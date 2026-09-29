@@ -69,9 +69,110 @@ async def upload_attendance(
             crud.create_attendance_record(db, att)
             crud.compute_eligibility_for_student(db, student.id, mst_exam_id)
             imported_count += 1
+        # Record the import so the dashboard activity feed can show it
+        db.add(models.AuditLog(
+            table_name="attendance_records",
+            record_id=0,
+            field_changed="import",
+            new_value=f"{imported_count} rows",
+            reason=file.filename,
+        ))
+        db.commit()
         return {"filename": file.filename, "rows_imported": imported_count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+# ── Dashboard ──────────────────────────────────────────────────────────────
+
+@app.get("/dashboard/stats")
+def dashboard_stats(db: Session = Depends(get_db)):
+    exam = db.query(models.MstExam).filter_by(id=1).first()
+    exam_label = exam.label if exam else "MST-1"
+
+    students = db.query(models.Student).all()
+    classes = {c.id: c for c in db.query(models.Class).all()}
+    elig_rows = db.query(models.MstEligibility).filter_by(mst_exam_id=1).all()
+    elig_by_student = {e.student_id: e for e in elig_rows}
+
+    total = len(students)
+    n_eligible = sum(1 for e in elig_rows if e.status == "Eligible")
+    n_borderline = sum(1 for e in elig_rows if e.status == "Borderline")
+    n_ineligible = sum(1 for e in elig_rows if e.status == "Not eligible")
+    n_overrides = sum(1 for e in elig_rows if e.override)
+
+    per_class: dict[str, dict] = {}
+    for s in students:
+        c = classes.get(s.class_id)
+        cname = c.name if c else "—"
+        bucket = per_class.setdefault(cname, {
+            "class": cname, "students": 0,
+            "eligible": 0, "borderline": 0, "ineligible": 0,
+        })
+        bucket["students"] += 1
+        e = elig_by_student.get(s.id)
+        st = e.status if e and e.status else "Missing"
+        if st == "Eligible":
+            bucket["eligible"] += 1
+        elif st == "Borderline":
+            bucket["borderline"] += 1
+        elif st == "Not eligible":
+            bucket["ineligible"] += 1
+
+    n_versions = db.query(models.TimetableVersion).count()
+    tt_entries = db.query(models.FacultyTimetable).all()
+    tt_classes = sorted({classes[e.class_id].name
+                         for e in tt_entries if e.class_id in classes})
+
+    logs = db.query(models.AuditLog)\
+        .order_by(models.AuditLog.changed_at.desc()).limit(8).all()
+    activity = []
+    # changed_at is stored as naive UTC (utcnow) — mark it so browsers parse it right
+    def ts(dt):
+        return dt.isoformat() + "Z" if dt else None
+    for log in logs:
+        at = ts(log.changed_at)
+        if log.field_changed == "import":
+            activity.append({
+                "kind": "upload",
+                "title": "Attendance uploaded",
+                "detail": f"{log.new_value} from {log.reason or 'file'}",
+                "at": at,
+            })
+        elif log.table_name == "mst_eligibility" and log.field_changed == "override":
+            e = db.query(models.MstEligibility).filter_by(id=log.record_id).first()
+            s = db.query(models.Student).filter_by(id=e.student_id).first() if e else None
+            who = f"roll {s.roll_number}" if s else f"record {log.record_id}"
+            action = "approved" if log.new_value == "True" else "revoked"
+            activity.append({
+                "kind": "override",
+                "title": f"Override {action} for {who}",
+                "detail": log.reason or "—",
+                "at": at,
+            })
+        else:
+            activity.append({
+                "kind": "other",
+                "title": f"{log.table_name} · {log.field_changed}",
+                "detail": log.reason or "",
+                "at": at,
+            })
+
+    return {
+        "exam_label": exam_label,
+        "total_students": total,
+        "eligible": n_eligible,
+        "eligible_pct": round(n_eligible / total * 100, 1) if total else 0,
+        "borderline": n_borderline,
+        "ineligible": n_ineligible,
+        "overrides": n_overrides,
+        "per_class": sorted(per_class.values(), key=lambda b: b["class"]),
+        "timetable": {
+            "versions": n_versions,
+            "periods": len(tt_entries),
+            "classes": tt_classes,
+        },
+        "recent_activity": activity,
+    }
 
 # ── Eligibility ────────────────────────────────────────────────────────────────
 

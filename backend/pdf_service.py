@@ -12,7 +12,9 @@ import models
 try:
     from weasyprint import HTML, CSS
     WEASYPRINT_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError: native Pango/GTK libs missing (common on Windows) — app still
+    # boots; PDF endpoints raise a clear error instead.
     WEASYPRINT_AVAILABLE = False
 
 
@@ -319,7 +321,8 @@ def render_pdf(html: str) -> bytes:
     """Render HTML to PDF bytes using WeasyPrint."""
     if not WEASYPRINT_AVAILABLE:
         raise RuntimeError(
-            "WeasyPrint is not installed. Run: pip install weasyprint"
+            "PDF export needs WeasyPrint's system libraries (Pango/GTK). "
+            "On Windows install the GTK3 runtime, or skip PDF export."
         )
     pdf_bytes = HTML(string=html).write_pdf(
         stylesheets=[CSS(string="@page { margin: 15mm; }")]
