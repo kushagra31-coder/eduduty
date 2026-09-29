@@ -9,6 +9,7 @@ import ai_service, pdf_service
 import pandas as pd
 import io
 import re
+from difflib import SequenceMatcher
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -28,6 +29,309 @@ def read_root():
 
 # ── Attendance upload ──────────────────────────────────────────────────────────
 
+def _to_int(v) -> int:
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 0
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            return 0
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _norm_name(n) -> str:
+    return re.sub(r"[^a-z]", "", (n or "").lower())
+
+
+def _parse_subject_sheet(df) -> dict | None:
+    """Parse one per-subject attendance sheet.
+
+    Layout (as in CI-1 IV.xlsx):
+      rows 0-5 : 'Faculty Name' / 'Subject Name' / 'Subject Code' header block
+      row H    : column titles ('s.no.', 'Enrollment NO.', 'Student Name', ...)
+                 AND the totals row (numeric total under 'Total Class')
+      rows H+1+: one row per student; value under 'Total Class' = classes attended
+    Returns None when the sheet is not in this format.
+    """
+    subj_code = subj_name = faculty_name = None
+    header_idx = None
+    scan = min(14, len(df))
+    for r in range(scan):
+        cells = [str(v).strip() for v in df.iloc[r].tolist()]
+        low = [c.lower() for c in cells]
+        if subj_code is None and any("subject code" in c for c in low):
+            v = cells[2] if len(cells) > 2 else ""
+            subj_code = "" if v.lower() == "nan" else v
+        if subj_name is None and any("subject name" in c for c in low):
+            v = cells[2] if len(cells) > 2 else ""
+            subj_name = "" if v.lower() == "nan" else v
+        if faculty_name is None and any("faculty name" in c for c in low):
+            v = cells[2] if len(cells) > 2 else ""
+            faculty_name = "" if v.lower() == "nan" else v
+        if header_idx is None and any("enrollment no" in c for c in low):
+            header_idx = r
+    if header_idx is None:
+        return None
+
+    # Column positions: labels may sit on the header row or the row above it
+    # (the header row doubles as the totals row, so its 'Total Class' cell is numeric).
+    col_roll = col_name = col_total = None
+    for lr in ({header_idx - 1} if header_idx > 0 else set()) | {header_idx}:
+        low = [str(v).strip().lower() for v in df.iloc[lr].tolist()]
+        for i, c in enumerate(low):
+            if col_roll is None and "enrollment no" in c:
+                col_roll = i
+            elif col_name is None and "student name" in c:
+                col_name = i
+            elif col_total is None and "total" in c and "class" in c:
+                col_total = i
+    if col_roll is None or col_total is None:
+        return None
+
+    total = _to_int(df.iloc[header_idx, col_total])
+    students = []
+    for r in range(header_idx + 1, len(df)):
+        cells = [str(v).strip() for v in df.iloc[r].tolist()]
+        low3 = [c.lower() for c in cells[:4]]
+        # Lab sheets append other classes' sections below, each starting with a
+        # repeated 'Faculty Name:' / header block — stop at the second section.
+        if any("faculty name" in c for c in low3) or any("enrollment no" in c for c in low3):
+            break
+        roll = cells[col_roll] if col_roll < len(cells) else ""
+        if not roll or roll.lower() == "nan":
+            continue
+        # skip non-enrollment junk (e.g. repeated header text like 'Enrollment No.')
+        if not re.search(r"\d", roll):
+            continue
+        name = str(df.iloc[r, col_name]).strip() if col_name is not None else ""
+        if not name or name.lower() == "nan":
+            name = "Unknown"
+        students.append((roll, name, _to_int(df.iloc[r, col_total])))
+    return {
+        "subject_code": (subj_code or "").strip(),
+        "subject_name": (subj_name or "").strip(),
+        "faculty_name": (faculty_name or "").strip(),
+        "total_classes": total,
+        "students": students,
+    }
+
+
+def _get_or_create_subject(db: Session, code: str, name: str):
+    code = (code or "").strip() or (name or "UNKNOWN").strip()
+    s = db.query(models.Subject).filter(models.Subject.code == code).first()
+    if not s:
+        s = models.Subject(code=code[:20], name=(name or code).strip()[:100])
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+    return s
+
+
+def _canon_faculty_tokens(n) -> set:
+    n = (n or "").lower()
+    n = re.sub(r"^(prof\.?|dr\.?)\s*", "", n).strip()
+    # known spelling variants across sheets
+    for a, b in (("shweta", "sweta"), ("aarti", "arti"),
+                 ("shrivastava", "shrivastva"), ("anajana", "anjana")):
+        n = n.replace(a, b)
+    return set(re.sub(r"[^a-z ]", " ", n).split())
+
+
+def _tok_sim(a: str, b: str) -> float:
+    # SequenceMatcher is not perfectly symmetric; take the max so that
+    # _same_person(a, b) == _same_person(b, a).
+    return max(SequenceMatcher(None, a, b).ratio(),
+               SequenceMatcher(None, b, a).ratio())
+
+
+def _same_person(a, b) -> bool:
+    """Token-subset match with per-token fuzzy tolerance.
+
+    Handles 'Purnima Shrivastava' vs 'Poornima Shrivasta' and
+    'MANOJ KUMAR GUPTA' vs 'Manoj Gupta', while keeping
+    'Anita Agrawal' vs 'Neha Agrawal' and 'Ashish Anjana' vs
+    'Ashwinee Gadwal' apart.
+    """
+    ta, tb = _canon_faculty_tokens(a), _canon_faculty_tokens(b)
+    if not ta or not tb:
+        return False
+    small, large = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    used = set()
+    for t in small:
+        best, bj = 0.0, -1
+        for j, u in enumerate(large):
+            if j in used:
+                continue
+            r = _tok_sim(t, u)
+            if r > best:
+                best, bj = r, j
+        if best < 0.78:
+            return False
+        used.add(bj)
+    return True
+
+
+def _title_score(n: str) -> int:
+    """Lower is better: penalize ALL-CAPS words ('VANDANA kATE' -> 1)."""
+    return sum(1 for w in re.sub(r"[^a-zA-Z ]", " ", n or "").split()
+               if w.isupper() and len(w) > 1)
+
+
+def _fix_name_word(w: str) -> str:
+    if w.isupper() and len(w) > 1:      # VANDANA -> Vandana
+        return w.title()
+    if re.match(r"^[a-z][A-Z]+$", w):   # kATE -> Kate
+        return w.title()
+    return w
+
+
+def _normalize_faculty_name(n: str) -> str:
+    """Display-quality normalization: space after Prof./Dr., fix ALL-CAPS words."""
+    n = re.sub(r"^(prof|dr)\.([A-Za-z])", r"\1. \2", (n or "").strip(), flags=re.IGNORECASE)
+    parts = n.split(" ", 1)
+    head, rest = parts[0], (parts[1] if len(parts) > 1 else "")
+    rest = " ".join(_fix_name_word(w) for w in rest.split())
+    return (head + " " + rest).strip()[:100]
+
+
+def _get_or_create_faculty(db: Session, raw_name: str):
+    # Sheets sometimes list two faculty as "A / B" — link the first, still register both.
+    names = [p.strip() for p in (raw_name or "").split("/") if p.strip()]
+    if not names or not names[0] or names[0].lower() == "nan":
+        return None
+    primary = _normalize_faculty_name(names[0])
+    for f in db.query(models.Faculty).all():
+        if f.name in ("Unknown", "", None) and primary != "Unknown":
+            f.name = primary
+            db.commit()
+            return f
+        if _same_person(f.name, primary):
+            # keep the best-cased variant of the name
+            for cand in (_normalize_faculty_name(f.name), primary):
+                if _title_score(cand) < _title_score(f.name):
+                    f.name = cand
+                    db.commit()
+            return f
+    f = models.Faculty(name=primary)
+    db.add(f)
+    db.commit()
+    db.refresh(f)
+    return f
+
+
+def _class_from_filename(db: Session, filename: str):
+    """Derive the class from workbook names like 'CI-1 IV.xlsx' / 'CY VI.xlsx'."""
+    m = re.match(r"\s*([A-Za-z]+-\d+|[A-Za-z]+)", filename or "")
+    branch = m.group(1).upper() if m else "CI-1"
+    sem_m = re.search(r"\b(II|III|IV|V|VI)\b", (filename or "").upper())
+    roman = sem_m.group(1) if sem_m else ""
+    year = {"II": 2, "III": 2, "IV": 2, "V": 3, "VI": 3}.get(roman, 2)
+    name = f"{branch} {roman}" if roman else branch
+    c = crud.get_class_by_name(db, name)
+    if not c:
+        c = models.Class(name=name, branch=branch, year=year)
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+    return c, roman or None
+
+
+def _ensure_dummy_exam(db: Session) -> int:
+    mst_exam_id = 1
+    if not db.query(models.MstExam).filter_by(id=mst_exam_id).first():
+        db.add(models.MstExam(id=mst_exam_id, label="MST-1"))
+        db.commit()
+    return mst_exam_id
+
+
+def _import_subject_workbook(db: Session, xls, filename: str):
+    """Import every per-subject sheet in the workbook."""
+    cls, semester = _class_from_filename(db, filename)
+    mst_exam_id = _ensure_dummy_exam(db)
+    sheets_summary = []
+    total_records = 0
+    students_seen = set()
+
+    for sh in xls.sheet_names:
+        df = xls.parse(sh, header=None)
+        parsed = _parse_subject_sheet(df)
+        if not parsed:
+            sheets_summary.append({"sheet": sh, "status": "skipped",
+                                   "reason": "not a subject attendance sheet"})
+            continue
+        if not parsed["students"]:
+            sheets_summary.append({"sheet": sh, "status": "skipped",
+                                   "reason": "no student rows found"})
+            continue
+        subject = _get_or_create_subject(db, parsed["subject_code"] or sh,
+                                         parsed["subject_name"])
+        faculty = _get_or_create_faculty(db, parsed["faculty_name"])
+        # Re-upload replaces the previous import of this file+subject (idempotent)
+        db.query(models.AttendanceRecord).filter(
+            models.AttendanceRecord.subject_id == subject.id,
+            models.AttendanceRecord.source_file == filename).delete()
+        db.commit()
+        n = 0
+        for roll, name, attended in parsed["students"]:
+            student = crud.get_student_by_roll(db, roll)
+            if not student:
+                student = models.Student(roll_number=roll, name=name,
+                                         class_id=cls.id)
+                db.add(student)
+                db.commit()
+                db.refresh(student)
+            elif name != "Unknown" and student.name in ("Unknown", "", None):
+                student.name = name
+                db.commit()
+            db.add(models.AttendanceRecord(
+                student_id=student.id,
+                faculty_id=faculty.id if faculty else None,
+                subject_id=subject.id,
+                semester=semester,
+                classes_conducted=parsed["total_classes"],
+                classes_attended=attended,
+                source_file=filename,
+            ))
+            n += 1
+            students_seen.add(student.id)
+        db.commit()
+        total_records += n
+        sheets_summary.append({
+            "sheet": sh,
+            "subject": subject.code,
+            "subject_name": subject.name,
+            "faculty": faculty.name if faculty else "—",
+            "status": "imported",
+            "rows": n,
+            "total_classes": parsed["total_classes"],
+        })
+
+    for sid in students_seen:
+        crud.compute_eligibility_for_student(db, sid, mst_exam_id)
+
+    db.add(models.AuditLog(
+        table_name="attendance_records", record_id=0, field_changed="import",
+        new_value=f"{total_records} rows across "
+                  f"{sum(1 for s in sheets_summary if s['status'] == 'imported')} subjects",
+        reason=filename,
+    ))
+    db.commit()
+
+    imported = [s for s in sheets_summary if s["status"] == "imported"]
+    if not imported:
+        raise HTTPException(
+            status_code=400,
+            detail="No subject attendance sheets found. Expected sheets with "
+                   "'Subject Code' and 'Enrollment No.' headers. "
+                   + "; ".join(f"{s['sheet']}: {s['reason']}" for s in sheets_summary))
+    return {"filename": filename, "format": "subject_sheets",
+            "class": cls.name,
+            "subjects_imported": len(imported),
+            "rows_imported": total_records,
+            "sheets": sheets_summary}
+
 @app.post("/upload-attendance/")
 async def upload_attendance(
     file: UploadFile = File(...),
@@ -38,7 +342,22 @@ async def upload_attendance(
 
     contents = await file.read()
     try:
-        df = pd.read_excel(io.BytesIO(contents))
+        xls = pd.ExcelFile(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
+
+    # Per-subject workbook (e.g. CI-1 IV.xlsx): one sheet per subject with
+    # 'Subject Code' / 'Enrollment No.' headers — parse every subject sheet.
+    try:
+        probe = [_parse_subject_sheet(xls.parse(sh, header=None))
+                 for sh in xls.sheet_names]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
+    if any(p for p in probe):
+        return _import_subject_workbook(db, xls, file.filename)
+
+    try:
+        df = xls.parse(xls.sheet_names[0])
         # Normalize column names for lookup (case/space/underscore-insensitive)
         colmap = {str(c).strip().lower().replace("_", " ").replace("-", " "): c for c in df.columns}
         def col(*names):
@@ -368,8 +687,9 @@ def list_faculty(db: Session = Depends(get_db)):
 from itertools import zip_longest as _zip_longest
 import datetime as _dt
 
-_DAY_MAP = {"MON": "Monday", "TUE": "Tuesday", "WED": "Wednesday", "THU": "Thursday",
-            "FRI": "Friday", "SAT": "Saturday", "SUN": "Sunday"}
+# Timetable rows store abbreviated days: MON, TUE, WED, THUR, FRI.
+# strftime("%a") gives MON, TUE, WED, THU, FRI — normalize THU -> THUR.
+_DAY_ALIASES = {"THU": "THUR"}
 
 
 def _seat_student_out(s):
@@ -582,7 +902,9 @@ def faculty_status_for_exam(mst_exam_id: int, db: Session = Depends(get_db)):
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
-    day = _DAY_MAP.get(exam.exam_date.strftime("%a").upper()) if exam.exam_date else None
+    day = exam.exam_date.strftime("%a").upper() if exam.exam_date else None
+    if day:
+        day = _DAY_ALIASES.get(day, day)  # match stored MON/TUE/WED/THUR/FRI values
     start, end = "09:00", "12:00"
     if exam.time_slot and "-" in exam.time_slot:
         parts = [p.strip() for p in exam.time_slot.split("-", 1)]

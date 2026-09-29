@@ -10,7 +10,13 @@ export default function AttendanceUpload() {
   const [isDragging, setIsDragging] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [isUploading, setIsUploading] = useState(false)
-  const [uploadResult, setUploadResult] = useState<{ filename: string, rows_imported: number } | null>(null)
+  const [uploadResult, setUploadResult] = useState<{
+    filename: string
+    rows_imported: number
+    subjects_imported?: number
+    class?: string
+    sheets?: { sheet: string; status: string; reason?: string; subject?: string; rows?: number }[]
+  } | null>(null)
   const { toast } = useToast()
 
   const handleDrag = useCallback((e: React.DragEvent) => {
@@ -56,26 +62,39 @@ export default function AttendanceUpload() {
     formData.append('file', file)
 
     try {
-      // Assuming backend runs on 8000
       const res = await fetch('/api/upload-attendance/', {
         method: 'POST',
         body: formData,
       })
-      
+
+      const data = await res.json().catch(() => null)
+
       if (!res.ok) {
-        throw new Error("Upload failed")
+        // HTTP error from the backend (e.g. 400 "no subject sheets recognized") —
+        // show FastAPI's actual detail instead of a generic message.
+        const detail = data?.detail ?? `Server returned status ${res.status}`
+        toast({
+          title: "Upload Failed",
+          description: detail,
+          variant: "destructive"
+        })
+        return
       }
-      
-      const data = await res.json()
+
       setUploadResult(data)
+      const skipped = (data.sheets ?? []).filter((s: { status: string }) => s.status !== 'imported')
       toast({
         title: "Upload Successful",
-        description: `Imported ${data.rows_imported} records from ${data.filename}`,
+        description: `Imported ${data.rows_imported} records across ${data.subjects_imported} subjects from ${data.filename}` +
+          (skipped.length ? ` (${skipped.length} sheet${skipped.length > 1 ? 's' : ''} skipped)` : ''),
       })
-    } catch {
+    } catch (e) {
+      // fetch() itself threw — network failure, backend unreachable.
       toast({
         title: "Upload Failed",
-        description: "There was an error communicating with the server.",
+        description: e instanceof TypeError
+          ? "Could not reach the backend. Is the FastAPI server running on port 8000?"
+          : (e instanceof Error ? e.message : "There was an error communicating with the server."),
         variant: "destructive"
       })
     } finally {
@@ -150,8 +169,29 @@ export default function AttendanceUpload() {
                 </div>
                 <h3 className="text-xl font-semibold">Upload Complete</h3>
                 <p className="text-muted-foreground">
-                  Successfully imported <span className="font-bold text-foreground">{uploadResult.rows_imported}</span> records from {uploadResult.filename}.
+                  Successfully imported <span className="font-bold text-foreground">{uploadResult.rows_imported}</span> records
+                  {uploadResult.subjects_imported != null && (
+                    <> across <span className="font-bold text-foreground">{uploadResult.subjects_imported}</span> subjects</>
+                  )}
+                  {uploadResult.class && (
+                    <> for class <span className="font-bold text-foreground">{uploadResult.class}</span></>
+                  )}{' '}
+                  from {uploadResult.filename}.
                 </p>
+                {uploadResult.sheets && uploadResult.sheets.some(s => s.status !== 'imported') && (
+                  <details className="text-left text-sm mt-2">
+                    <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                      {uploadResult.sheets.filter(s => s.status !== 'imported').length} sheet(s) skipped — details
+                    </summary>
+                    <ul className="mt-2 space-y-1">
+                      {uploadResult.sheets.filter(s => s.status !== 'imported').map(s => (
+                        <li key={s.sheet} className="text-muted-foreground">
+                          <span className="font-medium text-foreground">{s.sheet}</span>: {s.reason ?? s.status}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
                 <div className="pt-4">
                   <Button onClick={() => {
                     setFile(null)

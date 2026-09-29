@@ -123,7 +123,18 @@ export function AIChat() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => null)
+
+      if (!res.ok) {
+        // HTTP error from the backend — surface its detail, don't pretend it's a network failure.
+        setMessages(prev => [...prev, {
+          id: (Date.now() + 1).toString(),
+          role: 'error',
+          type: 'error',
+          content: `Request failed (HTTP ${res.status}): ${data?.detail ?? 'the AI backend returned an error.'}`,
+        }])
+        return
+      }
 
       if (data.type === 'write_proposal') {
         const msgId = (Date.now() + 1).toString()
@@ -161,11 +172,14 @@ export function AIChat() {
         }
         setMessages(prev => [...prev, botMsg])
       }
-    } catch {
+    } catch (e) {
+      // fetch() threw — network failure, not an HTTP error from the backend.
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(),
         role: 'error',
-        content: 'Could not reach the AI backend. Is the FastAPI server running on port 8000?',
+        content: e instanceof TypeError
+          ? 'Could not reach the backend. Is the FastAPI server running on port 8000?'
+          : `Request failed: ${e instanceof Error ? e.message : String(e)}`,
       }])
     } finally {
       setLoading(false)
@@ -187,7 +201,10 @@ export function AIChat() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ op_json: pendingOp.opJson }),
       })
-      const data = await res.json()
+      const data = await res.json().catch(() => null)
+      if (!res.ok) {
+        throw new Error(data?.detail ?? `Server returned status ${res.status}`)
+      }
       if (data.success) {
         toast({ title: 'Change applied', description: `${data.changed?.changed ?? 'Operation'} completed successfully.` })
         setMessages(prev => [...prev, {
