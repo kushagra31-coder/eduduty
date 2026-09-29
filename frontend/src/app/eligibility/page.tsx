@@ -91,7 +91,7 @@ export default function EligibilityPage() {
       } else {
         throw new Error("Failed to update override")
       }
-    } catch (err) {
+    } catch {
       toast({
         title: "Error",
         description: "Could not update the override status.",
@@ -101,10 +101,10 @@ export default function EligibilityPage() {
   }
 
   const getStatusBadge = (status: string, override: boolean) => {
-    if (override) return <Badge className="bg-blue-500 hover:bg-blue-600 text-white">Overridden</Badge>
-    if (status === "Eligible") return <Badge className="bg-emerald-500 hover:bg-emerald-600 text-white">Eligible</Badge>
-    if (status === "Borderline") return <Badge className="bg-amber-500 hover:bg-amber-600 text-amber-950 dark:text-amber-50">Borderline</Badge>
-    if (status === "Not eligible") return <Badge variant="destructive">Not Eligible</Badge>
+    if (override) return <Badge className="border-2 border-foreground bg-transparent text-foreground hover:bg-muted">Overridden</Badge>
+    if (status === "Eligible") return <Badge className="bg-foreground text-background hover:bg-foreground/85">Eligible</Badge>
+    if (status === "Borderline") return <Badge className="border border-dashed border-foreground/60 bg-transparent text-foreground hover:bg-muted">Borderline</Badge>
+    if (status === "Not eligible") return <Badge className="border border-foreground/30 bg-foreground/10 text-foreground hover:bg-foreground/15">Not Eligible</Badge>
     return <Badge variant="secondary">Missing</Badge>
   }
 
@@ -149,11 +149,11 @@ export default function EligibilityPage() {
                   </TableRow>
                 ) : (
                   records.map((record) => (
-                    <TableRow key={record.id} className={record.override ? "bg-blue-50/50 dark:bg-blue-950/20" : ""}>
-                      <TableCell className="font-medium">{record.roll_number}</TableCell>
+                    <TableRow key={record.id} className={record.override ? "bg-muted/60" : ""}>
+                      <TableCell className="font-medium font-mono">{record.roll_number}</TableCell>
                       <TableCell>{record.name}</TableCell>
-                      <TableCell className="text-right">{record.overall_pct}%</TableCell>
-                      <TableCell className="text-right text-muted-foreground">{record.lowest_subject_pct}%</TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">{record.overall_pct}%</TableCell>
+                      <TableCell className="text-right text-muted-foreground font-mono tabular-nums">{record.lowest_subject_pct}%</TableCell>
                       <TableCell>{getStatusBadge(record.status, record.override)}</TableCell>
                       <TableCell className="text-right">
                         <Button 

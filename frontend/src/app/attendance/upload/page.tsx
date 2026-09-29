@@ -3,7 +3,7 @@
 import { useState, useCallback } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { UploadCloud, FileSpreadsheet, CheckCircle, AlertCircle } from "lucide-react"
+import { UploadCloud, CheckCircle } from "lucide-react"
 import { useToast } from "@/components/ui/use-toast"
 
 export default function AttendanceUpload() {
@@ -72,7 +72,7 @@ export default function AttendanceUpload() {
         title: "Upload Successful",
         description: `Imported ${data.rows_imported} records from ${data.filename}`,
       })
-    } catch (err) {
+    } catch {
       toast({
         title: "Upload Failed",
         description: "There was an error communicating with the server.",
@@ -144,9 +144,9 @@ export default function AttendanceUpload() {
                 </div>
               </div>
             ) : (
-              <div className="border rounded-lg p-8 text-center space-y-4 bg-emerald-50/50 dark:bg-emerald-950/20">
+              <div className="border rounded-lg p-8 text-center space-y-4 bg-muted/50">
                 <div className="flex justify-center">
-                  <CheckCircle className="h-12 w-12 text-emerald-500" />
+                  <CheckCircle className="h-12 w-12 text-foreground" />
                 </div>
                 <h3 className="text-xl font-semibold">Upload Complete</h3>
                 <p className="text-muted-foreground">
