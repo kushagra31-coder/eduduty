@@ -27,6 +27,7 @@ ALLOWED_READ_VIEWS = {
     "ai_attendance_summary",
     "ai_vt_candidates",
     "ai_duty_roster",
+    "v_vt_follow_up_status",
 }
 
 # Only these operations can be triggered by the AI (write path)
@@ -45,6 +46,11 @@ You may ONLY query these views (no other tables):
 - ai_attendance_summary(class_name, roll_number, student_name, overall_pct, lowest_subject_pct)
 - ai_vt_candidates(class_name, roll_number, student_name, mst1_status, mst2_status)
 - ai_duty_roster(mst_label, exam_date, room_number, faculty_name, duty_status)
+- v_vt_follow_up_status(roll_number, student_name, class_name, mst_1_label, mst_2_label,
+    mst_1_appeared, mst_2_appeared, calculated_status, final_status, overridden,
+    override_reason, rule_version, updated_at)
+  calculated_status/final_status are one of: not_required, compulsory, under_review, excused, completed.
+  mst_1_appeared/mst_2_appeared are TRUE (present), FALSE (absent), or NULL (missing record).
 
 Rules:
 1. Only generate SELECT statements.
@@ -57,6 +63,12 @@ A: SELECT eligible_count FROM ai_eligibility_summary WHERE class_name='CI-1' AND
 
 Q: List borderline students in CI-2
 A: SELECT roll_number, student_name, overall_pct FROM ai_attendance_summary WHERE class_name='CI-2' AND overall_pct >= 45 AND overall_pct < 50;
+
+Q: How many CI-1 students are compulsory for VT?
+A: SELECT COUNT(*) FROM v_vt_follow_up_status WHERE class_name='CI-1' AND final_status='compulsory';
+
+Q: Which compulsory VT students have been excused?
+A: SELECT roll_number, student_name, override_reason FROM v_vt_follow_up_status WHERE final_status='excused';
 """
 
 WRITE_SYSTEM_PROMPT = """

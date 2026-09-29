@@ -13,6 +13,45 @@ from difflib import SequenceMatcher
 
 models.Base.metadata.create_all(bind=engine)
 
+# ── Read-only view for the AI + reporting (works on SQLite and Postgres) ──────
+_FOLLOW_UP_VIEW_BODY = """
+SELECT
+    s.roll_number,
+    s.name AS student_name,
+    c.name AS class_name,
+    e1.label AS mst_1_label,
+    e2.label AS mst_2_label,
+    fs.mst_1_appeared,
+    fs.mst_2_appeared,
+    fs.calculated_status,
+    fs.final_status,
+    fs.override AS overridden,
+    fs.override_reason,
+    fs.rule_version,
+    fs.updated_at
+FROM follow_up_statuses fs
+JOIN students s ON s.id = fs.student_id
+JOIN classes c ON c.id = s.class_id
+LEFT JOIN mst_exams e1 ON e1.id = fs.mst_1_exam_id
+LEFT JOIN mst_exams e2 ON e2.id = fs.mst_2_exam_id
+"""
+
+def _ensure_follow_up_view():
+    try:
+        with engine.begin() as conn:
+            if engine.dialect.name == "sqlite":
+                # SQLite has no CREATE OR REPLACE VIEW
+                conn.execute(models.text("DROP VIEW IF EXISTS v_vt_follow_up_status"))
+                conn.execute(models.text(
+                    "CREATE VIEW v_vt_follow_up_status AS" + _FOLLOW_UP_VIEW_BODY))
+            else:
+                conn.execute(models.text(
+                    "CREATE OR REPLACE VIEW v_vt_follow_up_status AS" + _FOLLOW_UP_VIEW_BODY))
+    except Exception as exc:  # never block app startup on a reporting view
+        print(f"warning: could not create v_vt_follow_up_status: {exc}", flush=True)
+
+_ensure_follow_up_view()
+
 app = FastAPI(title="MST Operations Portal API")
 
 app.add_middleware(
@@ -840,6 +879,8 @@ def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)
     att.marked_at = _dt.datetime.utcnow()
     db.commit()
     db.refresh(att)
+    # Appearance changed -> VT/follow-up rule must be re-evaluated
+    crud.recalculate_follow_up(db, att.student_id)
     return {"student_id": att.student_id, "status": att.status, "marked_at": att.marked_at}
 
 
@@ -848,6 +889,196 @@ def get_attendance(mst_exam_id: int, db: Session = Depends(get_db)):
     rows = db.query(models.MstAttempt).filter_by(mst_exam_id=mst_exam_id).all()
     return [{"student_id": a.student_id, "status": a.status, "marked_at": a.marked_at}
             for a in rows]
+
+
+# ── VT / follow-up ────────────────────────────────────────────────────────────
+
+def _follow_up_row_out(row, student, class_name):
+    return {
+        "id": row.id,
+        "student_id": row.student_id,
+        "roll_number": student.roll_number if student else None,
+        "name": student.name if student else None,
+        "class_id": student.class_id if student else None,
+        "class_name": class_name,
+        "mst_1_appeared": row.mst_1_appeared,
+        "mst_2_appeared": row.mst_2_appeared,
+        "calculated_status": row.calculated_status,
+        "final_status": row.final_status,
+        "override": row.override,
+        "override_reason": row.override_reason,
+        "rule_version": row.rule_version,
+        "updated_at": row.updated_at,
+    }
+
+@app.get("/follow-up")
+def list_follow_up(
+    class_id: int = None,
+    calculated_status: str = None,
+    final_status: str = None,
+    overridden: bool = None,
+    search: str = None,
+    db: Session = Depends(get_db),
+):
+    q = (
+        db.query(models.FollowUpStatus, models.Student, models.Class.name)
+        .join(models.Student, models.FollowUpStatus.student_id == models.Student.id)
+        .join(models.Class, models.Student.class_id == models.Class.id)
+    )
+    if class_id:
+        q = q.filter(models.Student.class_id == class_id)
+    if calculated_status:
+        q = q.filter(models.FollowUpStatus.calculated_status == calculated_status)
+    if final_status:
+        q = q.filter(models.FollowUpStatus.final_status == final_status)
+    if overridden is not None:
+        q = q.filter(models.FollowUpStatus.override.is_(overridden))
+    if search:
+        like = f"%{search}%"
+        q = q.filter(
+            (models.Student.roll_number.ilike(like)) |
+            (models.Student.name.ilike(like))
+        )
+    rows = q.order_by(models.Student.roll_number).all()
+    return [_follow_up_row_out(f, s, cname) for f, s, cname in rows]
+
+
+@app.get("/follow-up/stats")
+def follow_up_stats(class_id: int = None, db: Session = Depends(get_db)):
+    from sqlalchemy import func
+    q = db.query(
+        models.FollowUpStatus.final_status,
+        func.count(models.FollowUpStatus.id),
+    )
+    if class_id:
+        q = q.join(models.Student,
+                   models.FollowUpStatus.student_id == models.Student.id)\
+             .filter(models.Student.class_id == class_id)
+    by_final = dict(q.group_by(models.FollowUpStatus.final_status).all())
+
+    q2 = db.query(
+        models.FollowUpStatus.calculated_status,
+        func.count(models.FollowUpStatus.id),
+    )
+    if class_id:
+        q2 = q2.join(models.Student,
+                     models.FollowUpStatus.student_id == models.Student.id)\
+               .filter(models.Student.class_id == class_id)
+    by_calculated = dict(q2.group_by(models.FollowUpStatus.calculated_status).all())
+
+    total = sum(by_final.values())
+    students_total = db.query(func.count(models.Student.id))\
+        .filter(models.Student.active.is_(True))
+    if class_id:
+        students_total = students_total.filter(models.Student.class_id == class_id)
+    students_total = students_total.scalar()
+
+    return {
+        "total_evaluated": total,
+        "total_students": students_total,
+        "missing_records": max(students_total - total, 0),
+        "by_final_status": by_final,
+        "by_calculated_status": by_calculated,
+    }
+
+
+class FollowUpRecalcIn(BaseModel):
+    class_id: int = None
+
+@app.post("/follow-up/recalculate")
+def recalculate_follow_ups(req: FollowUpRecalcIn, db: Session = Depends(get_db)):
+    result = crud.recalculate_all_follow_ups(db, class_id=req.class_id)
+    _ensure_follow_up_view()  # keep the AI view in sync
+    return result
+
+
+class FollowUpOverrideIn(BaseModel):
+    final_status: str
+    reason: str
+    changed_by: int = None
+
+@app.post("/follow-up/{follow_up_id}/override")
+def override_follow_up(follow_up_id: int, req: FollowUpOverrideIn,
+                       db: Session = Depends(get_db)):
+    try:
+        row = crud.override_follow_up(
+            db, follow_up_id, req.final_status, req.reason, req.changed_by)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    student = db.query(models.Student).filter_by(id=row.student_id).first()
+    return _follow_up_row_out(
+        row, student, student and db.query(models.Class.name)
+        .filter_by(id=student.class_id).scalar())
+
+
+class FollowUpRestoreIn(BaseModel):
+    reason: str
+    changed_by: int = None
+
+@app.post("/follow-up/{follow_up_id}/restore")
+def restore_follow_up(follow_up_id: int, req: FollowUpRestoreIn,
+                      db: Session = Depends(get_db)):
+    try:
+        row = crud.restore_calculated_follow_up(
+            db, follow_up_id, req.reason, req.changed_by)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    student = db.query(models.Student).filter_by(id=row.student_id).first()
+    return _follow_up_row_out(
+        row, student, student and db.query(models.Class.name)
+        .filter_by(id=student.class_id).scalar())
+
+
+def _compulsory_follow_up_rows(db: Session, class_id: int = None):
+    q = (
+        db.query(models.FollowUpStatus, models.Student, models.Class.name)
+        .join(models.Student, models.FollowUpStatus.student_id == models.Student.id)
+        .join(models.Class, models.Student.class_id == models.Class.id)
+        .filter(models.FollowUpStatus.final_status == "compulsory")
+    )
+    if class_id:
+        q = q.filter(models.Student.class_id == class_id)
+    return q.order_by(models.Class.name, models.Student.roll_number).all()
+
+
+@app.get("/follow-up/export")
+def export_follow_up_excel(class_id: int = None, db: Session = Depends(get_db)):
+    rows = _compulsory_follow_up_rows(db, class_id)
+    data = [{
+        "Roll Number": s.roll_number,
+        "Name": s.name,
+        "Class": cname,
+        "MST-1": "Present" if f.mst_1_appeared else "Absent" if f.mst_1_appeared is False else "Missing",
+        "MST-2": "Present" if f.mst_2_appeared else "Absent" if f.mst_2_appeared is False else "Missing",
+        "Calculated": f.calculated_status,
+        "Final": f.final_status,
+        "Overridden": "Yes" if f.override else "No",
+        "Override Reason": f.override_reason or "",
+    } for f, s, cname in rows]
+    df = pd.DataFrame(data, columns=[
+        "Roll Number", "Name", "Class", "MST-1", "MST-2",
+        "Calculated", "Final", "Overridden", "Override Reason"])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="VT Compulsory", index=False)
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=vt_compulsory_list.xlsx"},
+    )
+
+
+@app.get("/follow-up/export-pdf")
+def export_follow_up_pdf(class_id: int = None, db: Session = Depends(get_db)):
+    rows = _compulsory_follow_up_rows(db, class_id)
+    html = pdf_service.build_follow_up_list_html(rows)
+    pdf_bytes = pdf_service.render_pdf(html)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=vt_compulsory_list.pdf"},
+    )
 
 
 @app.get("/mst/duties/{mst_exam_id}", response_model=list[schemas.DutyOut])

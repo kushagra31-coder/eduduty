@@ -328,3 +328,56 @@ def render_pdf(html: str) -> bytes:
         stylesheets=[CSS(string="@page { margin: 15mm; }")]
     )
     return pdf_bytes
+
+
+# ── VT / Follow-up compulsory list PDF ─────────────────────────────────────────
+
+def _appearance_label(appeared) -> str:
+    if appeared is True:
+        return "Present"
+    if appeared is False:
+        return "Absent"
+    return "Missing"
+
+
+def build_follow_up_list_html(rows) -> str:
+    """rows: list of (FollowUpStatus, Student, class_name) tuples."""
+    trs = []
+    for i, (f, s, cname) in enumerate(rows, start=1):
+        trs.append(
+            "<tr>"
+            f"<td>{i}</td>"
+            f"<td><strong>{s.roll_number}</strong></td>"
+            f"<td>{s.name}</td>"
+            f"<td>{cname}</td>"
+            f"<td>{_appearance_label(f.mst_1_appeared)}</td>"
+            f"<td>{_appearance_label(f.mst_2_appeared)}</td>"
+            f"<td>{f.final_status.replace('_', ' ').title()}"
+            f"{' (rule: ' + f.calculated_status.replace('_', ' ') + ')' if f.override else ''}</td>"
+            f"<td>{f.override_reason or '—'}</td>"
+            "</tr>"
+        )
+    body = "\n".join(trs) or '<tr><td colspan="8">No compulsory students.</td></tr>'
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+  <style>{BASE_CSS}</style>
+</head>
+<body><div class="page">
+<div class="header">
+  <div><h1>VT / Follow-up — Compulsory List</h1>
+  <div class="sub">Rule: absent in both MST-1 and MST-2 (absent-both-mst-v1)</div></div>
+  <div class="meta">Generated {datetime.now().strftime('%d %b %Y, %H:%M')}<br>
+  {len(rows)} student(s)</div>
+</div>
+<table>
+  <thead><tr>
+    <th>#</th><th>Roll No.</th><th>Name</th><th>Class</th>
+    <th>MST-1</th><th>MST-2</th><th>Final Status</th><th>Override Reason</th>
+  </tr></thead>
+  <tbody>{body}</tbody>
+</table>
+<div class="footer">
+  <span>EduDuty — MST Operations</span>
+  <span>Coordinator signature: ____________________</span>
+</div>
+</div></body></html>"""
