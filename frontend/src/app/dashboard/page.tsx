@@ -12,46 +12,46 @@ export default function Dashboard() {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-blue-500">
+        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-foreground">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">Total Students</CardTitle>
-            <Users className="h-4 w-4 text-blue-500" />
+            <Users className="h-4 w-4 text-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">1,240</div>
+            <div className="text-2xl font-bold font-mono tabular-nums">1,240</div>
             <p className="text-xs text-muted-foreground">Across all branches</p>
           </CardContent>
         </Card>
         
-        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-emerald-500">
+        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-foreground">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">MST-1 Eligible</CardTitle>
-            <CheckCircle className="h-4 w-4 text-emerald-500" />
+            <CheckCircle className="h-4 w-4 text-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">1,120</div>
+            <div className="text-2xl font-bold font-mono tabular-nums">1,120</div>
             <p className="text-xs text-muted-foreground">90.3% eligibility rate</p>
           </CardContent>
         </Card>
         
-        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-amber-500">
+        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-foreground">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">Borderline Cases</CardTitle>
-            <Clock className="h-4 w-4 text-amber-500" />
+            <Clock className="h-4 w-4 text-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">45</div>
+            <div className="text-2xl font-bold font-mono tabular-nums">45</div>
             <p className="text-xs text-muted-foreground">Requires review (45-50%)</p>
           </CardContent>
         </Card>
 
-        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-purple-500">
+        <Card className="hover:shadow-lg transition-shadow border-t-4 border-t-foreground">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">Recent Uploads</CardTitle>
-            <FileSpreadsheet className="h-4 w-4 text-purple-500" />
+            <FileSpreadsheet className="h-4 w-4 text-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">12</div>
+            <div className="text-2xl font-bold font-mono tabular-nums">12</div>
             <p className="text-xs text-muted-foreground">Files imported this week</p>
           </CardContent>
         </Card>

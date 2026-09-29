@@ -40,8 +40,10 @@ type Entry = {
 };
 
 export default function TimetablePage() {
-  const [classes, setClasses]   = useState<any[]>([]);
-  const [faculty, setFaculty]   = useState<any[]>([]);
+  type ClassItem = { id: number; name: string; year?: number };
+  type FacultyItem = { id: number; name: string; abbreviation?: string };
+  const [classes, setClasses]   = useState<ClassItem[]>([]);
+  const [faculty, setFaculty]   = useState<FacultyItem[]>([]);
   const [classId, setClassId]   = useState<number | null>(null);
   const [semester, setSemester] = useState("III");
   const [session, setSession]   = useState("Jul-Dec 2026");
@@ -102,7 +104,21 @@ export default function TimetablePage() {
     const version = await versionRes.json();
 
     // Step 2 — flatten grid into bulk entry payload
-    const entries: any[] = [];
+    type TimetableEntryPayload = {
+      faculty_id: number;
+      day_of_week: string;
+      period_start: string | null;
+      period_end: string | null;
+      subject_code?: string;
+      subject_name: string | null;
+      room: string | null;
+      batch: string | null;
+      class_id: number | null;
+      year?: number;
+      semester: string;
+      timetable_version_id: number;
+    };
+    const entries: TimetableEntryPayload[] = [];
     for (const day of DAYS) {
       PERIODS.forEach((p, idx) => {
         if (p.label === "LUNCH") return;
@@ -231,7 +247,7 @@ export default function TimetablePage() {
                           </span>
                           <button
                             onClick={ev => { ev.stopPropagation(); removeEntry(day, idx, i); }}
-                            className="text-red-500 shrink-0"
+                            className="text-muted-foreground hover:text-foreground transition-colors shrink-0"
                             title="Remove entry"
                           >
                             ×

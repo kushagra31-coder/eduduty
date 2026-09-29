@@ -1,14 +1,25 @@
 "use client"
 
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import { Home, Upload, CheckSquare, Settings, Sun, Moon, Bot, CalendarDays } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 
+const NAV_LINKS = [
+  { href: "/dashboard", label: "Dashboard", icon: Home },
+  { href: "/attendance/upload", label: "Upload Attendance", icon: Upload },
+  { href: "/eligibility", label: "Eligibility", icon: CheckSquare },
+  { href: "/ai", label: "AI Assistant", icon: Bot },
+  { href: "/timetable", label: "Timetable", icon: CalendarDays },
+  { href: "/settings", label: "Settings", icon: Settings },
+];
+
 export function Sidebar({ className }: { className?: string }) {
   const { theme, setTheme } = useTheme();
+  const pathname = usePathname();
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
@@ -19,34 +30,36 @@ export function Sidebar({ className }: { className?: string }) {
     <div className={cn("pb-12 border-r bg-background min-h-screen flex flex-col", className)}>
       <div className="space-y-4 py-4 flex-1">
         <div className="px-3 py-2">
-          <h2 className="mb-2 px-4 text-lg font-semibold tracking-tight">
-            MST Operations
-          </h2>
+          <div className="mb-6 px-4 flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-foreground text-background text-lg font-bold">
+              E
+            </div>
+            <div>
+              <h2 className="text-base font-bold tracking-tight leading-none">
+                EduDuty
+              </h2>
+              <p className="text-xs text-muted-foreground mt-1">MST Operations</p>
+            </div>
+          </div>
           <div className="space-y-1">
-            <Link href="/dashboard" className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors">
-              <Home className="h-4 w-4" />
-              Dashboard
-            </Link>
-            <Link href="/attendance/upload" className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors">
-              <Upload className="h-4 w-4" />
-              Upload Attendance
-            </Link>
-            <Link href="/eligibility" className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors">
-              <CheckSquare className="h-4 w-4" />
-              Eligibility
-            </Link>
-            <Link href="/ai" className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors">
-              <Bot className="h-4 w-4" />
-              AI Assistant
-            </Link>
-            <Link href="/timetable" className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors">
-              <CalendarDays className="h-4 w-4" />
-              Timetable
-            </Link>
-            <Link href="/settings" className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors">
-              <Settings className="h-4 w-4" />
-              Settings
-            </Link>
+            {NAV_LINKS.map(({ href, label, icon: Icon }) => {
+              const active = pathname === href || pathname.startsWith(href + "/");
+              return (
+                <Link
+                  key={href}
+                  href={href}
+                  className={cn(
+                    "w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                    active
+                      ? "bg-foreground text-background"
+                      : "hover:bg-accent hover:text-accent-foreground"
+                  )}
+                >
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </Link>
+              );
+            })}
           </div>
         </div>
       </div>

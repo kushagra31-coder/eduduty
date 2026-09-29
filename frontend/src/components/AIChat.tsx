@@ -39,12 +39,12 @@ function WriteProposalCard({ opJson, onConfirm, onDismiss }: {
 }) {
   const label = WRITE_OP_LABELS[opJson.operation] ?? opJson.operation
   return (
-    <div className="rounded-xl border border-amber-300 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-700 p-4 space-y-3 max-w-sm">
+    <div className="rounded-xl border-2 border-foreground bg-muted/40 p-4 space-y-3 max-w-sm">
       <div className="flex items-center gap-2">
-        <AlertTriangle className="h-4 w-4 text-amber-600 flex-shrink-0" />
-        <span className="font-semibold text-sm text-amber-800 dark:text-amber-200">Proposed Write: {label}</span>
+        <AlertTriangle className="h-4 w-4 text-foreground flex-shrink-0" />
+        <span className="font-semibold text-sm text-foreground">Proposed Write: {label}</span>
       </div>
-      <div className="text-xs space-y-1 text-amber-700 dark:text-amber-300">
+      <div className="text-xs space-y-1 text-muted-foreground">
         {Object.entries(opJson)
           .filter(([k]) => k !== 'operation')
           .map(([k, v]) => (
@@ -54,11 +54,11 @@ function WriteProposalCard({ opJson, onConfirm, onDismiss }: {
             </div>
           ))}
       </div>
-      <p className="text-xs text-amber-600 dark:text-amber-400">
+      <p className="text-xs text-muted-foreground">
         This change will be logged in the audit trail.
       </p>
       <div className="flex gap-2 pt-1">
-        <Button size="sm" onClick={onConfirm} className="bg-amber-600 hover:bg-amber-700 text-white">
+        <Button size="sm" onClick={onConfirm}>
           Confirm
         </Button>
         <Button size="sm" variant="outline" onClick={onDismiss}>
@@ -72,14 +72,14 @@ function WriteProposalCard({ opJson, onConfirm, onDismiss }: {
 function PDFLinkCard({ link, message }: { link: string; message: string }) {
   const fullUrl = `http://localhost:8000${link}`
   return (
-    <div className="rounded-xl border border-blue-200 bg-blue-50 dark:bg-blue-950/30 dark:border-blue-700 p-4 space-y-2 max-w-sm">
+    <div className="rounded-xl border border-foreground/30 bg-muted/30 p-4 space-y-2 max-w-sm">
       <div className="flex items-center gap-2">
-        <FileText className="h-4 w-4 text-blue-600" />
-        <span className="font-semibold text-sm text-blue-800 dark:text-blue-200">PDF Ready</span>
+        <FileText className="h-4 w-4 text-foreground" />
+        <span className="font-semibold text-sm text-foreground">PDF Ready</span>
       </div>
-      <p className="text-xs text-blue-700 dark:text-blue-300">{message}</p>
+      <p className="text-xs text-muted-foreground">{message}</p>
       <a href={fullUrl} target="_blank" rel="noreferrer">
-        <Button size="sm" variant="outline" className="gap-2 mt-1 text-blue-700 border-blue-300 hover:bg-blue-100">
+        <Button size="sm" variant="outline" className="gap-2 mt-1">
           <ExternalLink className="h-3 w-3" />
           Open PDF
         </Button>
@@ -194,13 +194,13 @@ export function AIChat() {
           id: Date.now().toString(),
           role: 'assistant',
           type: 'answer',
-          content: `✅ Done. The change has been applied and logged to the audit trail.`,
+          content: `Done — the change has been applied and logged to the audit trail.`,
         }])
       } else {
         throw new Error(data.detail ?? 'Unknown error')
       }
-    } catch (e: any) {
-      toast({ title: 'Write failed', description: e.message, variant: 'destructive' })
+    } catch (e) {
+      toast({ title: 'Write failed', description: e instanceof Error ? e.message : String(e), variant: 'destructive' })
     } finally {
       setLoading(false)
       setPendingOp(null)
@@ -297,7 +297,7 @@ export function AIChat() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-amber-500" />
+              <AlertTriangle className="h-5 w-5 text-foreground" />
               Confirm Database Change
             </DialogTitle>
             <DialogDescription>
@@ -319,7 +319,7 @@ export function AIChat() {
           )}
           <DialogFooter>
             <Button variant="outline" onClick={() => setConfirmDialogOpen(false)}>Cancel</Button>
-            <Button onClick={executeConfirmedWrite} className="bg-amber-600 hover:bg-amber-700 text-white">
+            <Button onClick={executeConfirmedWrite}>
               Apply Change
             </Button>
           </DialogFooter>
