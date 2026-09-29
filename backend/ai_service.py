@@ -97,10 +97,16 @@ async def _ollama_chat(system: str, user: str, temperature: float = 0.1) -> str:
         "stream": False,
         "options": {"temperature": temperature},
     }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
-        resp.raise_for_status()
-        return resp.json()["message"]["content"].strip()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+    except httpx.ConnectError:
+        raise ConnectionError(
+            f"Cannot reach Ollama at {OLLAMA_BASE_URL}. Is Ollama installed and running? "
+            f"Install it from https://ollama.com/download, then run: ollama pull {OLLAMA_MODEL}"
+        )
 
 # ── SQL validator (read path) ──────────────────────────────────────────────────
 
@@ -300,6 +306,8 @@ async def handle_ai_message(message: str, db: Session) -> dict:
 
         except (json.JSONDecodeError, ValueError) as e:
             return {"type": "error", "content": f"Could not parse write intent: {e}"}
+        except ConnectionError as e:
+            return {"type": "error", "content": str(e)}
 
     # ── Read / Q&A path ───────────────────────────────────────────────────────
     try:
