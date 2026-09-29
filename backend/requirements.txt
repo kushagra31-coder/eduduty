@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlalchemy
+pandas
+openpyxl
+pydantic
+python-multipart
+httpx
+weasyprint
