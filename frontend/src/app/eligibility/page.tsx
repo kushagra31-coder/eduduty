@@ -42,7 +42,7 @@ export default function EligibilityPage() {
     setIsLoading(true)
     try {
       // Hardcoded MST-1 for phase 1 demo
-      const res = await fetch('http://localhost:8000/eligibility/1')
+      const res = await fetch('/api/eligibility/1')
       if (res.ok) {
         const data = await res.json()
         setRecords(data)
@@ -75,7 +75,7 @@ export default function EligibilityPage() {
     }
 
     try {
-      const res = await fetch(`http://localhost:8000/eligibility/override/${selectedRecord.id}`, {
+      const res = await fetch(`/api/eligibility/override/${selectedRecord.id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

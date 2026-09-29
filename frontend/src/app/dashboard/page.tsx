@@ -4,7 +4,7 @@ import { useEffect, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Users, CheckCircle, Clock, CalendarDays, Upload, PenLine, Activity, ServerOff } from "lucide-react"
 
-const API = "http://localhost:8000"
+const API = "/api"
 
 type ActivityItem = {
   kind: string

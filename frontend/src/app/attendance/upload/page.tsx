@@ -57,7 +57,7 @@ export default function AttendanceUpload() {
 
     try {
       // Assuming backend runs on 8000
-      const res = await fetch('http://localhost:8000/upload-attendance/', {
+      const res = await fetch('/api/upload-attendance/', {
         method: 'POST',
         body: formData,
       })

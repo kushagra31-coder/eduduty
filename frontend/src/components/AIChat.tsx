@@ -70,7 +70,7 @@ function WriteProposalCard({ opJson, onConfirm, onDismiss }: {
 }
 
 function PDFLinkCard({ link, message }: { link: string; message: string }) {
-  const fullUrl = `http://localhost:8000${link}`
+  const fullUrl = `/api${link}`
   return (
     <div className="rounded-xl border border-foreground/30 bg-muted/30 p-4 space-y-2 max-w-sm">
       <div className="flex items-center gap-2">
@@ -118,7 +118,7 @@ export function AIChat() {
     setLoading(true)
 
     try {
-      const res = await fetch('http://localhost:8000/ai/query', {
+      const res = await fetch('/api/ai/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
@@ -182,7 +182,7 @@ export function AIChat() {
     setConfirmDialogOpen(false)
     setLoading(true)
     try {
-      const res = await fetch('http://localhost:8000/ai/confirm-write', {
+      const res = await fetch('/api/ai/confirm-write', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ op_json: pendingOp.opJson }),

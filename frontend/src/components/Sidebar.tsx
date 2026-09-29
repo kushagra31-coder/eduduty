@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, Upload, CheckSquare, Settings, Sun, Moon, Bot, CalendarDays } from 'lucide-react';
+import { Home, Upload, CheckSquare, Settings, Sun, Moon, Bot, CalendarDays, Armchair } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button';
 const NAV_LINKS = [
   { href: "/dashboard", label: "Dashboard", icon: Home },
   { href: "/attendance/upload", label: "Upload Attendance", icon: Upload },
+  { href: "/attendance/tracker", label: "MST Attendance Tracker", icon: Armchair },
   { href: "/eligibility", label: "Eligibility", icon: CheckSquare },
   { href: "/ai", label: "AI Assistant", icon: Bot },
   { href: "/timetable", label: "Timetable", icon: CalendarDays },
