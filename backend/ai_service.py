@@ -1,16 +1,26 @@
 """
-AI Service — local Ollama integration for MST Operations Portal.
+AI Service — cloud-first LLM integration for MST Operations Portal.
 
 Architecture:
-  - Read path:  NL question → Ollama generates SELECT → validated → run on ai_reader views → Ollama formats answer
-  - Write path: NL intent   → Ollama returns structured JSON → validated Pydantic schema →
+  - LLM provider chain (tried in order, first success wins):
+      1. Groq cloud API   (GROQ_API_KEY)   — free tier, no card, fastest
+      2. Gemini cloud API (GEMINI_API_KEY) — free tier via Google AI Studio
+      3. Local Ollama     (fallback for fully-offline dev)
+    Both cloud providers use the OpenAI-compatible /chat/completions API.
+    The backend only needs an API key as an environment variable — nothing to
+    install or keep running on the host, so the site works the same on a
+    laptop, Render, Railway, or any VPS.
+  - Read path:  NL question → LLM generates SELECT → validated → run on ai_reader views → LLM formats answer
+  - Write path: NL intent   → LLM returns structured JSON → validated Pydantic schema →
                               dispatched to named ORM operation → audit_log entry created
   - PDF path:   triggered by explicit intent keyword → returns download URL
 
 Never executes raw SQL from the model. Writes go through the ORM CRUD layer only.
+API keys are never logged or returned to the client.
 """
 
 import json
+import os
 import re
 import httpx
 from sqlalchemy.orm import Session
@@ -18,8 +28,36 @@ from sqlalchemy import text
 import models
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL    = "gemma2:2b"   # change to qwen2.5-coder:1.5b if preferred
+# Cloud-first: the AI works wherever the backend is hosted — no local Ollama needed.
+# Providers are tried in AI_PROVIDERS order; entries without a key are skipped.
+#
+#   Get a free Groq key (no credit card): https://console.groq.com/keys
+#   Windows PowerShell — set for the current session BEFORE starting uvicorn
+#   (do NOT commit the key; backend/.env is tracked in git):
+#       $env:GROQ_API_KEY="gsk_..."
+#   Optional overrides:
+#       $env:GROQ_MODEL="openai/gpt-oss-20b"   # if Groq deprecates the default
+#       $env:GEMINI_API_KEY="..."              # backup provider from https://aistudio.google.com/
+#       $env:AI_PROVIDERS="groq,ollama"        # change order / drop providers
+#   On Render / Railway / VPS: add GROQ_API_KEY as an environment variable.
+
+GROQ_API_KEY  = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL    = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_BASE_URL = os.environ.get(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "gemma2:2b")
+
+AI_PROVIDERS = [
+    p.strip().lower()
+    for p in os.environ.get("AI_PROVIDERS", "groq,gemini,ollama").split(",")
+    if p.strip()
+]
 
 # Only these views are queryable by the AI (read path)
 ALLOWED_READ_VIEWS = {
@@ -96,10 +134,41 @@ Format the result clearly and concisely. Use plain English. No SQL. No JSON. No 
 Keep it under 4 sentences.
 """
 
-# ── Ollama client ──────────────────────────────────────────────────────────────
+# ── LLM provider chain ─────────────────────────────────────────────────────────
+
+async def _openai_compat_chat(base_url: str, api_key: str, model: str,
+                              system: str, user: str, temperature: float) -> str:
+    """POST to an OpenAI-compatible /chat/completions endpoint (Groq, Gemini)."""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "temperature": temperature,
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{base_url}/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        if resp.status_code == 401:
+            raise RuntimeError("API key rejected (401) — check the key and try again.")
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Model '{model}' not found (404) — it may have been deprecated. "
+                f"Check the provider's current model list and set the *_MODEL env var."
+            )
+        if resp.status_code == 429:
+            raise RuntimeError("Rate limit hit (429) — wait a minute and retry.")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
 
 async def _ollama_chat(system: str, user: str, temperature: float = 0.1) -> str:
-    """Send a chat completion request to the local Ollama instance."""
+    """Send a chat completion request to the local Ollama instance (offline fallback)."""
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
@@ -116,9 +185,39 @@ async def _ollama_chat(system: str, user: str, temperature: float = 0.1) -> str:
             return resp.json()["message"]["content"].strip()
     except httpx.ConnectError:
         raise ConnectionError(
-            f"Cannot reach Ollama at {OLLAMA_BASE_URL}. Is Ollama installed and running? "
-            f"Install it from https://ollama.com/download, then run: ollama pull {OLLAMA_MODEL}"
+            f"Cannot reach Ollama at {OLLAMA_BASE_URL}. "
+            f"Start Ollama (https://ollama.com/download) and run: ollama pull {OLLAMA_MODEL}"
         )
+
+
+async def _llm_chat(system: str, user: str, temperature: float = 0.1) -> str:
+    """Try each configured provider in order; the first success wins."""
+    errors = []
+    for provider in AI_PROVIDERS:
+        try:
+            if provider == "groq":
+                if not GROQ_API_KEY:
+                    errors.append("groq: GROQ_API_KEY not set")
+                    continue
+                return await _openai_compat_chat(
+                    GROQ_BASE_URL, GROQ_API_KEY, GROQ_MODEL, system, user, temperature)
+            elif provider == "gemini":
+                if not GEMINI_API_KEY:
+                    errors.append("gemini: GEMINI_API_KEY not set")
+                    continue
+                return await _openai_compat_chat(
+                    GEMINI_BASE_URL, GEMINI_API_KEY, GEMINI_MODEL, system, user, temperature)
+            elif provider == "ollama":
+                return await _ollama_chat(system, user, temperature)
+            else:
+                errors.append(f"{provider}: unknown provider name")
+        except Exception as e:
+            errors.append(f"{provider}: {e}")
+    raise RuntimeError(
+        "AI is unreachable — " + " | ".join(errors) +
+        ". Get a free Groq key at https://console.groq.com/keys and set GROQ_API_KEY, "
+        "or run Ollama locally."
+    )
 
 # ── SQL validator (read path) ──────────────────────────────────────────────────
 
@@ -301,7 +400,7 @@ async def handle_ai_message(message: str, db: Session) -> dict:
     write_keywords = ["override", "mark", "assign", "update", "change", "set"]
     if any(k in msg_lower for k in write_keywords):
         try:
-            raw_json = await _ollama_chat(WRITE_SYSTEM_PROMPT, message)
+            raw_json = await _llm_chat(WRITE_SYSTEM_PROMPT, message)
             # Strip any accidental markdown fences
             raw_json = re.sub(r"```[a-z]*\n?", "", raw_json).strip()
             op_json  = json.loads(raw_json)
@@ -318,19 +417,19 @@ async def handle_ai_message(message: str, db: Session) -> dict:
 
         except (json.JSONDecodeError, ValueError) as e:
             return {"type": "error", "content": f"Could not parse write intent: {e}"}
-        except ConnectionError as e:
+        except (ConnectionError, RuntimeError) as e:
             return {"type": "error", "content": str(e)}
 
     # ── Read / Q&A path ───────────────────────────────────────────────────────
     try:
-        sql_raw = await _ollama_chat(READ_SYSTEM_PROMPT, message)
+        sql_raw = await _llm_chat(READ_SYSTEM_PROMPT, message)
         sql     = _validate_read_sql(sql_raw)
 
         rows = db.execute(text(sql)).fetchall()
         result_str = str([dict(r._mapping) for r in rows])
 
         # Format result in plain English
-        formatted = await _ollama_chat(
+        formatted = await _llm_chat(
             FORMAT_SYSTEM_PROMPT,
             f"Question: {message}\nQuery result: {result_str}",
             temperature=0.3,
