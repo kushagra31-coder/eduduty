@@ -1205,3 +1205,170 @@ def faculty_status_for_exam(mst_exam_id: int, db: Session = Depends(get_db)):
             "reason": reason,
         })
     return out
+
+
+# ── Faculty × MST timetable grid ─────────────────────────────────────────────
+
+@app.get("/mst/faculty-grid")
+def faculty_exam_grid(db: Session = Depends(get_db)):
+    """
+    Returns every exam slot × every faculty member so the frontend can render
+    a full free/busy timetable grid without multiple round-trips.
+    """
+    exams = db.query(models.MstExam).order_by(
+        models.MstExam.exam_date, models.MstExam.time_slot).all()
+    all_faculty = db.query(models.Faculty).order_by(models.Faculty.name).all()
+    all_duties = db.query(models.InvigilationDuty).all()
+    rooms_map = {r.id: r.room_number for r in db.query(models.Room).all()}
+
+    # duty lookup: {(exam_id, faculty_id): room_number}
+    duty_lookup: dict[tuple, str] = {}
+    for d in all_duties:
+        if d.faculty_id:
+            duty_lookup[(d.mst_exam_id, d.faculty_id)] = rooms_map.get(d.room_id, "?")
+
+    exam_rows = []
+    for exam in exams:
+        day = exam.exam_date.strftime("%a").upper() if exam.exam_date else None
+        if day:
+            day = _DAY_ALIASES.get(day, day)
+        start, end = "09:00", "12:00"
+        if exam.time_slot and "-" in exam.time_slot:
+            parts = [p.strip() for p in exam.time_slot.split("-", 1)]
+            if len(parts) == 2 and all(parts):
+                start, end = parts
+
+        if day:
+            avail_list = crud.check_faculty_availability(db, day, start, end)
+            avail_map = {r.faculty_id: r.status for r in avail_list}
+        else:
+            avail_map = {}
+
+        faculty_cells = []
+        for f in all_faculty:
+            if (exam.id, f.id) in duty_lookup:
+                cell_status = "on_duty"
+                cell_reason = f"Room {duty_lookup[(exam.id, f.id)]}"
+            elif f.exempt_from_duty:
+                cell_status = "exempt"
+                cell_reason = f.exempt_reason or "Exempt"
+            else:
+                raw = avail_map.get(f.id, "Available")
+                if raw == "Blocked":
+                    cell_status = "teaching"
+                    cell_reason = "Teaching"
+                else:
+                    cell_status = "free"
+                    cell_reason = "Free"
+            faculty_cells.append({
+                "faculty_id": f.id,
+                "status": cell_status,
+                "reason": cell_reason,
+            })
+
+        exam_rows.append({
+            "exam_id": exam.id,
+            "label": exam.label,
+            "exam_date": exam.exam_date.isoformat() if exam.exam_date else None,
+            "time_slot": exam.time_slot,
+            "faculty": faculty_cells,
+        })
+
+    return {
+        "exams": exam_rows,
+        "faculty": [{"id": f.id, "name": f.name, "abbreviation": f.abbreviation} for f in all_faculty],
+    }
+
+
+# ── MST Roll-call attendance (no seating plan required) ──────────────────────
+
+@app.get("/mst/attendance/rollcall/{mst_exam_id}")
+def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
+    """
+    Returns all eligible/seatable students for an exam with their current
+    attendance status so the teacher can do a fast roll-call.
+    Works even when no seating plan has been generated.
+    """
+    exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    # Fetch students scoped to the exam's class (or all if no class attached)
+    q = db.query(models.Student).filter_by(active=True)
+    if exam.class_id:
+        q = q.filter_by(class_id=exam.class_id)
+    students = q.order_by(models.Student.roll_number).all()
+
+    # Fetch existing attempt records
+    attempts = {
+        a.student_id: a.status
+        for a in db.query(models.MstAttempt).filter_by(mst_exam_id=mst_exam_id).all()
+    }
+
+    classes_map = {c.id: c.name for c in db.query(models.Class).all()}
+
+    return [
+        {
+            "student_id": s.id,
+            "roll_number": s.roll_number,
+            "name": s.name,
+            "batch_number": s.batch_number,
+            "class_name": classes_map.get(s.class_id, ""),
+            "status": attempts.get(s.id),  # None if not yet marked
+        }
+        for s in students
+    ]
+
+
+# ── AI routes ─────────────────────────────────────────────────────────────────
+import ai_service as _ai
+
+class AIQueryIn(BaseModel):
+    message: str
+
+class AIWriteConfirmIn(BaseModel):
+    op_json: dict
+
+@app.get("/ai/health")
+async def ai_health():
+    """Returns which AI providers are configured so the UI can show a status."""
+    import os
+    providers = []
+    if os.environ.get("GROQ_API_KEY"):
+        providers.append({"name": "groq", "configured": True})
+    else:
+        providers.append({"name": "groq", "configured": False, "hint": "Set GROQ_API_KEY in backend/.env"})
+    if os.environ.get("GEMINI_API_KEY"):
+        providers.append({"name": "gemini", "configured": True})
+    else:
+        providers.append({"name": "gemini", "configured": False, "hint": "Set GEMINI_API_KEY in backend/.env"})
+    import httpx
+    ollama_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as c:
+            r = await c.get("http://localhost:11434/api/tags")
+            ollama_ok = r.status_code == 200
+    except Exception:
+        pass
+    providers.append({"name": "ollama", "configured": ollama_ok})
+    any_ok = any(p["configured"] for p in providers)
+    return {"ready": any_ok, "providers": providers}
+
+
+@app.post("/ai/query")
+async def ai_query(req: AIQueryIn, db: Session = Depends(get_db)):
+    """Route a user message to the AI and return the response."""
+    result = await _ai.handle_ai_message(req.message, db)
+    return result
+
+
+@app.post("/ai/confirm-write")
+async def ai_confirm_write(req: AIWriteConfirmIn, db: Session = Depends(get_db)):
+    """Execute a previously-proposed write operation after user confirmation."""
+    try:
+        changed = _ai.execute_write_op(req.op_json, db)
+        return {"success": True, "changed": changed}
+    except (ValueError, KeyError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
