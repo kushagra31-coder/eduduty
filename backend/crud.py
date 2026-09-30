@@ -421,3 +421,222 @@ def restore_calculated_follow_up(db: Session, follow_up_id: int,
     db.commit()
     db.refresh(row)
     return row
+
+# ── Invigilation duty auto-scheduler ───────────────────────────────────────────
+# Greedy, explainable, deterministic: for each exam (chronological) and each
+# room, pick the free faculty member with the fewest duties so far.
+# A teacher is "free" for an exam slot when they:
+#   1. are not exempt from duty,
+#   2. have no regular class overlapping the slot (any year/class),
+#   3. have no other invigilation duty overlapping the slot,
+#   4. have not hit max_duties_per_day.
+# The scheduler only PROPOSES — a human reviews and applies.
+
+_DAY_ALIASES = {"THU": "THUR"}
+
+
+def _exam_slot(exam):
+    """Return (day_code, start, end) or (None, None, None) if unschedulable."""
+    if not exam.exam_date or not exam.time_slot or "-" not in exam.time_slot:
+        return None, None, None
+    parts = [p.strip() for p in exam.time_slot.split("-", 1)]
+    if len(parts) != 2 or not all(parts):
+        return None, None, None
+    day = exam.exam_date.strftime("%a").upper()
+    day = _DAY_ALIASES.get(day, day)
+    return day, parts[0], parts[1]
+
+
+def _slots_overlap(s1, e1, s2, e2):
+    return s1 < e2 and e1 > s2
+
+
+def _faculty_day_duties(db: Session, faculty_id: int, exam_date):
+    """Existing assigned duties for this faculty on this date (with slots)."""
+    rows = (
+        db.query(models.InvigilationDuty, models.MstExam)
+        .join(models.MstExam,
+              models.InvigilationDuty.mst_exam_id == models.MstExam.id)
+        .filter(models.InvigilationDuty.faculty_id == faculty_id,
+                models.InvigilationDuty.status == "Assigned",
+                models.MstExam.exam_date == exam_date)
+        .all()
+    )
+    return rows
+
+
+def propose_invigilation_duties(db: Session, mst_exam_ids: list):
+    """Return a duty proposal: assignments + explanations + unfilled rooms.
+
+    Does NOT write anything. Call apply_duty_proposal() to save.
+    """
+    exams = (
+        db.query(models.MstExam)
+        .filter(models.MstExam.id.in_(mst_exam_ids))
+        .order_by(models.MstExam.exam_date, models.MstExam.id)
+        .all()
+    )
+    faculty = {f.id: f for f in db.query(models.Faculty).all()}
+    rooms = {r.id: r.room_number for r in db.query(models.Room).all()}
+
+    # running counts: existing assigned duties per faculty (all dates) + proposal
+    total_duties = {
+        f.id: db.query(models.InvigilationDuty)
+                .filter_by(faculty_id=f.id, status="Assigned").count()
+        for f in faculty.values()
+    }
+    # (faculty_id, date) -> list of (start, end) already committed in this proposal
+    proposal_busy = {}
+
+    proposal = []
+    unfilled = []
+    skipped_exams = []
+
+    for exam in exams:
+        day, start, end = _exam_slot(exam)
+        if not day:
+            skipped_exams.append({
+                "mst_exam_id": exam.id, "label": exam.label,
+                "reason": "Exam needs a date and a time slot like 09:30-12:30",
+            })
+            continue
+        room_ids = sorted({
+            s.room_id for s in
+            db.query(models.Seat.room_id).filter_by(mst_exam_id=exam.id).distinct()
+        })
+        if not room_ids:
+            skipped_exams.append({
+                "mst_exam_id": exam.id, "label": exam.label,
+                "reason": "No seating plan (no rooms) for this exam yet",
+            })
+            continue
+
+        for room_id in room_ids:
+            # skip rooms that already have a duty assigned in the DB
+            existing = db.query(models.InvigilationDuty).filter_by(
+                mst_exam_id=exam.id, room_id=room_id).first()
+            if existing and existing.faculty_id and existing.status == "Assigned":
+                continue
+
+            candidates = []   # (total_duties, name, faculty, reason)
+            blockers = []
+            for f in faculty.values():
+                if f.exempt_from_duty:
+                    blockers.append(f"{f.name}: exempt ({f.exempt_reason or 'by admin'})")
+                    continue
+                clash = db.query(models.FacultyTimetable).filter(
+                    models.FacultyTimetable.faculty_id == f.id,
+                    models.FacultyTimetable.day_of_week == day,
+                    models.FacultyTimetable.period_start < end,
+                    models.FacultyTimetable.period_end > start,
+                ).first()
+                if clash:
+                    blockers.append(
+                        f"{f.name}: teaching "
+                        f"{clash.subject_code or 'a class'} ({clash.period_start}-{clash.period_end})")
+                    continue
+                # overlapping invigilation duty already in DB
+                overlap = False
+                for d, e in _faculty_day_duties(db, f.id, exam.exam_date):
+                    es, ee = _exam_slot(e)[1:]
+                    if es and _slots_overlap(start, end, es, ee):
+                        blockers.append(
+                            f"{f.name}: already invigilating room "
+                            f"{rooms.get(d.room_id, d.room_id)} ({es}-{ee})")
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                # overlapping duty already proposed in this run
+                for ps, pe in proposal_busy.get((f.id, str(exam.exam_date)), []):
+                    if _slots_overlap(start, end, ps, pe):
+                        blockers.append(f"{f.name}: already proposed for an overlapping slot")
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                # max duties per day
+                day_count = sum(
+                    1 for d, e in _faculty_day_duties(db, f.id, exam.exam_date)
+                ) + sum(
+                    1 for (fid, fdate), slots in proposal_busy.items()
+                    if fid == f.id and fdate == str(exam.exam_date)
+                    for _ in slots
+                )
+                if day_count >= (f.max_duties_per_day or 2):
+                    blockers.append(
+                        f"{f.name}: at daily limit ({day_count}/{f.max_duties_per_day or 2})")
+                    continue
+                candidates.append((total_duties[f.id], f.name, f,
+                                   f"No class {start}-{end}; {total_duties[f.id]} duties so far"))
+
+            if candidates:
+                candidates.sort(key=lambda c: (c[0], c[1]))
+                _, _, chosen, why = candidates[0]
+                proposal.append({
+                    "mst_exam_id": exam.id,
+                    "exam_label": exam.label,
+                    "exam_date": str(exam.exam_date),
+                    "time_slot": exam.time_slot,
+                    "room_id": room_id,
+                    "room_number": rooms.get(room_id, str(room_id)),
+                    "faculty_id": chosen.id,
+                    "faculty_name": chosen.name,
+                    "reason": why,
+                })
+                total_duties[chosen.id] += 1
+                proposal_busy.setdefault(
+                    (chosen.id, str(exam.exam_date)), []).append((start, end))
+            else:
+                unfilled.append({
+                    "mst_exam_id": exam.id,
+                    "exam_label": exam.label,
+                    "exam_date": str(exam.exam_date),
+                    "time_slot": exam.time_slot,
+                    "room_id": room_id,
+                    "room_number": rooms.get(room_id, str(room_id)),
+                    "reason": "No free faculty",
+                    "blockers": blockers,
+                })
+
+    return {
+        "proposal": proposal,
+        "unfilled": unfilled,
+        "skipped_exams": skipped_exams,
+        "stats": {
+            "exams": len(exams),
+            "rooms_filled": len(proposal),
+            "rooms_unfilled": len(unfilled),
+        },
+    }
+
+
+def apply_duty_proposal(db: Session, assignments: list, changed_by: int = None):
+    """Save a reviewed proposal. Each assignment: {mst_exam_id, room_id, faculty_id}."""
+    applied = []
+    now = datetime.datetime.utcnow()
+    for a in assignments:
+        d = db.query(models.InvigilationDuty).filter_by(
+            mst_exam_id=a["mst_exam_id"], room_id=a["room_id"]).first()
+        if not d:
+            d = models.InvigilationDuty(
+                mst_exam_id=a["mst_exam_id"], room_id=a["room_id"], status="Unfilled")
+            db.add(d)
+            db.flush()
+        old_faculty = d.faculty_id
+        d.faculty_id = a["faculty_id"]
+        d.status = "Assigned"
+        d.assigned_at = now
+        faculty = db.query(models.Faculty).filter_by(id=a["faculty_id"]).first()
+        db.add(models.AuditLog(
+            table_name="invigilation_duties",
+            record_id=d.id,
+            field_changed="faculty_id",
+            old_value=str(old_faculty) if old_faculty else None,
+            new_value=str(a["faculty_id"]),
+            changed_by=changed_by,
+            reason=f"Auto-scheduler proposal applied: {faculty.name if faculty else a['faculty_id']}",
+        ))
+        applied.append(d.id)
+    db.commit()
+    return {"applied": len(applied), "duty_ids": applied}

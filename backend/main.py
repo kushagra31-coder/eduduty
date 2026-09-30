@@ -1122,6 +1122,30 @@ def unassign_duty(duty_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+class AutoScheduleIn(BaseModel):
+    mst_exam_ids: list[int]
+
+@app.post("/mst/duties/auto-schedule")
+def auto_schedule_duties(req: AutoScheduleIn, db: Session = Depends(get_db)):
+    """Propose invigilation duties. Nothing is saved — review first, then apply."""
+    if not req.mst_exam_ids:
+        raise HTTPException(status_code=400, detail="Pick at least one exam")
+    return crud.propose_invigilation_duties(db, req.mst_exam_ids)
+
+
+class ApplyProposalIn(BaseModel):
+    assignments: list[dict]   # [{mst_exam_id, room_id, faculty_id}]
+    changed_by: int = None
+
+@app.post("/mst/duties/auto-schedule/apply")
+def apply_scheduled_duties(req: ApplyProposalIn, db: Session = Depends(get_db)):
+    """Save a reviewed proposal. Every assignment is audit-logged."""
+    for a in req.assignments:
+        if not all(k in a for k in ("mst_exam_id", "room_id", "faculty_id")):
+            raise HTTPException(status_code=400, detail=f"Bad assignment: {a}")
+    return crud.apply_duty_proposal(db, req.assignments, req.changed_by)
+
+
 @app.get("/mst/faculty-status", response_model=list[schemas.FacultyExamStatusOut])
 def faculty_status_for_exam(mst_exam_id: int, db: Session = Depends(get_db)):
     """
