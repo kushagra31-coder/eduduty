@@ -9,16 +9,16 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 
 const NAV_LINKS = [
-  { href: "/dashboard",        label: "Dashboard",             icon: Home },
-  { href: "/attendance/upload",label: "Upload Attendance",      icon: Upload },
-  { href: "/attendance/tracker",label: "MST Seat Map",          icon: Armchair },
-  { href: "/mst-rollcall",     label: "MST Roll Call",          icon: ClipboardCheck },
-  { href: "/eligibility",      label: "Eligibility",            icon: CheckSquare },
-  { href: "/follow-up",        label: "VT / Follow-up",         icon: ClipboardList },
-  { href: "/duties",           label: "Duty Scheduler",         icon: Users },
-  { href: "/timetable",        label: "Faculty Free Grid",      icon: CalendarDays },
-  { href: "/ai",               label: "AI Assistant",           icon: Bot },
-  { href: "/settings",         label: "Settings",               icon: Settings },
+  { href: "/dashboard",          label: "Dashboard",          icon: Home },
+  { href: "/attendance/upload",  label: "Upload Attendance",  icon: Upload },
+  { href: "/attendance/tracker", label: "MST Seat Map",       icon: Armchair },
+  { href: "/mst-rollcall",       label: "MST Roll Call",      icon: ClipboardCheck },
+  { href: "/eligibility",        label: "Eligibility",        icon: CheckSquare },
+  { href: "/follow-up",          label: "VT / Follow-up",     icon: ClipboardList },
+  { href: "/duties",             label: "Duty Scheduler",     icon: Users },
+  { href: "/timetable",          label: "Timetable",          icon: CalendarDays },
+  { href: "/ai",                 label: "AI Assistant",       icon: Bot },
+  { href: "/settings",           label: "Settings",           icon: Settings },
 ];
 
 
@@ -32,11 +32,11 @@ export function Sidebar({ className }: { className?: string }) {
   }, []);
 
   return (
-    <div className={cn("pb-12 border-r bg-background min-h-screen flex flex-col", className)}>
+    <div className={cn("pb-12 border-r bg-sidebar min-h-screen flex flex-col", className)}>
       <div className="space-y-4 py-4 flex-1">
         <div className="px-3 py-2">
           <div className="mb-6 px-4 flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-foreground text-background text-lg font-bold">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-primary-foreground text-lg font-bold shadow-sm">
               E
             </div>
             <div>
@@ -54,10 +54,10 @@ export function Sidebar({ className }: { className?: string }) {
                   key={href}
                   href={href}
                   className={cn(
-                    "w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                    "w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-all duration-150",
                     active
-                      ? "bg-foreground text-background"
-                      : "hover:bg-accent hover:text-accent-foreground"
+                      ? "bg-primary text-primary-foreground shadow-sm"
+                      : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
                   )}
                 >
                   <Icon className="h-4 w-4" />

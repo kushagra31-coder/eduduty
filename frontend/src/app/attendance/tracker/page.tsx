@@ -54,8 +54,8 @@ function StudentHalf({
 }: { student: SeatStudent | null; mark: Mark; onToggle: () => void }) {
   if (!student) {
     return (
-      <div className="flex-1 rounded-md border border-dashed border-muted-foreground/40 px-2 py-3 text-center text-xs text-muted-foreground">
-        empty
+      <div className="flex-1 rounded-md border border-dashed border-muted-foreground/20 bg-muted/20 px-2 py-3 flex items-center justify-center text-[10px] text-muted-foreground/60 transition-colors">
+        empty seat
       </div>
     )
   }
@@ -429,7 +429,20 @@ export default function AttendanceTracker() {
               <Card key={room.room_id}>
                 <CardHeader className="pb-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <CardTitle className="text-lg font-mono">Room {room.room_number}</CardTitle>
+                    <CardTitle className="text-lg font-mono flex items-center gap-4">
+                      Room {room.room_number}
+                      {room.capacity ? (
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground font-sans font-normal">
+                          <div className="w-24 h-2 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-black transition-all"
+                              style={{ width: `${Math.min(100, (room.seats.reduce((acc, s) => acc + (s.left ? 1 : 0) + (s.right ? 1 : 0), 0) / room.capacity) * 100)}%` }}
+                            />
+                          </div>
+                          {room.seats.reduce((acc, s) => acc + (s.left ? 1 : 0) + (s.right ? 1 : 0), 0)} / {room.capacity} seated
+                        </div>
+                      ) : null}
+                    </CardTitle>
                     <div className="flex items-center gap-2 text-sm">
                       {duty?.faculty_name ? (
                         <span className="flex items-center gap-2">
