@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/components/ui/use-toast"
 import {
   CheckCircle2, XCircle, MinusCircle, Search, RefreshCw,
-  Users, UserCheck, UserX, AlertCircle, Download,
+  Users, UserCheck, UserX, AlertCircle,
 } from "lucide-react"
 
 const API = "/api"
@@ -134,7 +134,6 @@ export default function RollCallPage() {
     })
   }, [students, marks, search, filter])
 
-  const selectedExam = exams.find(e => e.id === examId)
 
   return (
     <div className="space-y-6">
@@ -233,14 +232,14 @@ export default function RollCallPage() {
 
           {/* Loading */}
           {loading ? (
-            <div className="flex items-center justify-center h-48">
-              <RefreshCw className="h-5 w-5 animate-spin text-muted-foreground" />
-              <span className="ml-2 text-muted-foreground text-sm">Loading students…</span>
+            <div className="flex flex-col items-center justify-center min-h-[400px] border rounded-xl bg-muted/5">
+              <RefreshCw className="h-6 w-6 animate-spin text-muted-foreground mb-4" />
+              <span className="text-muted-foreground text-sm font-medium">Loading students…</span>
             </div>
           ) : filtered.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-48 gap-2 text-muted-foreground">
-              <AlertCircle className="h-8 w-8" />
-              <p className="text-sm">No students match — try a different filter or search.</p>
+            <div className="flex flex-col items-center justify-center min-h-[400px] gap-3 text-muted-foreground border rounded-xl bg-muted/5">
+              <AlertCircle className="h-10 w-10 opacity-50" />
+              <p className="text-sm font-medium">No students match — try a different filter or search.</p>
             </div>
           ) : (
             /* Roll call list */
@@ -296,7 +295,7 @@ export default function RollCallPage() {
           )}
 
           {/* Progress bar */}
-          {students.length > 0 && (
+          {!loading && students.length > 0 && (
             <div className="space-y-1">
               <div className="flex justify-between text-xs text-muted-foreground">
                 <span>{counts.present + counts.absent} of {counts.total} marked</span>

@@ -36,21 +36,55 @@ LEFT JOIN mst_exams e1 ON e1.id = fs.mst_1_exam_id
 LEFT JOIN mst_exams e2 ON e2.id = fs.mst_2_exam_id
 """
 
-def _ensure_follow_up_view():
+def _ensure_ai_views():
     try:
+        views = {
+            "v_vt_follow_up_status": _FOLLOW_UP_VIEW_BODY,
+            "ai_eligibility_summary": """
+                SELECT c.name AS class_name, e.label AS mst_label,
+                SUM(CASE WHEN me.status = 'Eligible' THEN 1 ELSE 0 END) AS eligible_count,
+                SUM(CASE WHEN me.status = 'Not eligible' THEN 1 ELSE 0 END) AS ineligible_count,
+                SUM(CASE WHEN me.status = 'Missing' THEN 1 ELSE 0 END) AS missing_count
+                FROM mst_eligibility me
+                JOIN students s ON s.id = me.student_id
+                JOIN classes c ON c.id = s.class_id
+                JOIN mst_exams e ON e.id = me.mst_exam_id
+                GROUP BY c.name, e.label
+            """,
+            "ai_attendance_summary": """
+                SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
+                me.overall_pct, me.lowest_subject_pct
+                FROM mst_eligibility me
+                JOIN students s ON s.id = me.student_id
+                JOIN classes c ON c.id = s.class_id
+            """,
+            "ai_vt_candidates": """
+                SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
+                CASE WHEN fs.mst_1_appeared IS NULL THEN 'Missing' WHEN fs.mst_1_appeared THEN 'Present' ELSE 'Absent' END AS mst1_status,
+                CASE WHEN fs.mst_2_appeared IS NULL THEN 'Missing' WHEN fs.mst_2_appeared THEN 'Present' ELSE 'Absent' END AS mst2_status
+                FROM follow_up_statuses fs
+                JOIN students s ON s.id = fs.student_id
+                JOIN classes c ON c.id = s.class_id
+            """,
+            "ai_duty_roster": """
+                SELECT e.label AS mst_label, e.exam_date, r.room_number, f.name AS faculty_name, d.status AS duty_status
+                FROM invigilation_duties d
+                JOIN mst_exams e ON e.id = d.mst_exam_id
+                JOIN rooms r ON r.id = d.room_id
+                LEFT JOIN faculty f ON f.id = d.faculty_id
+            """
+        }
         with engine.begin() as conn:
-            if engine.dialect.name == "sqlite":
-                # SQLite has no CREATE OR REPLACE VIEW
-                conn.execute(models.text("DROP VIEW IF EXISTS v_vt_follow_up_status"))
-                conn.execute(models.text(
-                    "CREATE VIEW v_vt_follow_up_status AS" + _FOLLOW_UP_VIEW_BODY))
-            else:
-                conn.execute(models.text(
-                    "CREATE OR REPLACE VIEW v_vt_follow_up_status AS" + _FOLLOW_UP_VIEW_BODY))
-    except Exception as exc:  # never block app startup on a reporting view
-        print(f"warning: could not create v_vt_follow_up_status: {exc}", flush=True)
+            for vname, vbody in views.items():
+                if engine.dialect.name == "sqlite":
+                    conn.execute(models.text(f"DROP VIEW IF EXISTS {vname}"))
+                    conn.execute(models.text(f"CREATE VIEW {vname} AS {vbody}"))
+                else:
+                    conn.execute(models.text(f"CREATE OR REPLACE VIEW {vname} AS {vbody}"))
+    except Exception as exc:
+        print(f"warning: could not create views: {exc}", flush=True)
 
-_ensure_follow_up_view()
+_ensure_ai_views()
 
 app = FastAPI(title="MST Operations Portal API")
 
@@ -346,6 +380,17 @@ def _import_subject_workbook(db: Session, xls, filename: str):
             "rows": n,
             "total_classes": parsed["total_classes"],
         })
+
+    # Auto-assign batches by splitting the class in half
+    all_class_students = db.query(models.Student).filter_by(class_id=cls.id).all()
+    import re
+    def natural_sort_key(s):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s.roll_number or "")]
+    all_class_students.sort(key=natural_sort_key)
+    midpoint = (len(all_class_students) + 1) // 2
+    for i, s in enumerate(all_class_students):
+        s.batch_number = 1 if i < midpoint else 2
+    db.commit()
 
     for sid in students_seen:
         crud.compute_eligibility_for_student(db, sid, mst_exam_id)
@@ -715,11 +760,89 @@ def list_faculty(db: Session = Depends(get_db)):
             "abbreviation": f.abbreviation,
             "department": f.department,
             "exempt_from_duty": f.exempt_from_duty,
+            "exempt_reason": f.exempt_reason,
+            "max_duties_per_day": f.max_duties_per_day,
         }
         for f in rows
     ]
 
-# ── MST seat-map attendance tracker ──────────────────────────────────────────
+
+class FacultyCreate(BaseModel):
+    name: str
+    abbreviation: str | None = None
+    department: str | None = None
+    exempt_from_duty: bool = False
+    exempt_reason: str | None = None
+    max_duties_per_day: int = 2
+
+
+class FacultyUpdate(BaseModel):
+    name: str | None = None
+    abbreviation: str | None = None
+    department: str | None = None
+    exempt_from_duty: bool | None = None
+    exempt_reason: str | None = None
+    max_duties_per_day: int | None = None
+
+
+@app.post("/faculty")
+def create_faculty(req: FacultyCreate, db: Session = Depends(get_db)):
+    f = models.Faculty(
+        name=req.name,
+        abbreviation=req.abbreviation,
+        department=req.department,
+        exempt_from_duty=req.exempt_from_duty,
+        exempt_reason=req.exempt_reason,
+        max_duties_per_day=req.max_duties_per_day,
+    )
+    db.add(f)
+    db.commit()
+    db.refresh(f)
+    return {"id": f.id, "name": f.name, "abbreviation": f.abbreviation,
+            "department": f.department, "exempt_from_duty": f.exempt_from_duty,
+            "exempt_reason": f.exempt_reason, "max_duties_per_day": f.max_duties_per_day}
+
+
+@app.patch("/faculty/{faculty_id}")
+def update_faculty(faculty_id: int, req: FacultyUpdate, db: Session = Depends(get_db)):
+    f = db.query(models.Faculty).filter_by(id=faculty_id).first()
+    if not f:
+        raise HTTPException(status_code=404, detail="Faculty not found")
+    if req.name is not None:
+        f.name = req.name
+    if req.abbreviation is not None:
+        f.abbreviation = req.abbreviation
+    if req.department is not None:
+        f.department = req.department
+    if req.exempt_from_duty is not None:
+        f.exempt_from_duty = req.exempt_from_duty
+    if req.exempt_reason is not None:
+        f.exempt_reason = req.exempt_reason
+    if req.max_duties_per_day is not None:
+        f.max_duties_per_day = req.max_duties_per_day
+    db.commit()
+    db.refresh(f)
+    return {"id": f.id, "name": f.name, "abbreviation": f.abbreviation,
+            "department": f.department, "exempt_from_duty": f.exempt_from_duty,
+            "exempt_reason": f.exempt_reason, "max_duties_per_day": f.max_duties_per_day}
+
+
+class ClassCreate(BaseModel):
+    name: str
+    branch: str
+    year: int
+    section: str | None = None
+
+
+@app.post("/classes", response_model=schemas.ClassOut)
+def create_class(req: ClassCreate, db: Session = Depends(get_db)):
+    c = models.Class(name=req.name, branch=req.branch, year=req.year, section=req.section)
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+    return c
+
+
 # Seating rule: Batch 1 roll n sits beside Batch 2 roll n (sorted by roll
 # number, zipped in order). Students outside batches 1/2 sit alone.
 
@@ -780,10 +903,13 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
     if exam.class_id:
         q = q.filter_by(class_id=exam.class_id)
     students = q.all()
-    b1 = sorted([s for s in students if s.batch_number == 1], key=lambda s: s.roll_number or "")
-    b2 = sorted([s for s in students if s.batch_number == 2], key=lambda s: s.roll_number or "")
-    others = sorted([s for s in students if s.batch_number not in (1, 2)],
-                    key=lambda s: s.roll_number or "")
+    import re
+    def natural_sort_key(s):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s.roll_number or "")]
+
+    b1 = sorted([s for s in students if s.batch_number == 1], key=natural_sort_key)
+    b2 = sorted([s for s in students if s.batch_number == 2], key=natural_sort_key)
+    others = sorted([s for s in students if s.batch_number not in (1, 2)], key=natural_sort_key)
     pairs = [(l, r) for l, r in _zip_longest(b1, b2)]
     pairs += [(s, None) for s in others]
 
@@ -988,7 +1114,7 @@ class FollowUpRecalcIn(BaseModel):
 @app.post("/follow-up/recalculate")
 def recalculate_follow_ups(req: FollowUpRecalcIn, db: Session = Depends(get_db)):
     result = crud.recalculate_all_follow_ups(db, class_id=req.class_id)
-    _ensure_follow_up_view()  # keep the AI view in sync
+    _ensure_ai_views()  # keep the AI view in sync
     return result
 
 
@@ -1320,14 +1446,7 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
     ]
 
 
-# ── AI routes ─────────────────────────────────────────────────────────────────
-import ai_service as _ai
-
-class AIQueryIn(BaseModel):
-    message: str
-
-class AIWriteConfirmIn(BaseModel):
-    op_json: dict
+# ── AI health check ───────────────────────────────────────────────────────────
 
 @app.get("/ai/health")
 async def ai_health():
@@ -1354,21 +1473,3 @@ async def ai_health():
     any_ok = any(p["configured"] for p in providers)
     return {"ready": any_ok, "providers": providers}
 
-
-@app.post("/ai/query")
-async def ai_query(req: AIQueryIn, db: Session = Depends(get_db)):
-    """Route a user message to the AI and return the response."""
-    result = await _ai.handle_ai_message(req.message, db)
-    return result
-
-
-@app.post("/ai/confirm-write")
-async def ai_confirm_write(req: AIWriteConfirmIn, db: Session = Depends(get_db)):
-    """Execute a previously-proposed write operation after user confirmation."""
-    try:
-        changed = _ai.execute_write_op(req.op_json, db)
-        return {"success": True, "changed": changed}
-    except (ValueError, KeyError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
