@@ -1320,14 +1320,7 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
     ]
 
 
-# ── AI routes ─────────────────────────────────────────────────────────────────
-import ai_service as _ai
-
-class AIQueryIn(BaseModel):
-    message: str
-
-class AIWriteConfirmIn(BaseModel):
-    op_json: dict
+# ── AI health (provider status for the UI banner) ──────────────────────────────
 
 @app.get("/ai/health")
 async def ai_health():
@@ -1353,22 +1346,3 @@ async def ai_health():
     providers.append({"name": "ollama", "configured": ollama_ok})
     any_ok = any(p["configured"] for p in providers)
     return {"ready": any_ok, "providers": providers}
-
-
-@app.post("/ai/query")
-async def ai_query(req: AIQueryIn, db: Session = Depends(get_db)):
-    """Route a user message to the AI and return the response."""
-    result = await _ai.handle_ai_message(req.message, db)
-    return result
-
-
-@app.post("/ai/confirm-write")
-async def ai_confirm_write(req: AIWriteConfirmIn, db: Session = Depends(get_db)):
-    """Execute a previously-proposed write operation after user confirmation."""
-    try:
-        changed = _ai.execute_write_op(req.op_json, db)
-        return {"success": True, "changed": changed}
-    except (ValueError, KeyError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))

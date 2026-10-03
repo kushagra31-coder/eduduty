@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/components/ui/use-toast"
 import {
   CheckCircle2, XCircle, MinusCircle, Search, RefreshCw,
-  Users, UserCheck, UserX, AlertCircle, Download,
+  Users, UserCheck, UserX, AlertCircle,
 } from "lucide-react"
 
 const API = "/api"
@@ -133,8 +133,6 @@ export default function RollCallPage() {
       return matchSearch && matchFilter
     })
   }, [students, marks, search, filter])
-
-  const selectedExam = exams.find(e => e.id === examId)
 
   return (
     <div className="space-y-6">

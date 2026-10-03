@@ -1,7 +1,6 @@
 "use client"
 
 import { useEffect, useState, useMemo } from "react"
-import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { RefreshCw, Search, CheckCircle, BookOpen, Shield, Clock, AlertCircle } from "lucide-react"
@@ -116,7 +115,7 @@ export default function TimetablePage() {
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-bold tracking-tight">Faculty Free–Busy Grid</h1>
         <p className="text-sm text-muted-foreground">
-          Cross-reference of every MST exam slot against every teacher's timetable.
+          Cross-reference of every MST exam slot against every teacher&apos;s timetable.
           Green = available for invigilation.
         </p>
       </div>
