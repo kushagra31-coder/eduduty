@@ -152,10 +152,19 @@ def bulk_create_timetable_entries(db: Session, entries: list):
     return objs
 
 def get_timetable_for_class(db: Session, class_id: int, semester: str = None):
-    q = db.query(models.FacultyTimetable).filter(models.FacultyTimetable.class_id == class_id)
+    q = (
+        db.query(models.FacultyTimetable, models.Faculty.name.label("fac_name"))
+        .join(models.Faculty, models.FacultyTimetable.faculty_id == models.Faculty.id)
+        .filter(models.FacultyTimetable.class_id == class_id)
+    )
     if semester:
         q = q.filter(models.FacultyTimetable.semester == semester)
-    return q.all()
+    results = []
+    for entry, fac_name in q.all():
+        # Attach faculty_name so TimetableEntryOut can serialise it
+        entry.faculty_name = fac_name
+        results.append(entry)
+    return results
 
 def check_faculty_availability(db: Session, day_of_week: str, period_start: str, period_end: str):
     """

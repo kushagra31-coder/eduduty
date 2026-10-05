@@ -6,6 +6,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select"
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -16,6 +19,8 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useToast } from "@/components/ui/use-toast"
+
+type Exam = { id: number; label: string }
 
 type EligibilityRecord = {
   id: number
@@ -31,6 +36,8 @@ type EligibilityRecord = {
 }
 
 export default function EligibilityPage() {
+  const [exams, setExams] = useState<Exam[]>([])
+  const [examId, setExamId] = useState<number>(1)
   const [records, setRecords] = useState<EligibilityRecord[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [overrideModalOpen, setOverrideModalOpen] = useState(false)
@@ -38,11 +45,21 @@ export default function EligibilityPage() {
   const [overrideReason, setOverrideReason] = useState("")
   const { toast } = useToast()
 
+  // Load exams on mount
+  useEffect(() => {
+    fetch('/api/mst/exams')
+      .then(r => r.ok ? r.json() : [])
+      .then((data: Exam[]) => {
+        setExams(data)
+        if (data.length > 0) setExamId(data[data.length - 1].id) // pick the latest
+      })
+      .catch(() => {})
+  }, [])
+
   const fetchRecords = async () => {
     setIsLoading(true)
     try {
-      // Hardcoded MST-1 for phase 1 demo
-      const res = await fetch('/api/eligibility/1')
+      const res = await fetch(`/api/eligibility/${examId}`)
       if (res.ok) {
         const data = await res.json()
         setRecords(data)
@@ -56,7 +73,8 @@ export default function EligibilityPage() {
 
   useEffect(() => {
     fetchRecords()
-  }, [])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [examId])
 
   const handleOverrideClick = (record: EligibilityRecord) => {
     setSelectedRecord(record)
@@ -87,7 +105,7 @@ export default function EligibilityPage() {
       if (res.ok) {
         toast({ title: "Override updated successfully" })
         setOverrideModalOpen(false)
-        fetchRecords() // refresh data
+        fetchRecords()
       } else {
         throw new Error("Failed to update override")
       }
@@ -101,29 +119,45 @@ export default function EligibilityPage() {
   }
 
   const getStatusBadge = (status: string, override: boolean) => {
-    if (override) return <Badge className="border-2 border-foreground bg-transparent text-foreground hover:bg-muted">Overridden</Badge>
-    if (status === "Eligible") return <Badge className="bg-foreground text-background hover:bg-foreground/85">Eligible</Badge>
-    if (status === "Borderline") return <Badge className="border border-dashed border-foreground/60 bg-transparent text-foreground hover:bg-muted">Borderline</Badge>
-    if (status === "Not eligible") return <Badge className="border border-foreground/30 bg-foreground/10 text-foreground hover:bg-foreground/15">Not Eligible</Badge>
+    if (override) return <Badge className="border-2 border-primary bg-transparent text-primary hover:bg-primary/10">Overridden</Badge>
+    if (status === "Eligible") return <Badge className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/25">Eligible</Badge>
+    if (status === "Borderline") return <Badge className="bg-amber-500/20 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25">Borderline</Badge>
+    if (status === "Not eligible") return <Badge className="bg-red-500/20 text-red-700 dark:text-red-400 border-red-500/30 hover:bg-red-500/25">Not Eligible</Badge>
     return <Badge variant="secondary">Missing</Badge>
   }
 
+  const selectedExam = exams.find(e => e.id === examId)
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      <div className="flex justify-between items-end">
+      <div className="flex justify-between items-end flex-wrap gap-3">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">MST Eligibility</h1>
           <p className="text-muted-foreground mt-2">
             Review eligibility status and manage HOD overrides.
           </p>
         </div>
-        <Button variant="outline" onClick={fetchRecords}>Refresh Data</Button>
+        <div className="flex items-center gap-2">
+          {exams.length > 0 && (
+            <Select value={String(examId)} onValueChange={v => setExamId(Number(v))}>
+              <SelectTrigger className="w-40">
+                <SelectValue placeholder="Select exam" />
+              </SelectTrigger>
+              <SelectContent>
+                {exams.map(e => (
+                  <SelectItem key={e.id} value={String(e.id)}>{e.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          <Button variant="outline" onClick={fetchRecords}>Refresh</Button>
+        </div>
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>Eligibility Roster - MST-1</CardTitle>
-          <CardDescription>Based on 50% attendance threshold.</CardDescription>
+          <CardTitle>Eligibility Roster{selectedExam ? ` — ${selectedExam.label}` : ''}</CardTitle>
+          <CardDescription>Based on 50% overall attendance threshold. Borderline: 45–49%.</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="rounded-md border">

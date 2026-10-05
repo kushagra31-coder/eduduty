@@ -263,7 +263,7 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         label   = op_json["mst_label"]
         reason  = op_json["reason"]
 
-        student = db.query(models.Student).filter(models.Student.roll_number == roll).first()
+        student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{roll}%")).first()
         if not student:
             raise ValueError(f"Student with roll number {roll} not found.")
         exam = db.query(models.MstExam).filter(models.MstExam.label == label).first()
@@ -299,7 +299,7 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         if status not in allowed_statuses:
             raise ValueError(f"Invalid status '{status}'. Must be one of {allowed_statuses}")
 
-        student = db.query(models.Student).filter(models.Student.roll_number == roll).first()
+        student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{roll}%")).first()
         if not student:
             raise ValueError(f"Student {roll} not found.")
         exam = db.query(models.MstExam).filter(models.MstExam.label == label).first()
