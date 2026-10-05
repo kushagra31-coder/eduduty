@@ -170,3 +170,22 @@ class AuditLog(Base):
     changed_by = Column(Integer, ForeignKey("users.id"))
     reason = Column(String(300))
     changed_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+class FollowUpStatus(Base):
+    __tablename__ = "follow_up_statuses"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, unique=True, index=True)
+    rule_version = Column(String(30), nullable=False, default="absent-both-mst-v1")
+    mst_1_exam_id = Column(Integer, ForeignKey("mst_exams.id"))
+    mst_2_exam_id = Column(Integer, ForeignKey("mst_exams.id"))
+    # None = no appearance record yet (missing data is NOT absence)
+    mst_1_appeared = Column(Boolean)
+    mst_2_appeared = Column(Boolean)
+    calculated_status = Column(String(20), nullable=False, default="under_review")
+    final_status = Column(String(20), nullable=False, default="under_review")
+    override = Column(Boolean, default=False, nullable=False)
+    override_reason = Column(String(300))
+    override_by = Column(Integer)
+    overridden_at = Column(DateTime)
+    calculated_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

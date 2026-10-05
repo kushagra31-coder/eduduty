@@ -130,3 +130,88 @@ class FacultyAvailabilityResult(BaseModel):
     faculty_name: str
     status: str        # 'Available' | 'Blocked' | 'Exempt'
     reason: str
+
+# ── MST seat-map attendance tracker ──────────────────────────────────────────
+
+class MstExamCreate(BaseModel):
+    label: str
+    exam_date: Optional[date] = None
+    time_slot: Optional[str] = None
+    class_id: Optional[int] = None
+
+class MstExamOut(BaseModel):
+    id: int
+    label: str
+    exam_date: Optional[date] = None
+    time_slot: Optional[str] = None
+    class_id: Optional[int] = None
+    class Config:
+        from_attributes = True
+
+class RoomCreate(BaseModel):
+    room_number: str
+    capacity: Optional[int] = None
+
+class RoomOut(BaseModel):
+    id: int
+    room_number: str
+    capacity: Optional[int] = None
+    class Config:
+        from_attributes = True
+
+class SeatingGenerateIn(BaseModel):
+    mst_exam_id: int
+    room_ids: list[int]
+
+class SeatStudentOut(BaseModel):
+    id: int
+    roll_number: str
+    name: str
+    batch_number: Optional[int] = None
+
+class SeatOut(BaseModel):
+    id: int
+    seat_number: Optional[str] = None
+    room_id: int
+    room_number: str
+    left: Optional[SeatStudentOut] = None
+    right: Optional[SeatStudentOut] = None
+    left_status: Optional[str] = None
+    right_status: Optional[str] = None
+
+class RoomSeatingOut(BaseModel):
+    room_id: int
+    room_number: str
+    capacity: Optional[int] = None
+    seats: list[SeatOut]
+
+class MarkAttendanceIn(BaseModel):
+    mst_exam_id: int
+    student_id: int
+    status: str  # 'Present' | 'Absent'
+
+class AttendanceMarkOut(BaseModel):
+    student_id: int
+    status: str
+    marked_at: Optional[datetime] = None
+
+class DutyAssignIn(BaseModel):
+    mst_exam_id: int
+    room_id: int
+    faculty_id: int
+
+class DutyOut(BaseModel):
+    id: int
+    room_id: int
+    room_number: str
+    faculty_id: Optional[int] = None
+    faculty_name: Optional[str] = None
+    status: str
+
+class FacultyExamStatusOut(BaseModel):
+    faculty_id: int
+    faculty_name: str
+    abbreviation: Optional[str] = None
+    department: Optional[str] = None
+    status: str  # 'Available' | 'Teaching' | 'On duty' | 'Exempt'
+    reason: str

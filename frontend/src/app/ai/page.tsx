@@ -1,6 +1,7 @@
 import { AIChat } from '@/components/AIChat'
-import { Bot, Cpu, Lock } from 'lucide-react'
+import { Bot, Cloud, Lock, Cpu } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
+import AIHealthBanner from '@/components/AIHealthBanner'
 
 export default function AIPage() {
   return (
@@ -18,12 +19,16 @@ export default function AIPage() {
         </div>
       </div>
 
+      {/* AI health status */}
+      <AIHealthBanner />
+
       {/* Capability chips */}
       <div className="flex flex-wrap gap-2 text-xs">
         {[
-          { icon: <Cpu className="h-3 w-3" />, label: 'Runs locally via Ollama' },
-          { icon: <Lock className="h-3 w-3" />, label: 'Data never leaves your server' },
-          { icon: <Lock className="h-3 w-3" />, label: 'Writes need human confirmation' },
+          { icon: <Cloud className="h-3 w-3" />, label: 'Cloud AI — Groq or Gemini (no local install)' },
+          { icon: <Lock className="h-3 w-3" />,  label: 'Data never leaves your server' },
+          { icon: <Lock className="h-3 w-3" />,  label: 'Writes need human confirmation' },
+          { icon: <Cpu className="h-3 w-3" />,   label: 'Falls back to Ollama if available' },
         ].map(chip => (
           <div key={chip.label} className="flex items-center gap-1.5 rounded-full border bg-secondary/60 px-3 py-1 text-muted-foreground">
             {chip.icon}

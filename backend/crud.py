@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 import models, schemas
+import datetime
 from decimal import Decimal
 
 def get_classes(db: Session):
@@ -204,3 +205,438 @@ def check_faculty_availability(db: Session, day_of_week: str, period_start: str,
                 reason="No class or duty conflict",
             ))
     return results
+
+# ── VT / follow-up rule engine ─────────────────────────────────────────────────
+# Rule version: absent-both-mst-v1
+#   absent in BOTH MST-1 and MST-2  -> compulsory
+#   missing appearance data        -> under_review (missing != absent)
+#   otherwise                      -> not_required
+# Never derived from eligibility — an eligible-but-absent student is the target.
+
+FOLLOW_UP_RULE_VERSION = "absent-both-mst-v1"
+
+FOLLOW_UP_STATUSES = ("not_required", "compulsory", "under_review", "excused", "completed")
+
+# final_status values a human may set (calculated_status stays system-owned)
+OVERRIDABLE_FINAL_STATUSES = ("under_review", "excused", "completed")
+
+
+def _find_mst_exam(db: Session, student, label: str):
+    """Newest exam with this label, preferring the student's class, else unscoped."""
+    exam = (
+        db.query(models.MstExam)
+        .filter(models.MstExam.label == label,
+                models.MstExam.class_id == student.class_id)
+        .order_by(models.MstExam.id.desc())
+        .first()
+    )
+    if exam is None:
+        exam = (
+            db.query(models.MstExam)
+            .filter(models.MstExam.label == label,
+                    models.MstExam.class_id.is_(None))
+            .order_by(models.MstExam.id.desc())
+            .first()
+        )
+    return exam
+
+
+def _appeared(db: Session, student_id: int, exam):
+    """True/False from the attempt record; None when there is no record."""
+    if exam is None:
+        return None
+    att = (
+        db.query(models.MstAttempt)
+        .filter_by(student_id=student_id, mst_exam_id=exam.id)
+        .first()
+    )
+    if att is None:
+        return None
+    return att.status == "Present"
+
+
+def calculate_follow_up_status(mst_1_appeared, mst_2_appeared) -> str:
+    if mst_1_appeared is None or mst_2_appeared is None:
+        return "under_review"
+    if not mst_1_appeared and not mst_2_appeared:
+        return "compulsory"
+    return "not_required"
+
+
+def recalculate_follow_up(db: Session, student_id: int):
+    """Recompute one student's follow-up record from MST-1/MST-2 appearance.
+
+    Returns the FollowUpStatus row. Writes an audit entry when the
+    calculated status changes. A manual override never changes the
+    calculated recommendation — only the final status.
+    """
+    student = db.query(models.Student).filter_by(id=student_id).first()
+    if student is None:
+        return None
+
+    exam1 = _find_mst_exam(db, student, "MST-1")
+    exam2 = _find_mst_exam(db, student, "MST-2")
+    m1 = _appeared(db, student_id, exam1)
+    m2 = _appeared(db, student_id, exam2)
+    calculated = calculate_follow_up_status(m1, m2)
+
+    now = datetime.datetime.utcnow()
+    row = (
+        db.query(models.FollowUpStatus)
+        .filter_by(student_id=student_id)
+        .first()
+    )
+    if row is None:
+        row = models.FollowUpStatus(
+            student_id=student_id,
+            rule_version=FOLLOW_UP_RULE_VERSION,
+            mst_1_exam_id=exam1.id if exam1 else None,
+            mst_2_exam_id=exam2.id if exam2 else None,
+            mst_1_appeared=m1,
+            mst_2_appeared=m2,
+            calculated_status=calculated,
+            final_status=calculated,   # no override yet: final follows calculation
+            override=False,
+            calculated_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+
+    old_calculated = row.calculated_status
+    row.mst_1_exam_id = exam1.id if exam1 else None
+    row.mst_2_exam_id = exam2.id if exam2 else None
+    row.mst_1_appeared = m1
+    row.mst_2_appeared = m2
+    row.calculated_status = calculated
+    row.calculated_at = now
+    row.updated_at = now
+    # A fresh calculation refreshes final_status only when nobody overrode it.
+    if not row.override:
+        row.final_status = calculated
+
+    if old_calculated != calculated:
+        db.add(models.AuditLog(
+            table_name="follow_up_statuses",
+            record_id=row.id,
+            field_changed="calculated_status",
+            old_value=old_calculated,
+            new_value=calculated,
+            changed_by=None,   # system action, not a human
+            reason=(
+                f"Rule {FOLLOW_UP_RULE_VERSION}: "
+                f"MST-1={'Present' if m1 else 'Absent' if m1 is False else 'missing'}, "
+                f"MST-2={'Present' if m2 else 'Absent' if m2 is False else 'missing'}"
+            ),
+        ))
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def recalculate_all_follow_ups(db: Session, class_id: int = None) -> dict:
+    """Batch recalculation for every active student (optionally one class)."""
+    q = db.query(models.Student).filter(models.Student.active.is_(True))
+    if class_id:
+        q = q.filter(models.Student.class_id == class_id)
+    counts = {"evaluated": 0, "changed": 0}
+    for student in q.all():
+        before = (
+            db.query(models.FollowUpStatus.calculated_status)
+            .filter_by(student_id=student.id)
+            .scalar()
+        )
+        recalculate_follow_up(db, student.id)
+        counts["evaluated"] += 1
+        if before is not None and before != (
+            db.query(models.FollowUpStatus.calculated_status)
+            .filter_by(student_id=student.id)
+            .scalar()
+        ):
+            counts["changed"] += 1
+    return counts
+
+
+def override_follow_up(db: Session, follow_up_id: int, final_status: str,
+                       reason: str, changed_by: int = None):
+    """Authorized human decision. calculated_status is never touched."""
+    if final_status not in OVERRIDABLE_FINAL_STATUSES:
+        raise ValueError(
+            f"final_status must be one of {OVERRIDABLE_FINAL_STATUSES}"
+        )
+    if not reason or not reason.strip():
+        raise ValueError("A typed reason is required for every override.")
+    row = db.query(models.FollowUpStatus).filter_by(id=follow_up_id).first()
+    if row is None:
+        raise ValueError("Follow-up record not found.")
+
+    old_final = row.final_status
+    now = datetime.datetime.utcnow()
+    row.final_status = final_status
+    row.override = True
+    row.override_reason = reason.strip()
+    row.override_by = changed_by
+    row.overridden_at = now
+    row.updated_at = now
+    db.add(models.AuditLog(
+        table_name="follow_up_statuses",
+        record_id=row.id,
+        field_changed="final_status",
+        old_value=old_final,
+        new_value=final_status,
+        changed_by=changed_by,
+        reason=reason.strip(),
+    ))
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def restore_calculated_follow_up(db: Session, follow_up_id: int,
+                                 reason: str, changed_by: int = None):
+    """Drop the human override; final_status follows the rule again."""
+    if not reason or not reason.strip():
+        raise ValueError("A typed reason is required to restore the calculated status.")
+    row = db.query(models.FollowUpStatus).filter_by(id=follow_up_id).first()
+    if row is None:
+        raise ValueError("Follow-up record not found.")
+    old_final = row.final_status
+    row.final_status = row.calculated_status
+    row.override = False
+    row.override_reason = None
+    row.override_by = None
+    row.overridden_at = None
+    row.updated_at = datetime.datetime.utcnow()
+    db.add(models.AuditLog(
+        table_name="follow_up_statuses",
+        record_id=row.id,
+        field_changed="final_status",
+        old_value=old_final,
+        new_value=row.calculated_status,
+        changed_by=changed_by,
+        reason=f"Override cleared — restored calculated status. {reason.strip()}",
+    ))
+    db.commit()
+    db.refresh(row)
+    return row
+
+# ── Invigilation duty auto-scheduler ───────────────────────────────────────────
+# Greedy, explainable, deterministic: for each exam (chronological) and each
+# room, pick the free faculty member with the fewest duties so far.
+# A teacher is "free" for an exam slot when they:
+#   1. are not exempt from duty,
+#   2. have no regular class overlapping the slot (any year/class),
+#   3. have no other invigilation duty overlapping the slot,
+#   4. have not hit max_duties_per_day.
+# The scheduler only PROPOSES — a human reviews and applies.
+
+_DAY_ALIASES = {"THU": "THUR"}
+
+
+def _exam_slot(exam):
+    """Return (day_code, start, end) or (None, None, None) if unschedulable."""
+    if not exam.exam_date or not exam.time_slot or "-" not in exam.time_slot:
+        return None, None, None
+    parts = [p.strip() for p in exam.time_slot.split("-", 1)]
+    if len(parts) != 2 or not all(parts):
+        return None, None, None
+    day = exam.exam_date.strftime("%a").upper()
+    day = _DAY_ALIASES.get(day, day)
+    return day, parts[0], parts[1]
+
+
+def _slots_overlap(s1, e1, s2, e2):
+    return s1 < e2 and e1 > s2
+
+
+def _faculty_day_duties(db: Session, faculty_id: int, exam_date):
+    """Existing assigned duties for this faculty on this date (with slots)."""
+    rows = (
+        db.query(models.InvigilationDuty, models.MstExam)
+        .join(models.MstExam,
+              models.InvigilationDuty.mst_exam_id == models.MstExam.id)
+        .filter(models.InvigilationDuty.faculty_id == faculty_id,
+                models.InvigilationDuty.status == "Assigned",
+                models.MstExam.exam_date == exam_date)
+        .all()
+    )
+    return rows
+
+
+def propose_invigilation_duties(db: Session, mst_exam_ids: list):
+    """Return a duty proposal: assignments + explanations + unfilled rooms.
+
+    Does NOT write anything. Call apply_duty_proposal() to save.
+    """
+    exams = (
+        db.query(models.MstExam)
+        .filter(models.MstExam.id.in_(mst_exam_ids))
+        .order_by(models.MstExam.exam_date, models.MstExam.id)
+        .all()
+    )
+    faculty = {f.id: f for f in db.query(models.Faculty).all()}
+    rooms = {r.id: r.room_number for r in db.query(models.Room).all()}
+
+    # running counts: existing assigned duties per faculty (all dates) + proposal
+    total_duties = {
+        f.id: db.query(models.InvigilationDuty)
+                .filter_by(faculty_id=f.id, status="Assigned").count()
+        for f in faculty.values()
+    }
+    # (faculty_id, date) -> list of (start, end) already committed in this proposal
+    proposal_busy = {}
+
+    proposal = []
+    unfilled = []
+    skipped_exams = []
+
+    for exam in exams:
+        day, start, end = _exam_slot(exam)
+        if not day:
+            skipped_exams.append({
+                "mst_exam_id": exam.id, "label": exam.label,
+                "reason": "Exam needs a date and a time slot like 09:30-12:30",
+            })
+            continue
+        room_ids = sorted({
+            s.room_id for s in
+            db.query(models.Seat.room_id).filter_by(mst_exam_id=exam.id).distinct()
+        })
+        if not room_ids:
+            skipped_exams.append({
+                "mst_exam_id": exam.id, "label": exam.label,
+                "reason": "No seating plan (no rooms) for this exam yet",
+            })
+            continue
+
+        for room_id in room_ids:
+            # skip rooms that already have a duty assigned in the DB
+            existing = db.query(models.InvigilationDuty).filter_by(
+                mst_exam_id=exam.id, room_id=room_id).first()
+            if existing and existing.faculty_id and existing.status == "Assigned":
+                continue
+
+            candidates = []   # (total_duties, name, faculty, reason)
+            blockers = []
+            for f in faculty.values():
+                if f.exempt_from_duty:
+                    blockers.append(f"{f.name}: exempt ({f.exempt_reason or 'by admin'})")
+                    continue
+                clash = db.query(models.FacultyTimetable).filter(
+                    models.FacultyTimetable.faculty_id == f.id,
+                    models.FacultyTimetable.day_of_week == day,
+                    models.FacultyTimetable.period_start < end,
+                    models.FacultyTimetable.period_end > start,
+                ).first()
+                if clash:
+                    blockers.append(
+                        f"{f.name}: teaching "
+                        f"{clash.subject_code or 'a class'} ({clash.period_start}-{clash.period_end})")
+                    continue
+                # overlapping invigilation duty already in DB
+                overlap = False
+                for d, e in _faculty_day_duties(db, f.id, exam.exam_date):
+                    es, ee = _exam_slot(e)[1:]
+                    if es and _slots_overlap(start, end, es, ee):
+                        blockers.append(
+                            f"{f.name}: already invigilating room "
+                            f"{rooms.get(d.room_id, d.room_id)} ({es}-{ee})")
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                # overlapping duty already proposed in this run
+                for ps, pe in proposal_busy.get((f.id, str(exam.exam_date)), []):
+                    if _slots_overlap(start, end, ps, pe):
+                        blockers.append(f"{f.name}: already proposed for an overlapping slot")
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                # max duties per day
+                day_count = sum(
+                    1 for d, e in _faculty_day_duties(db, f.id, exam.exam_date)
+                ) + sum(
+                    1 for (fid, fdate), slots in proposal_busy.items()
+                    if fid == f.id and fdate == str(exam.exam_date)
+                    for _ in slots
+                )
+                if day_count >= (f.max_duties_per_day or 2):
+                    blockers.append(
+                        f"{f.name}: at daily limit ({day_count}/{f.max_duties_per_day or 2})")
+                    continue
+                candidates.append((total_duties[f.id], f.name, f,
+                                   f"No class {start}-{end}; {total_duties[f.id]} duties so far"))
+
+            if candidates:
+                candidates.sort(key=lambda c: (c[0], c[1]))
+                _, _, chosen, why = candidates[0]
+                proposal.append({
+                    "mst_exam_id": exam.id,
+                    "exam_label": exam.label,
+                    "exam_date": str(exam.exam_date),
+                    "time_slot": exam.time_slot,
+                    "room_id": room_id,
+                    "room_number": rooms.get(room_id, str(room_id)),
+                    "faculty_id": chosen.id,
+                    "faculty_name": chosen.name,
+                    "reason": why,
+                })
+                total_duties[chosen.id] += 1
+                proposal_busy.setdefault(
+                    (chosen.id, str(exam.exam_date)), []).append((start, end))
+            else:
+                unfilled.append({
+                    "mst_exam_id": exam.id,
+                    "exam_label": exam.label,
+                    "exam_date": str(exam.exam_date),
+                    "time_slot": exam.time_slot,
+                    "room_id": room_id,
+                    "room_number": rooms.get(room_id, str(room_id)),
+                    "reason": "No free faculty",
+                    "blockers": blockers,
+                })
+
+    return {
+        "proposal": proposal,
+        "unfilled": unfilled,
+        "skipped_exams": skipped_exams,
+        "stats": {
+            "exams": len(exams),
+            "rooms_filled": len(proposal),
+            "rooms_unfilled": len(unfilled),
+        },
+    }
+
+
+def apply_duty_proposal(db: Session, assignments: list, changed_by: int = None):
+    """Save a reviewed proposal. Each assignment: {mst_exam_id, room_id, faculty_id}."""
+    applied = []
+    now = datetime.datetime.utcnow()
+    for a in assignments:
+        d = db.query(models.InvigilationDuty).filter_by(
+            mst_exam_id=a["mst_exam_id"], room_id=a["room_id"]).first()
+        if not d:
+            d = models.InvigilationDuty(
+                mst_exam_id=a["mst_exam_id"], room_id=a["room_id"], status="Unfilled")
+            db.add(d)
+            db.flush()
+        old_faculty = d.faculty_id
+        d.faculty_id = a["faculty_id"]
+        d.status = "Assigned"
+        d.assigned_at = now
+        faculty = db.query(models.Faculty).filter_by(id=a["faculty_id"]).first()
+        db.add(models.AuditLog(
+            table_name="invigilation_duties",
+            record_id=d.id,
+            field_changed="faculty_id",
+            old_value=str(old_faculty) if old_faculty else None,
+            new_value=str(a["faculty_id"]),
+            changed_by=changed_by,
+            reason=f"Auto-scheduler proposal applied: {faculty.name if faculty else a['faculty_id']}",
+        ))
+        applied.append(d.id)
+    db.commit()
+    return {"applied": len(applied), "duty_ids": applied}
