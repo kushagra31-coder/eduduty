@@ -134,7 +134,6 @@ export default function RollCallPage() {
     })
   }, [students, marks, search, filter])
 
-
   return (
     <div className="space-y-6">
       {/* Header */}

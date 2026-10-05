@@ -1446,7 +1446,7 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
     ]
 
 
-# ── AI health check ───────────────────────────────────────────────────────────
+# ── AI health (provider status for the UI banner) ──────────────────────────────
 
 @app.get("/ai/health")
 async def ai_health():
@@ -1472,4 +1472,3 @@ async def ai_health():
     providers.append({"name": "ollama", "configured": ollama_ok})
     any_ok = any(p["configured"] for p in providers)
     return {"ready": any_ok, "providers": providers}
-
