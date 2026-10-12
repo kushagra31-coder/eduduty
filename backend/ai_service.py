@@ -384,21 +384,43 @@ async def handle_ai_message(message: str, db: Session) -> dict:
     msg_lower = message.lower()
 
     # ── PDF intent detection ──────────────────────────────────────────────────
-    if any(k in msg_lower for k in ["pdf", "report", "download", "print"]):
-        # Look for a roll number pattern
-        roll_match = re.search(r"\b\d{4,}\b", message)
-        if roll_match:
-            roll = roll_match.group()
-            return {
-                "type": "pdf_link",
-                "content": f"/pdf/student/{roll}",
-                "message": f"Here is the PDF report link for roll number {roll}.",
-            }
-        return {
-            "type": "pdf_link",
-            "content": "/pdf/seating/1/1",
-            "message": "Here is the seating chart PDF link.",
-        }
+    if any(k in msg_lower for k in ["pdf", "download", "print"]):
+        # 1. Look for roll number candidate and verify against DB
+        roll_matches = re.findall(r"\b[A-Za-z0-9_-]{4,}\b", message)
+        for cand in roll_matches:
+            student = db.query(models.Student).filter(models.Student.roll_number.ilike(cand)).first()
+            if student:
+                return {
+                    "type": "pdf_link",
+                    "content": f"/pdf/student/{student.roll_number}",
+                    "message": f"Here is the PDF report link for {student.name} ({student.roll_number}).",
+                }
+
+        # 2. Look for exam + room for seating chart PDF
+        if "seating" in msg_lower or ("exam" in msg_lower and "room" in msg_lower):
+            rooms = db.query(models.Room).all()
+            matched_room = None
+            for r in rooms:
+                if r.room_number and r.room_number.lower() in msg_lower:
+                    matched_room = r
+                    break
+
+            exams = db.query(models.MstExam).all()
+            matched_exam = None
+            for e in exams:
+                if e.label and (e.label.lower() in msg_lower or e.label.lower().replace("-", " ") in msg_lower):
+                    matched_exam = e
+                    break
+
+            if matched_room and matched_exam:
+                return {
+                    "type": "pdf_link",
+                    "content": f"/pdf/seating/{matched_exam.id}/{matched_room.id}",
+                    "message": f"Here is the seating chart PDF link for {matched_exam.label} in {matched_room.room_number}.",
+                }
+
+        # If entity could not be resolved, fall through to normal query path.
+        # Do not return a hardcoded /pdf/seating/1/1 shortcut.
 
     # ── Write intent detection ────────────────────────────────────────────────
     write_keywords = ["override", "mark", "assign", "update", "change", "set"]
