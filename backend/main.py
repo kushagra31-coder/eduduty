@@ -1,3 +1,4 @@
+# SECURITY NOTE: MVP does not enforce authentication. Do not deploy to public internet without adding auth middleware.
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response

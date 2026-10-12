@@ -1,3 +1,4 @@
+// SECURITY NOTE: MVP does not enforce authentication. Do not deploy to public internet without adding auth middleware.
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import localFont from "next/font/local";
