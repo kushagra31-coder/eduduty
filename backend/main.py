@@ -91,6 +91,12 @@ def _ensure_ai_views():
 
 _ensure_ai_views()
 
+try:
+    from migrate_unique_constraints import run_unique_constraint_migration
+    run_unique_constraint_migration(engine)
+except Exception as exc:
+    print(f"warning: unique constraint migration: {exc}", flush=True)
+
 app = FastAPI(title="MST Operations Portal API")
 
 app.add_middleware(
