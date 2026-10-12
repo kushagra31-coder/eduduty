@@ -12,6 +12,7 @@ import pandas as pd
 import io
 import re
 from difflib import SequenceMatcher
+import datetime as _dt
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -1135,6 +1136,112 @@ def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)
     # Appearance changed -> VT/follow-up rule must be re-evaluated
     crud.recalculate_follow_up(db, att.student_id)
     return {"student_id": att.student_id, "status": att.status, "marked_at": att.marked_at}
+
+
+@app.post("/mst/attendance/mark-bulk", response_model=schemas.AttendanceMarkBulkOut)
+def mark_attendance_bulk(req: schemas.MarkAttendanceBulkIn, db: Session = Depends(get_db)):
+    if req.status not in ("Present", "Absent"):
+        raise HTTPException(status_code=400, detail="status must be Present or Absent")
+
+    exam = db.query(models.MstExam).filter_by(id=req.mst_exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    # Item 6 Eligibility Gate: HTTP 409 if no eligibility records exist for this exam
+    elig_count = db.query(models.MstEligibility).filter_by(mst_exam_id=req.mst_exam_id).count()
+    if elig_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Eligibility not computed for this exam. Compute eligibility first."
+        )
+
+    if not req.student_ids:
+        return {
+            "marked_count": 0,
+            "mst_exam_id": req.mst_exam_id,
+            "status": req.status,
+            "student_ids": [],
+            "skipped": [],
+        }
+
+    # Fetch eligibility for the requested students
+    elig_records = {
+        e.student_id: e
+        for e in db.query(models.MstEligibility)
+        .filter(
+            models.MstEligibility.mst_exam_id == req.mst_exam_id,
+            models.MstEligibility.student_id.in_(req.student_ids)
+        )
+        .all()
+    }
+
+    # Fetch existing attempt records for these students
+    existing_attempts = {
+        a.student_id: a
+        for a in db.query(models.MstAttempt)
+        .filter(
+            models.MstAttempt.mst_exam_id == req.mst_exam_id,
+            models.MstAttempt.student_id.in_(req.student_ids)
+        )
+        .all()
+    }
+
+    now = _dt.datetime.utcnow()
+    marked_student_ids = []
+    skipped = []
+
+    for sid in req.student_ids:
+        # Check eligibility gate: student must be Eligible or have an active override
+        elig = elig_records.get(sid)
+        if not elig or (elig.status != "Eligible" and not elig.override):
+            skipped.append({
+                "student_id": sid,
+                "reason": f"Not eligible for exam (status: {elig.status if elig else 'None'}, override: {elig.override if elig else False})"
+            })
+            continue
+
+        att = existing_attempts.get(sid)
+        old_status = att.status if att else None
+        if not att:
+            att = models.MstAttempt(
+                mst_exam_id=req.mst_exam_id,
+                student_id=sid,
+                status=req.status,
+                marked_at=now,
+            )
+            db.add(att)
+            db.flush()  # populate att.id
+        else:
+            att.status = req.status
+            att.marked_at = now
+
+        # One audit entry per student
+        db.add(models.AuditLog(
+            table_name="mst_attempts",
+            record_id=att.id,
+            field_changed="status",
+            old_value=old_status,
+            new_value=req.status,
+            reason=f"bulk attendance mark ({req.status}) for exam {req.mst_exam_id}",
+            changed_by="USER",
+        ))
+
+        marked_student_ids.append(sid)
+
+    # Commit all changes in ONE atomic transaction
+    db.commit()
+
+    # Recalculate follow-up / VT rules for all marked students
+    for sid in marked_student_ids:
+        crud.recalculate_follow_up(db, sid)
+
+    return {
+        "marked_count": len(marked_student_ids),
+        "mst_exam_id": req.mst_exam_id,
+        "status": req.status,
+        "student_ids": marked_student_ids,
+        "skipped": skipped,
+    }
 
 
 @app.get("/mst/attendance/{mst_exam_id}")

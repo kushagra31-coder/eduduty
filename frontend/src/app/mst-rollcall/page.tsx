@@ -101,12 +101,31 @@ export default function RollCallPage() {
     }
   }
 
-  // Mark ALL visible students as present
+  // Mark ALL visible students as present in one atomic bulk request
   async function markAllPresent() {
     if (!examId) return
     const toMark = filtered.filter(s => marks[s.student_id] !== "Present")
-    for (const s of toMark) await toggle(s.student_id)
-    toast({ title: `${toMark.length} students marked Present` })
+    if (toMark.length === 0) return
+
+    try {
+      await apiFetch("/mst/attendance/mark-bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mst_exam_id: examId,
+          student_ids: toMark.map(s => s.student_id),
+          status: "Present",
+        }),
+      })
+      setMarks(prev => {
+        const next = { ...prev }
+        for (const s of toMark) next[s.student_id] = "Present"
+        return next
+      })
+      toast({ title: `${toMark.length} students marked Present` })
+    } catch (e) {
+      toast({ title: "Bulk save failed", description: (e as Error).message, variant: "destructive" })
+    }
   }
 
   // Counts

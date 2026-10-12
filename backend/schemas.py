@@ -217,6 +217,18 @@ class AttendanceMarkOut(BaseModel):
     status: str
     marked_at: Optional[datetime] = None
 
+class MarkAttendanceBulkIn(BaseModel):
+    mst_exam_id: int
+    student_ids: list[int]
+    status: str = "Present"  # 'Present' | 'Absent'
+
+class AttendanceMarkBulkOut(BaseModel):
+    marked_count: int
+    mst_exam_id: int
+    status: str
+    student_ids: list[int]
+    skipped: list[dict] = []
+
 class DutyAssignIn(BaseModel):
     mst_exam_id: int
     room_id: int
