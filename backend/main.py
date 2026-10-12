@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Union, List, Optional
@@ -312,18 +313,45 @@ def _class_from_filename(db: Session, filename: str):
     return c, roman or None
 
 
-def _ensure_dummy_exam(db: Session) -> int:
-    mst_exam_id = 1
-    if not db.query(models.MstExam).filter_by(id=mst_exam_id).first():
-        db.add(models.MstExam(id=mst_exam_id, label="MST-1"))
-        db.commit()
-    return mst_exam_id
+def get_non_attempted_exams_for_class(db: Session, class_id: int) -> list[models.MstExam]:
+    """Find all exams applicable to this class that have no recorded student attempts.
+    If no exams exist, initialize a default MST-1 exam."""
+    attempted_exam_ids = {
+        row[0] for row in (
+            db.query(models.MstAttempt.mst_exam_id)
+            .join(models.Student, models.MstAttempt.student_id == models.Student.id)
+            .filter(models.Student.class_id == class_id)
+            .distinct()
+            .all()
+        )
+    }
+    candidate_exams = db.query(models.MstExam).filter(
+        or_(models.MstExam.class_id == class_id, models.MstExam.class_id.is_(None))
+    ).all()
+    non_attempted = [e for e in candidate_exams if e.id not in attempted_exam_ids]
+
+    if not non_attempted:
+        if not candidate_exams:
+            default_exam = models.MstExam(label="MST-1", class_id=class_id)
+            db.add(default_exam)
+            db.commit()
+            db.refresh(default_exam)
+            return [default_exam]
+        else:
+            next_label = f"MST-{len(candidate_exams) + 1}"
+            next_exam = models.MstExam(label=next_label, class_id=class_id)
+            db.add(next_exam)
+            db.commit()
+            db.refresh(next_exam)
+            return [next_exam]
+
+    return non_attempted
 
 
 def _import_subject_workbook(db: Session, xls, filename: str):
     """Import every per-subject sheet in the workbook."""
     cls, semester = _class_from_filename(db, filename)
-    mst_exam_id = _ensure_dummy_exam(db)
+    target_exams = get_non_attempted_exams_for_class(db, cls.id)
     sheets_summary = []
     total_records = 0
     students_seen = set()
@@ -394,7 +422,8 @@ def _import_subject_workbook(db: Session, xls, filename: str):
     db.commit()
 
     for sid in students_seen:
-        crud.compute_eligibility_for_student(db, sid, mst_exam_id)
+        for exam in target_exams:
+            crud.compute_eligibility_for_student(db, sid, exam.id)
 
     db.add(models.AuditLog(
         table_name="attendance_records", record_id=0, field_changed="import",
@@ -464,13 +493,6 @@ async def upload_attendance(
                 if m:
                     return int(m.group(0))
             return None
-        mst_exam_id = 1
-        dummy_exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
-        if not dummy_exam:
-            dummy_exam = models.MstExam(id=mst_exam_id, label="MST-1")
-            db.add(dummy_exam)
-            db.commit()
-
         imported_count = 0
         for _, row in df.iterrows():
             roll_number = str(row.get(c_roll, '')).strip() if c_roll else ''
@@ -498,7 +520,9 @@ async def upload_attendance(
                 classes_attended=attended
             )
             crud.create_attendance_record(db, att)
-            crud.compute_eligibility_for_student(db, student.id, mst_exam_id)
+            target_exams = get_non_attempted_exams_for_class(db, student.class_id)
+            for ex in target_exams:
+                crud.compute_eligibility_for_student(db, student.id, ex.id)
             imported_count += 1
         # Record the import so the dashboard activity feed can show it
         db.add(models.AuditLog(
@@ -516,13 +540,18 @@ async def upload_attendance(
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 @app.get("/dashboard/stats")
-def dashboard_stats(db: Session = Depends(get_db)):
-    exam = db.query(models.MstExam).filter_by(id=1).first()
+def dashboard_stats(mst_exam_id: Optional[int] = None, db: Session = Depends(get_db)):
+    if mst_exam_id:
+        exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
+    else:
+        exam = db.query(models.MstExam).order_by(models.MstExam.id.desc()).first()
+
     exam_label = exam.label if exam else "MST-1"
+    resolved_exam_id = exam.id if exam else 1
 
     students = db.query(models.Student).all()
     classes = {c.id: c for c in db.query(models.Class).all()}
-    elig_rows = db.query(models.MstEligibility).filter_by(mst_exam_id=1).all()
+    elig_rows = db.query(models.MstEligibility).filter_by(mst_exam_id=resolved_exam_id).all() if exam else []
     elig_by_student = {e.student_id: e for e in elig_rows}
 
     total = len(students)
