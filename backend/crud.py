@@ -1,3 +1,4 @@
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 import models, schemas
 import datetime
@@ -137,6 +138,26 @@ def create_timetable_version(db: Session, v: schemas.TimetableVersionCreate):
     db.refresh(obj)
     return obj
 
+def active_timetable_query(db: Session):
+    """
+    Query FacultyTimetable joined to TimetableVersion such that only active
+    versions are returned, but preserving legacy/unversioned rows where
+    timetable_version_id is NULL.
+    """
+    return (
+        db.query(models.FacultyTimetable)
+        .outerjoin(
+            models.TimetableVersion,
+            models.FacultyTimetable.timetable_version_id == models.TimetableVersion.id,
+        )
+        .filter(
+            or_(
+                models.FacultyTimetable.timetable_version_id.is_(None),
+                models.TimetableVersion.active.is_(True),
+            )
+        )
+    )
+
 def create_timetable_entry(db: Session, e: schemas.TimetableEntryCreate):
     obj = models.FacultyTimetable(**e.dict())
     db.add(obj)
@@ -153,7 +174,8 @@ def bulk_create_timetable_entries(db: Session, entries: list):
 
 def get_timetable_for_class(db: Session, class_id: int, semester: str = None):
     q = (
-        db.query(models.FacultyTimetable, models.Faculty.name.label("fac_name"))
+        active_timetable_query(db)
+        .add_columns(models.Faculty.name.label("fac_name"))
         .join(models.Faculty, models.FacultyTimetable.faculty_id == models.Faculty.id)
         .filter(models.FacultyTimetable.class_id == class_id)
     )
@@ -188,7 +210,7 @@ def check_faculty_availability(db: Session, day_of_week: str, period_start: str,
             ))
             continue
 
-        clash = db.query(models.FacultyTimetable).filter(
+        clash = active_timetable_query(db).filter(
             models.FacultyTimetable.faculty_id == f.id,
             models.FacultyTimetable.day_of_week == day_of_week,
             # standard interval-overlap test
@@ -533,7 +555,7 @@ def propose_invigilation_duties(db: Session, mst_exam_ids: list):
                 if f.exempt_from_duty:
                     blockers.append(f"{f.name}: exempt ({f.exempt_reason or 'by admin'})")
                     continue
-                clash = db.query(models.FacultyTimetable).filter(
+                clash = active_timetable_query(db).filter(
                     models.FacultyTimetable.faculty_id == f.id,
                     models.FacultyTimetable.day_of_week == day,
                     models.FacultyTimetable.period_start < end,

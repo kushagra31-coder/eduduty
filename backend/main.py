@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from typing import Union, List, Optional
 from database import engine, get_db
 import models, schemas, crud
 import ai_service, pdf_service
@@ -1472,4 +1473,80 @@ async def ai_health():
     providers.append({"name": "ollama", "configured": ollama_ok})
     any_ok = any(p["configured"] for p in providers)
     return {"ready": any_ok, "providers": providers}
+
+
+# ── Timetable Endpoints ───────────────────────────────────────────────────────
+
+@app.get("/timetable/class/{class_id}", response_model=List[schemas.TimetableEntryOut])
+@app.get("/timetable/class/{class_id}/{semester}", response_model=List[schemas.TimetableEntryOut])
+def get_class_timetable_endpoint(
+    class_id: int,
+    semester: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    return crud.get_timetable_for_class(db, class_id=class_id, semester=semester)
+
+
+@app.put("/timetable/class/{class_id}/{semester}")
+def save_timetable_for_class(
+    class_id: int,
+    semester: str,
+    payload: Union[schemas.TimetableSaveRequest, List[schemas.TimetableEntryCreate]],
+    db: Session = Depends(get_db),
+):
+    cls = db.query(models.Class).filter_by(id=class_id).first()
+    if not cls:
+        raise HTTPException(status_code=404, detail=f"Class {class_id} not found")
+
+    session_name = "Jul-Dec 2026"
+    doc_no = None
+    if isinstance(payload, schemas.TimetableSaveRequest):
+        session_name = payload.session or session_name
+        doc_no = payload.doc_no
+        entries_data = payload.entries
+    else:
+        entries_data = payload
+
+    try:
+        # Atomic transaction:
+        # 1. Deactivate existing active versions for this class and semester
+        db.query(models.TimetableVersion).filter(
+            models.TimetableVersion.class_id == class_id,
+            models.TimetableVersion.semester == semester,
+            models.TimetableVersion.active == True,
+        ).update({"active": False})
+
+        # 2. Create the new active version
+        new_version = models.TimetableVersion(
+            class_id=class_id,
+            semester=semester,
+            session=session_name,
+            doc_no=doc_no,
+            active=True,
+        )
+        db.add(new_version)
+        db.flush()
+
+        # 3. Create new entries attached to new_version.id
+        objs = []
+        for e in entries_data:
+            ed = e.dict() if hasattr(e, "dict") else dict(e)
+            ed["class_id"] = class_id
+            ed["semester"] = semester
+            ed["year"] = ed.get("year") or cls.year or 2
+            ed["timetable_version_id"] = new_version.id
+            objs.append(models.FacultyTimetable(**ed))
+
+        db.add_all(objs)
+        db.commit()
+        db.refresh(new_version)
+        return {
+            "status": "success",
+            "version_id": new_version.id,
+            "entries_saved": len(objs),
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Failed to save timetable: {exc}")
+
 

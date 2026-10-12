@@ -148,11 +148,6 @@ function TimetableInputTab() {
     const cls = classes.find(c => c.id === classId)
     setSaving(true)
     try {
-      const version = await apiFetch("/timetable/version", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ class_id: classId, semester, session }),
-      })
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const entries: any[] = []
       for (const day of DAYS) {
@@ -172,7 +167,6 @@ function TimetableInputTab() {
               class_id: classId,
               year: cls?.year ?? 2,
               semester,
-              timetable_version_id: version.id,
             })
           }
         })
@@ -181,12 +175,12 @@ function TimetableInputTab() {
         toast({ title: "Nothing to save", description: "Add at least one class entry.", variant: "destructive" })
         return
       }
-      await apiFetch("/timetable/entries/bulk", {
-        method: "POST",
+      await apiFetch(`/timetable/class/${classId}/${encodeURIComponent(semester)}`, {
+        method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(entries),
+        body: JSON.stringify({ session, entries }),
       })
-      toast({ title: `Saved ${entries.length} entries`, description: "Timetable committed. The duty scheduler will use this data." })
+      toast({ title: `Saved ${entries.length} entries`, description: "Timetable committed atomically. The duty scheduler will use this data." })
     } catch (e) {
       toast({ title: "Save failed", description: (e as Error).message, variant: "destructive" })
     } finally {
