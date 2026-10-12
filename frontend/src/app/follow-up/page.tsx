@@ -23,6 +23,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { useToast } from "@/components/ui/use-toast"
+import { apiFetch, getApiErrorMessage } from "@/lib/api"
 
 type FollowUpRecord = {
   id: number
@@ -95,8 +96,8 @@ export default function FollowUpPage() {
     setIsLoading(true)
     try {
       const [recRes, statRes] = await Promise.all([
-        fetch(`/api/follow-up${q ? `?${q}` : ""}`),
-        fetch(`/api/follow-up/stats${classFilter !== "all" ? `?class_id=${classFilter}` : ""}`),
+        apiFetch(`/follow-up${q ? `?${q}` : ""}`),
+        apiFetch(`/follow-up/stats${classFilter !== "all" ? `?class_id=${classFilter}` : ""}`),
       ])
       if (recRes.ok) setRecords(await recRes.json())
       if (statRes.ok) setStats(await statRes.json())
@@ -108,7 +109,7 @@ export default function FollowUpPage() {
   }, [classFilter, finalFilter, search])
 
   useEffect(() => {
-    fetch("/api/classes").then((r) => r.ok ? r.json() : []).then(setClasses).catch(() => {})
+    apiFetch("/classes").then((r) => r.ok ? r.json() : []).then(setClasses).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -119,17 +120,21 @@ export default function FollowUpPage() {
   const recalculate = async () => {
     setRecalcBusy(true)
     try {
-      const res = await fetch("/api/follow-up/recalculate", {
+      const res = await apiFetch("/follow-up/recalculate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ class_id: classFilter !== "all" ? Number(classFilter) : null }),
       })
-      if (!res.ok) throw new Error("recalc failed")
+      if (!res.ok) {
+        const msg = await getApiErrorMessage(res, "Recalculation failed")
+        throw new Error(msg)
+      }
       const data = await res.json()
       toast({ title: `Recalculated ${data.evaluated} students (${data.changed} changed)` })
       fetchData()
-    } catch {
-      toast({ title: "Recalculation failed", variant: "destructive" })
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Recalculation failed"
+      toast({ title: "Recalculation failed", description: msg, variant: "destructive" })
     } finally {
       setRecalcBusy(false)
     }
@@ -148,14 +153,14 @@ export default function FollowUpPage() {
       return
     }
     try {
-      const res = await fetch(`/api/follow-up/${selected.id}/override`, {
+      const res = await apiFetch(`/follow-up/${selected.id}/override`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ final_status: newStatus, reason: reason.trim() }),
       })
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || "override failed")
+        const msg = await getApiErrorMessage(res, "Override failed")
+        throw new Error(msg)
       }
       toast({ title: "Override saved and audited" })
       setDialogOpen(false)
@@ -172,19 +177,24 @@ export default function FollowUpPage() {
       return
     }
     try {
-      const res = await fetch(`/api/follow-up/${selected.id}/restore`, {
+      const res = await apiFetch(`/follow-up/${selected.id}/restore`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reason: reason.trim() }),
       })
-      if (!res.ok) throw new Error("restore failed")
+      if (!res.ok) {
+        const msg = await getApiErrorMessage(res, "Restore failed")
+        throw new Error(msg)
+      }
       toast({ title: "Restored to calculated status" })
       setDialogOpen(false)
       fetchData()
-    } catch {
-      toast({ title: "Error restoring status", variant: "destructive" })
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Error restoring status"
+      toast({ title: "Error restoring status", description: msg, variant: "destructive" })
     }
   }
+
 
   const exportUrl = (pdf: boolean) => {
     const q = classFilter !== "all" ? `?class_id=${classFilter}` : ""

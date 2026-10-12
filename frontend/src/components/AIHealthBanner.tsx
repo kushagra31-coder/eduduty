@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { CheckCircle2, AlertTriangle, XCircle } from 'lucide-react'
+import { apiFetch } from '@/lib/api'
 
 type Provider = { name: string; configured: boolean; hint?: string }
 type HealthData = { ready: boolean; providers: Provider[] }
@@ -10,8 +11,9 @@ export default function AIHealthBanner() {
   const [health, setHealth] = useState<HealthData | null>(null)
 
   useEffect(() => {
-    fetch('/api/ai/health').then(r => r.ok ? r.json() : null).then(setHealth).catch(() => {})
+    apiFetch('/ai/health').then(r => r.ok ? r.json() : null).then(setHealth).catch(() => {})
   }, [])
+
 
   if (!health) return null
 

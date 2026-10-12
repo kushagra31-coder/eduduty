@@ -5,6 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { UploadCloud, CheckCircle } from "lucide-react"
 import { useToast } from "@/components/ui/use-toast"
+import { apiFetch, getApiErrorMessage } from "@/lib/api"
 
 export default function AttendanceUpload() {
   const [isDragging, setIsDragging] = useState(false)
@@ -62,17 +63,13 @@ export default function AttendanceUpload() {
     formData.append('file', file)
 
     try {
-      const res = await fetch('/api/upload-attendance/', {
+      const res = await apiFetch('/upload-attendance/', {
         method: 'POST',
         body: formData,
       })
 
-      const data = await res.json().catch(() => null)
-
       if (!res.ok) {
-        // HTTP error from the backend (e.g. 400 "no subject sheets recognized") —
-        // show FastAPI's actual detail instead of a generic message.
-        const detail = data?.detail ?? `Server returned status ${res.status}`
+        const detail = await getApiErrorMessage(res, `Server returned status ${res.status}`)
         toast({
           title: "Upload Failed",
           description: detail,
@@ -81,7 +78,9 @@ export default function AttendanceUpload() {
         return
       }
 
+      const data = await res.json()
       setUploadResult(data)
+
       const skipped = (data.sheets ?? []).filter((s: { status: string }) => s.status !== 'imported')
       toast({
         title: "Upload Successful",

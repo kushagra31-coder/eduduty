@@ -12,8 +12,7 @@ import {
   CheckCircle2, XCircle, MinusCircle, Search, RefreshCw,
   Users, UserCheck, UserX, AlertCircle,
 } from "lucide-react"
-
-const API = "/api"
+import { apiFetch, getApiErrorMessage } from "@/lib/api"
 
 type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null }
 type Student = {
@@ -22,14 +21,15 @@ type Student = {
 }
 type Mark = "Present" | "Absent" | null
 
-async function apiFetch(path: string, init?: RequestInit) {
-  const res = await fetch(`${API}${path}`, init)
+async function fetchRollCall<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await apiFetch(path, init)
   if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as { detail?: string }
-    throw new Error(err.detail ?? `HTTP ${res.status}`)
+    const err = await getApiErrorMessage(res, `HTTP ${res.status}`)
+    throw new Error(err)
   }
   return res.json()
 }
+
 
 function markStyle(s: Mark) {
   if (s === "Present") return "border-2 border-emerald-500 bg-emerald-500/10 text-foreground"
@@ -60,14 +60,14 @@ export default function RollCallPage() {
 
   // Load exams on mount
   useEffect(() => {
-    apiFetch("/mst/exams").then(setExams).catch(() => {})
+    fetchRollCall<Exam[]>("/mst/exams").then(setExams).catch(() => {})
   }, [])
 
   // Load roll-call when exam changes
   const loadRollcall = useCallback(async (id: number) => {
     setLoading(true)
     try {
-      const data: Student[] = await apiFetch(`/mst/attendance/rollcall/${id}`)
+      const data = await fetchRollCall<Student[]>(`/mst/attendance/rollcall/${id}`)
       setStudents(data)
       const m: Record<number, Mark> = {}
       for (const s of data) m[s.student_id] = (s.status as Mark) ?? null
@@ -88,11 +88,12 @@ export default function RollCallPage() {
     setMarks(prev => ({ ...prev, [studentId]: next }))  // optimistic
     setSaving(prev => ({ ...prev, [studentId]: true }))
     try {
-      await apiFetch("/mst/attendance/mark", {
+      await fetchRollCall("/mst/attendance/mark", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mst_exam_id: examId, student_id: studentId, status: next }),
       })
+
     } catch (e) {
       toast({ title: "Save failed", description: (e as Error).message, variant: "destructive" })
       setMarks(prev => ({ ...prev, [studentId]: marks[studentId] ?? null })) // revert

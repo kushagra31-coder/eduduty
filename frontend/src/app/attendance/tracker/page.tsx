@@ -14,8 +14,7 @@ import {
   Armchair, Users, UserCheck, UserX, MinusCircle, RefreshCw,
   ServerOff, Plus, ClipboardCheck, GraduationCap,
 } from "lucide-react"
-
-const API = "/api"
+import { apiFetch, getApiErrorMessage } from "@/lib/api"
 
 type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null }
 type Room = { id: number; room_number: string; capacity: number | null }
@@ -36,13 +35,14 @@ type ClassInfo = { id: number; name: string; branch: string }
 type Mark = "Present" | "Absent" | null
 
 async function api(path: string, init?: RequestInit) {
-  const res = await fetch(`${API}${path}`, init)
+  const res = await apiFetch(path, init)
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({}))
-    throw new Error((detail as { detail?: string }).detail || `request failed (${res.status})`)
+    const msg = await getApiErrorMessage(res, `Request failed (${res.status})`)
+    throw new Error(msg)
   }
   return res.json()
 }
+
 
 function nextMark(m: Mark): Mark {
   // click toggles: unmarked -> present -> absent -> present ...

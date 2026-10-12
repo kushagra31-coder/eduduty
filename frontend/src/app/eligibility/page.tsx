@@ -19,6 +19,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useToast } from "@/components/ui/use-toast"
+import { apiFetch } from "@/lib/api"
 
 type Exam = { id: number; label: string }
 
@@ -47,7 +48,7 @@ export default function EligibilityPage() {
 
   // Load exams on mount
   useEffect(() => {
-    fetch('/api/mst/exams')
+    apiFetch('/mst/exams')
       .then(r => r.ok ? r.json() : [])
       .then((data: Exam[]) => {
         setExams(data)
@@ -59,7 +60,7 @@ export default function EligibilityPage() {
   const fetchRecords = async () => {
     setIsLoading(true)
     try {
-      const res = await fetch(`/api/eligibility/${examId}`)
+      const res = await apiFetch(`/eligibility/${examId}`)
       if (res.ok) {
         const data = await res.json()
         setRecords(data)
@@ -93,7 +94,7 @@ export default function EligibilityPage() {
     }
 
     try {
-      const res = await fetch(`/api/eligibility/override/${selectedRecord.id}`, {
+      const res = await apiFetch(`/eligibility/override/${selectedRecord.id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

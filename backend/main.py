@@ -1,15 +1,34 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from database import engine, get_db
-import models, schemas, crud
-import ai_service, pdf_service
-import pandas as pd
+import sys
+import os
 import io
 import re
+import uuid
+from typing import Optional
 from difflib import SequenceMatcher
+import zipfile
+import pandas as pd
+
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, JSONResponse
+from fastapi.exception_handlers import http_exception_handler
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from database import engine, get_db, get_ai_db
+import models, schemas, crud
+import ai_service, pdf_service
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from core.security import SUPER_ADMIN, ADMIN, EXAM_COORDINATOR, FACULTY, INVIGILATOR, VIEWER
+from api.dependencies import (
+    get_current_user,
+    require_permission,
+    verify_invigilator_room_assignment,
+    verify_faculty_student_access,
+)
+
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -37,14 +56,27 @@ LEFT JOIN mst_exams e2 ON e2.id = fs.mst_2_exam_id
 """
 
 def _ensure_ai_views():
+    """
+    Inspect database view state on startup.
+    Alembic migrations are the sole schema migration authority.
+
+    State 1 (All expected views exist): Do nothing; 0 DDL statements executed.
+    State 2 (Partial expected views exist): Database schema inconsistency / drift. Raise RuntimeError and fail fast.
+    State 3 (No expected views exist): Dev/test fallback creates all views for non-migrated dev environments.
+    """
     try:
+        from sqlalchemy import inspect
+        import ai_service
+
+        expected_views = set(ai_service.ALLOWED_READ_VIEWS)
         views = {
             "v_vt_follow_up_status": _FOLLOW_UP_VIEW_BODY,
             "ai_eligibility_summary": """
                 SELECT c.name AS class_name, e.label AS mst_label,
-                SUM(CASE WHEN me.status = 'Eligible' THEN 1 ELSE 0 END) AS eligible_count,
-                SUM(CASE WHEN me.status = 'Not eligible' THEN 1 ELSE 0 END) AS ineligible_count,
-                SUM(CASE WHEN me.status = 'Missing' THEN 1 ELSE 0 END) AS missing_count
+                COUNT(CASE WHEN LOWER(me.status) = 'eligible' THEN 1 END) AS eligible_count,
+                COUNT(CASE WHEN LOWER(me.status) IN ('borderline', 'conditionally_eligible') THEN 1 END) AS borderline_count,
+                COUNT(CASE WHEN LOWER(me.status) IN ('not eligible', 'ineligible') THEN 1 END) AS ineligible_count,
+                COUNT(CASE WHEN LOWER(me.status) = 'missing' THEN 1 END) AS missing_count
                 FROM mst_eligibility me
                 JOIN students s ON s.id = me.student_id
                 JOIN classes c ON c.id = s.class_id
@@ -52,19 +84,20 @@ def _ensure_ai_views():
                 GROUP BY c.name, e.label
             """,
             "ai_attendance_summary": """
-                SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
+                SELECT c.name AS class_name, e.label AS mst_label, s.roll_number, s.name AS student_name,
                 me.overall_pct, me.lowest_subject_pct
                 FROM mst_eligibility me
                 JOIN students s ON s.id = me.student_id
                 JOIN classes c ON c.id = s.class_id
+                JOIN mst_exams e ON e.id = me.mst_exam_id
             """,
             "ai_vt_candidates": """
                 SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
                 CASE WHEN fs.mst_1_appeared IS NULL THEN 'Missing' WHEN fs.mst_1_appeared THEN 'Present' ELSE 'Absent' END AS mst1_status,
                 CASE WHEN fs.mst_2_appeared IS NULL THEN 'Missing' WHEN fs.mst_2_appeared THEN 'Present' ELSE 'Absent' END AS mst2_status
-                FROM follow_up_statuses fs
-                JOIN students s ON s.id = fs.student_id
+                FROM students s
                 JOIN classes c ON c.id = s.class_id
+                LEFT JOIN follow_up_statuses fs ON fs.student_id = s.id
             """,
             "ai_duty_roster": """
                 SELECT e.label AS mst_label, e.exam_date, r.room_number, f.name AS faculty_name, d.status AS duty_status
@@ -75,30 +108,168 @@ def _ensure_ai_views():
             """
         }
         with engine.begin() as conn:
-            for vname, vbody in views.items():
-                if engine.dialect.name == "sqlite":
-                    conn.execute(models.text(f"DROP VIEW IF EXISTS {vname}"))
-                    conn.execute(models.text(f"CREATE VIEW {vname} AS {vbody}"))
-                else:
-                    conn.execute(models.text(f"CREATE OR REPLACE VIEW {vname} AS {vbody}"))
+            inspector = inspect(conn)
+            existing_views = set(inspector.get_view_names())
+            present = existing_views & expected_views
+            missing = expected_views - existing_views
+
+            if len(present) == len(expected_views):
+                # State 1: All views present. Alembic managed. Do nothing.
+                return
+            elif len(present) > 0 and len(missing) > 0:
+                # State 2: Partial view presence -> Schema drift error
+                raise RuntimeError(
+                    f"SCHEMA DRIFT ERROR: Database contains partial AI reporting views. "
+                    f"Present: {sorted(list(present))}, Missing: {sorted(list(missing))}. "
+                    f"Run 'alembic upgrade head' to reconcile schema."
+                )
+            else:
+                # State 3: No expected views present (unmigrated dev/test environment)
+                app_env = os.environ.get("APP_ENV", os.environ.get("ENVIRONMENT", "development")).strip().lower()
+                if app_env not in ("development", "dev", "test", "testing"):
+                    raise RuntimeError(
+                        "PRODUCTION SCHEMA ERROR: Database contains no AI reporting views. "
+                        "Automatic view fallback is forbidden in non-development environments. "
+                        "Operators must execute 'alembic upgrade head'."
+                    )
+                for vname in expected_views:
+                    vbody = views.get(vname)
+                    if vbody:
+                        conn.execute(models.text(f"CREATE VIEW {vname} AS {vbody}"))
+    except RuntimeError:
+        raise
     except Exception as exc:
-        print(f"warning: could not create views: {exc}", flush=True)
+        print(f"warning: could not verify views: {exc}", flush=True)
 
 _ensure_ai_views()
 
 app = FastAPI(title="MST Operations Portal API")
 
+# Configure environment-controlled CORS allow-list (replaces wildcard allow_origins=["*"])
+cors_origins_env = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+allowed_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+@app.exception_handler(Exception)
+async def safe_exception_handler(request: Request, exc: Exception):
+    """Prevent raw stack trace leakage in 500 error responses."""
+    if isinstance(exc, HTTPException):
+        return await http_exception_handler(request, exc)
+    req_id = f"req_{uuid.uuid4().hex[:8]}"
+    print(f"[INTERNAL_ERROR {req_id}] {request.method} {request.url}: {exc}", flush=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_SERVER_ERROR",
+                "message": "An unexpected server error occurred.",
+                "request_id": req_id,
+            }
+        },
+    )
+
 @app.get("/")
 def read_root():
     return {"message": "MST Operations Portal Backend"}
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "environment": os.getenv("ENVIRONMENT", "development")}
+
+
+class DemoLoginRequest(BaseModel):
+    email: str
+
+
+@app.get("/auth/status")
+def auth_status():
+    """Return public authentication provider configuration and demo mode status."""
+    import core.security as sec
+    return {
+        "supabase_configured": bool(sec.get_supabase_jwt_secret()),
+        "demo_auth_enabled": sec.is_demo_auth_enabled(),
+        "demo_accounts": [
+            {
+                "email": email,
+                "name": acc["name"],
+                "role": acc["role"],
+                "description": f"Role: {acc['role']}" + (f" (Faculty #{acc['faculty_id']})" if acc.get("faculty_id") else ""),
+            }
+            for email, acc in sec.DEMO_ACCOUNTS.items()
+        ] if sec.is_demo_auth_enabled() else [],
+    }
+
+
+@app.post("/auth/demo-login")
+def demo_login(req: DemoLoginRequest, db: Session = Depends(get_db)):
+    """
+    Development-only demo login endpoint.
+    Strictly restricted to preconfigured demo identities.
+    Fails closed if ENABLE_DEV_DEMO_AUTH is disabled or if requested email is unauthorized.
+    """
+    import core.security as sec
+    if not sec.is_demo_auth_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "DEMO_AUTH_DISABLED",
+                    "message": "Demo authentication is disabled in this environment.",
+                }
+            },
+        )
+    try:
+        token_data = sec.create_demo_jwt(req.email)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "code": "INVALID_DEMO_ACCOUNT",
+                    "message": str(e),
+                }
+            },
+        )
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "code": "DEMO_AUTH_DISABLED",
+                    "message": str(e),
+                }
+            },
+        )
+
+    email_clean = req.email.strip().lower()
+    acc = sec.DEMO_ACCOUNTS[email_clean]
+    user = db.query(models.User).filter_by(email=email_clean).first()
+    if not user:
+        user = models.User(
+            supabase_uid=acc["sub"],
+            name=acc["name"],
+            role=acc["role"],
+            email=email_clean,
+            faculty_id=acc.get("faculty_id"),
+        )
+        db.add(user)
+        db.commit()
+    else:
+        if user.role != acc["role"] or user.faculty_id != acc.get("faculty_id"):
+            user.role = acc["role"]
+            user.faculty_id = acc.get("faculty_id")
+            db.commit()
+
+    return token_data
+
+
 
 # ── Attendance upload ──────────────────────────────────────────────────────────
 
@@ -395,16 +566,16 @@ def _import_subject_workbook(db: Session, xls, filename: str):
     for sid in students_seen:
         crud.compute_eligibility_for_student(db, sid, mst_exam_id)
 
+    imported = [s for s in sheets_summary if s["status"] == "imported"]
     db.add(models.AuditLog(
         table_name="attendance_records", record_id=0, field_changed="import",
-        new_value=f"{total_records} rows across "
-                  f"{sum(1 for s in sheets_summary if s['status'] == 'imported')} subjects",
+        new_value=f"{total_records} rows across {len(imported)} subjects",
         reason=filename,
     ))
     db.commit()
 
-    imported = [s for s in sheets_summary if s["status"] == "imported"]
     if not imported:
+        db.rollback()
         raise HTTPException(
             status_code=400,
             detail="No subject attendance sheets found. Expected sheets with "
@@ -416,33 +587,96 @@ def _import_subject_workbook(db: Session, xls, filename: str):
             "rows_imported": total_records,
             "sheets": sheets_summary}
 
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MiB limit (PRD requirement)
+
 @app.post("/upload-attendance/")
 async def upload_attendance(
+    request: Request,
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("attendance.import"))
 ):
-    if not file.filename.endswith(('.xls', '.xlsx')):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an Excel file.")
+    # 1. Pre-check Content-Length header if provided by client
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit():
+        if int(content_length) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="File size exceeds maximum permitted limit of 10 MiB.")
 
-    contents = await file.read()
+    # 2. File extension check (.xls, .xlsx)
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(('.xls', '.xlsx')):
+        raise HTTPException(status_code=400, detail="Invalid file extension. Please upload an Excel file (.xls or .xlsx).")
+
+    # 3. Bounded chunked streaming read (guarantees size enforcement even with missing/spoofed Content-Length)
+    CHUNK_SIZE = 64 * 1024
+    contents = bytearray()
+    while True:
+        chunk = await file.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        contents.extend(chunk)
+        if len(contents) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="File size exceeds maximum permitted limit of 10 MiB.")
+
+    # 4. Empty file check
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # 5. Magic Bytes Container Validation & ZIP Archive Safety Check
+    is_xlsx = contents.startswith(b"PK\x03\x04") or contents.startswith(b"PK\x05\x06")
+    is_xls = contents.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    if not (is_xlsx or is_xls):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or corrupt Excel file format: magic header signature does not match XLS or XLSX."
+        )
+
+    if is_xlsx:
+        try:
+            with zipfile.ZipFile(io.BytesIO(bytes(contents))) as zf:
+                infolist = zf.infolist()
+                if len(infolist) > 100:
+                    raise HTTPException(status_code=400, detail="Excel ZIP archive exceeds maximum permitted entry limit (100 entries).")
+                uncompressed_size = sum(z.file_size for z in infolist)
+                if uncompressed_size > 50 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail="Excel ZIP archive exceeds maximum permitted uncompressed size limit (50 MiB).")
+                if len(contents) > 0 and (uncompressed_size / len(contents)) > 100.0 and uncompressed_size > 1 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail="Excel ZIP archive decompression ratio exceeds safety limits.")
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Invalid or corrupt Excel ZIP archive.")
+
+    # 6. Parser Execution & Structure Boundary Enforcement
     try:
-        xls = pd.ExcelFile(io.BytesIO(contents))
+        xls = pd.ExcelFile(io.BytesIO(bytes(contents)))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not parse Excel file: corrupt spreadsheet structure or invalid formatting.")
 
-    # Per-subject workbook (e.g. CI-1 IV.xlsx): one sheet per subject with
-    # 'Subject Code' / 'Enrollment No.' headers — parse every subject sheet.
-    try:
-        probe = [_parse_subject_sheet(xls.parse(sh, header=None))
-                 for sh in xls.sheet_names]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
-    if any(p for p in probe):
-        return _import_subject_workbook(db, xls, file.filename)
+    if len(xls.sheet_names) > 20:
+        raise HTTPException(status_code=400, detail="Excel workbook exceeds maximum permitted sheet count (20).")
 
+    # Atomic transaction execution with explicit rollback on error
     try:
+        # Probe for subject workbook sheets
+        try:
+            probe = []
+            for sh in xls.sheet_names:
+                df_sheet = xls.parse(sh, header=None)
+                if len(df_sheet) > 10000 or len(df_sheet.columns) > 100:
+                    raise HTTPException(status_code=400, detail=f"Sheet '{sh}' exceeds maximum permitted dimensions (10,000 rows x 100 columns).")
+                probe.append(_parse_subject_sheet(df_sheet))
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
+
+        if any(p for p in probe):
+            return _import_subject_workbook(db, xls, filename)
+
+        # Single-sheet fallback processing
         df = xls.parse(xls.sheet_names[0])
-        # Normalize column names for lookup (case/space/underscore-insensitive)
+        if len(df) > 10000 or len(df.columns) > 100:
+            raise HTTPException(status_code=400, detail="Excel sheet exceeds maximum permitted dimensions (10,000 rows x 100 columns).")
+
         colmap = {str(c).strip().lower().replace("_", " ").replace("-", " "): c for c in df.columns}
         def col(*names):
             for n in names:
@@ -454,6 +688,7 @@ async def upload_attendance(
         c_total = col("total classes", "classes conducted", "total")
         c_att = col("attended", "classes attended", "attended classes")
         c_batch = [colmap[k] for k in ("batch", "batch number", "batch no") if k in colmap]
+
         def row_batch(row):
             for cb in c_batch:
                 raw = str(row.get(cb, "")).strip().upper()
@@ -463,6 +698,7 @@ async def upload_attendance(
                 if m:
                     return int(m.group(0))
             return None
+
         mst_exam_id = 1
         dummy_exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
         if not dummy_exam:
@@ -473,7 +709,7 @@ async def upload_attendance(
         imported_count = 0
         for _, row in df.iterrows():
             roll_number = str(row.get(c_roll, '')).strip() if c_roll else ''
-            if not roll_number or roll_number == 'nan':
+            if not roll_number or roll_number.lower() == 'nan':
                 continue
             name     = str(row.get(c_name, 'Unknown')).strip() if c_name else 'Unknown'
             total    = int(row.get(c_total, 0)) if c_total else 0
@@ -499,23 +735,31 @@ async def upload_attendance(
             crud.create_attendance_record(db, att)
             crud.compute_eligibility_for_student(db, student.id, mst_exam_id)
             imported_count += 1
-        # Record the import so the dashboard activity feed can show it
+
         db.add(models.AuditLog(
             table_name="attendance_records",
             record_id=0,
             field_changed="import",
             new_value=f"{imported_count} rows",
-            reason=file.filename,
+            reason=filename,
         ))
         db.commit()
-        return {"filename": file.filename, "rows_imported": imported_count}
+        return {"filename": filename, "rows_imported": imported_count}
+
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 @app.get("/dashboard/stats")
-def dashboard_stats(db: Session = Depends(get_db)):
+def dashboard_stats(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("reports.read"))
+):
     exam = db.query(models.MstExam).filter_by(id=1).first()
     exam_label = exam.label if exam else "MST-1"
 
@@ -607,7 +851,11 @@ def dashboard_stats(db: Session = Depends(get_db)):
 # ── Eligibility ────────────────────────────────────────────────────────────────
 
 @app.get("/eligibility/{mst_exam_id}", response_model=list[schemas.MstEligibilityDisplay])
-def get_eligibility(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_eligibility(
+    mst_exam_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("eligibility.read"))
+):
     return crud.get_mst_eligibility(db, mst_exam_id)
 
 @app.post("/eligibility/override/{eligibility_id}")
@@ -615,10 +863,10 @@ def override_eligibility(
     eligibility_id: int,
     override: bool = Body(...),
     reason: str = Body(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("eligibility.override"))
 ):
-    user_id = 1
-    record = crud.update_eligibility_override(db, eligibility_id, override, reason, user_id)
+    record = crud.update_eligibility_override(db, eligibility_id, override, reason, current_user.id)
     if not record:
         raise HTTPException(status_code=404, detail="Eligibility record not found")
     return {"message": "Override applied successfully"}
@@ -632,35 +880,115 @@ class WriteConfirmRequest(BaseModel):
     op_json: dict
 
 @app.post("/ai/query")
-async def ai_query(req: AIMessageRequest, db: Session = Depends(get_db)):
+async def ai_query(
+    req: AIMessageRequest,
+    db: Session = Depends(get_db),
+    read_db: Session = Depends(get_ai_db),
+    current_user: models.User = Depends(require_permission("ai.read"))
+):
     """
     Route a natural language message to read / write-proposal / pdf path.
+    Enforces Layer 2 resource-level scope authorization for non-administrative users.
     Returns { type, content }
     """
+    # Resource-level scope enforcement for FACULTY role
+    if current_user.role == FACULTY:
+        if not current_user.faculty_id:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": {"code": "FORBIDDEN", "message": "Access denied: User is not linked to an active faculty record."}}
+            )
+        fac_record = db.query(models.Faculty).filter_by(id=current_user.faculty_id).first()
+        if not fac_record:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": {"code": "FORBIDDEN", "message": "Access denied: User is not linked to an active faculty record."}}
+            )
+        # Resolve permitted class names for this faculty member (Policy 1: Active FacultyTimetable entries only)
+        assigned_class_ids = set()
+        tt_query = db.query(models.FacultyTimetable.class_id).outerjoin(
+            models.TimetableVersion, models.FacultyTimetable.timetable_version_id == models.TimetableVersion.id
+        ).filter(
+            models.FacultyTimetable.faculty_id == current_user.faculty_id,
+            (models.FacultyTimetable.timetable_version_id == None) | (models.TimetableVersion.active == True)
+        )
+        for (cid,) in tt_query.all():
+            if cid:
+                assigned_class_ids.add(cid)
+
+        permitted_classes = set()
+        if assigned_class_ids:
+            classes = db.query(models.Class.name).filter(models.Class.id.in_(assigned_class_ids)).all()
+            permitted_classes = {c[0] for c in classes}
+
+        # Inspect message for class references (e.g. 'CI-1', 'CS-81', 'Cyber-3')
+        all_db_classes = db.query(models.Class).all()
+        for c_obj in all_db_classes:
+            if re.search(rf"\b{re.escape(c_obj.name)}\b", req.message, re.IGNORECASE):
+                if c_obj.name not in permitted_classes:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": f"Access denied: Class '{c_obj.name}' is outside your assigned academic scope.",
+                            }
+                        }
+                    )
+
+    scope_classes = permitted_classes if current_user.role == FACULTY else None
+
     try:
-        result = await ai_service.handle_ai_message(req.message, db)
+        result = await ai_service.handle_ai_message(
+            req.message,
+            db=db,
+            read_db=read_db,
+            scope_class_names=scope_classes,
+            user_faculty_name=None,  # Policy 2: Faculty can view institution-wide duty roster
+            current_user=current_user,
+        )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ai/confirm-write")
-def ai_confirm_write(req: WriteConfirmRequest, db: Session = Depends(get_db)):
+def ai_confirm_write(
+    req: WriteConfirmRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("ai.write"))
+):
     """
     Execute an AI-proposed write ONLY after the user has explicitly confirmed in the UI.
     """
     try:
-        result = ai_service.execute_write_op(req.op_json, db)
+        result = ai_service.execute_write_op(req.op_json, db, current_user=current_user)
         return {"success": True, "changed": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # ── PDF generation ─────────────────────────────────────────────────────────────
 
 @app.get("/pdf/student/{roll_number}")
-def get_student_pdf(roll_number: str, db: Session = Depends(get_db)):
+def get_student_pdf(
+    roll_number: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("reports.read"))
+):
     """Generate and stream a formal student record PDF."""
+    student = db.query(models.Student).filter_by(roll_number=roll_number).first()
+    if not student:
+        raise HTTPException(status_code=404, detail=f"Student with roll number {roll_number} not found.")
+    
+    # Resource-level authorization: enforce academic scope check for faculty/operational roles
+    verify_faculty_student_access(db, current_user, student.id)
+
     try:
         html      = pdf_service.build_student_record_html(roll_number, db)
         pdf_bytes = pdf_service.render_pdf(html)
@@ -675,8 +1003,16 @@ def get_student_pdf(roll_number: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=str(e))
 
 @app.get("/pdf/seating/{mst_exam_id}/{room_id}")
-def get_seating_pdf(mst_exam_id: int, room_id: int, db: Session = Depends(get_db)):
+def get_seating_pdf(
+    mst_exam_id: int,
+    room_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("reports.read"))
+):
     """Generate and stream a seating chart + signature sheet PDF."""
+    # Resource-level authorization: check invigilator room assignment scope
+    verify_invigilator_room_assignment(db, current_user, mst_exam_id=mst_exam_id, room_id=room_id)
+
     try:
         html      = pdf_service.build_seating_chart_html(mst_exam_id, room_id, db)
         pdf_bytes = pdf_service.render_pdf(html)
@@ -694,13 +1030,26 @@ def get_seating_pdf(mst_exam_id: int, room_id: int, db: Session = Depends(get_db
         raise HTTPException(status_code=503, detail=str(e))
 
 @app.get("/pdf/student/{roll_number}/html")
-def get_student_html(roll_number: str, db: Session = Depends(get_db)):
+def get_student_html(
+    roll_number: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("reports.read"))
+):
     """Debug: returns raw HTML preview without WeasyPrint installed."""
+    student = db.query(models.Student).filter_by(roll_number=roll_number).first()
+    if not student:
+        raise HTTPException(status_code=404, detail=f"Student with roll number {roll_number} not found.")
+    
+    # Resource-level authorization: enforce academic scope check for faculty/operational roles
+    verify_faculty_student_access(db, current_user, student.id)
+
     try:
         html = pdf_service.build_student_record_html(roll_number, db)
         return Response(content=html, media_type="text/html")
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
 
 
 # ── Timetable ──────────────────────────────────────────────────────────────────
@@ -709,17 +1058,26 @@ from fastapi import APIRouter
 timetable_router = APIRouter(prefix="/timetable", tags=["timetable"])
 
 @timetable_router.post("/version", response_model=schemas.TimetableVersionOut)
-def create_timetable_version(v: schemas.TimetableVersionCreate, db: Session = Depends(get_db)):
+def create_timetable_version(
+    v: schemas.TimetableVersionCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.manage"))
+):
     return crud.create_timetable_version(db, v)
 
 @timetable_router.post("/entry", response_model=schemas.TimetableEntryOut)
-def create_timetable_entry(e: schemas.TimetableEntryCreate, db: Session = Depends(get_db)):
+def create_timetable_entry(
+    e: schemas.TimetableEntryCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.manage"))
+):
     return crud.create_timetable_entry(db, e)
 
 @timetable_router.post("/entries/bulk")
 def create_timetable_entries_bulk(
     entries: list[schemas.TimetableEntryCreate],
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.manage"))
 ):
     crud.bulk_create_timetable_entries(db, entries)
     return {"created": len(entries)}
@@ -729,6 +1087,7 @@ def get_class_timetable(
     class_id: int,
     semester: str = None,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.read"))
 ):
     return crud.get_timetable_for_class(db, class_id, semester)
 
@@ -736,6 +1095,7 @@ def get_class_timetable(
 def faculty_availability(
     check: schemas.FacultyAvailabilityCheck,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.read"))
 ):
     return crud.check_faculty_availability(
         db, check.day_of_week, check.period_start, check.period_end
@@ -747,11 +1107,17 @@ app.include_router(timetable_router)
 # ── Classes / Faculty helpers (used by timetable frontend) ─────────────────────
 
 @app.get("/classes", response_model=list[schemas.ClassOut])
-def list_classes(db: Session = Depends(get_db)):
+def list_classes(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.read"))
+):
     return crud.get_classes(db)
 
 @app.get("/faculty")
-def list_faculty(db: Session = Depends(get_db)):
+def list_faculty(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.read"))
+):
     rows = db.query(models.Faculty).all()
     return [
         {
@@ -786,7 +1152,11 @@ class FacultyUpdate(BaseModel):
 
 
 @app.post("/faculty")
-def create_faculty(req: FacultyCreate, db: Session = Depends(get_db)):
+def create_faculty(
+    req: FacultyCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.manage"))
+):
     f = models.Faculty(
         name=req.name,
         abbreviation=req.abbreviation,
@@ -804,7 +1174,12 @@ def create_faculty(req: FacultyCreate, db: Session = Depends(get_db)):
 
 
 @app.patch("/faculty/{faculty_id}")
-def update_faculty(faculty_id: int, req: FacultyUpdate, db: Session = Depends(get_db)):
+def update_faculty(
+    faculty_id: int,
+    req: FacultyUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.manage"))
+):
     f = db.query(models.Faculty).filter_by(id=faculty_id).first()
     if not f:
         raise HTTPException(status_code=404, detail="Faculty not found")
@@ -835,7 +1210,11 @@ class ClassCreate(BaseModel):
 
 
 @app.post("/classes", response_model=schemas.ClassOut)
-def create_class(req: ClassCreate, db: Session = Depends(get_db)):
+def create_class(
+    req: ClassCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("faculty.manage"))
+):
     c = models.Class(name=req.name, branch=req.branch, year=req.year, section=req.section)
     db.add(c)
     db.commit()
@@ -862,12 +1241,19 @@ def _seat_student_out(s):
 
 
 @app.get("/mst/exams", response_model=list[schemas.MstExamOut])
-def list_mst_exams(db: Session = Depends(get_db)):
+def list_mst_exams(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("exam.read"))
+):
     return db.query(models.MstExam).order_by(models.MstExam.id.desc()).all()
 
 
 @app.post("/mst/exams", response_model=schemas.MstExamOut)
-def create_mst_exam(req: schemas.MstExamCreate, db: Session = Depends(get_db)):
+def create_mst_exam(
+    req: schemas.MstExamCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("exam.create"))
+):
     exam = models.MstExam(label=req.label, exam_date=req.exam_date,
                           time_slot=req.time_slot, class_id=req.class_id)
     db.add(exam)
@@ -877,12 +1263,19 @@ def create_mst_exam(req: schemas.MstExamCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/rooms", response_model=list[schemas.RoomOut])
-def list_rooms(db: Session = Depends(get_db)):
+def list_rooms(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("seating.read"))
+):
     return db.query(models.Room).order_by(models.Room.room_number).all()
 
 
 @app.post("/rooms", response_model=schemas.RoomOut)
-def create_room(req: schemas.RoomCreate, db: Session = Depends(get_db)):
+def create_room(
+    req: schemas.RoomCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("seating.manage"))
+):
     room = models.Room(room_number=req.room_number, capacity=req.capacity)
     db.add(room)
     db.commit()
@@ -891,7 +1284,11 @@ def create_room(req: schemas.RoomCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/mst/seating/generate")
-def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_db)):
+def generate_seating(
+    req: schemas.SeatingGenerateIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("seating.generate"))
+):
     exam = db.query(models.MstExam).filter_by(id=req.mst_exam_id).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
@@ -941,7 +1338,11 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
 
 
 @app.get("/mst/seating/{mst_exam_id}")
-def get_seating(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_seating(
+    mst_exam_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("seating.read"))
+):
     seats = db.query(models.Seat).filter_by(mst_exam_id=mst_exam_id).all()
     if not seats:
         return []
@@ -989,19 +1390,28 @@ def get_seating(mst_exam_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/mst/attendance/mark", response_model=schemas.AttendanceMarkOut)
-def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)):
+def mark_attendance(
+    req: schemas.MarkAttendanceIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("attendance.mark"))
+):
     if req.status not in ("Present", "Absent"):
         raise HTTPException(status_code=400, detail="status must be Present or Absent")
+    
+    # Server-side resource authorization check: verify invigilator is assigned to this room/exam
+    verify_invigilator_room_assignment(db, current_user, mst_exam_id=req.mst_exam_id, student_id=req.student_id)
+
     att = db.query(models.MstAttempt).filter_by(
         mst_exam_id=req.mst_exam_id, student_id=req.student_id).first()
     if not att:
         att = models.MstAttempt(
             mst_exam_id=req.mst_exam_id, student_id=req.student_id,
-            status=req.status,
+            status=req.status, marked_by=current_user.faculty_id
         )
         db.add(att)
     else:
         att.status = req.status
+        att.marked_by = current_user.faculty_id
     att.marked_at = _dt.datetime.utcnow()
     db.commit()
     db.refresh(att)
@@ -1010,8 +1420,13 @@ def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)
     return {"student_id": att.student_id, "status": att.status, "marked_at": att.marked_at}
 
 
+
 @app.get("/mst/attendance/{mst_exam_id}")
-def get_attendance(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_attendance(
+    mst_exam_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("attendance.read"))
+):
     rows = db.query(models.MstAttempt).filter_by(mst_exam_id=mst_exam_id).all()
     return [{"student_id": a.student_id, "status": a.status, "marked_at": a.marked_at}
             for a in rows]
@@ -1037,6 +1452,7 @@ def _follow_up_row_out(row, student, class_name):
         "updated_at": row.updated_at,
     }
 
+
 @app.get("/follow-up")
 def list_follow_up(
     class_id: int = None,
@@ -1045,6 +1461,7 @@ def list_follow_up(
     overridden: bool = None,
     search: str = None,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("vt.read"))
 ):
     q = (
         db.query(models.FollowUpStatus, models.Student, models.Class.name)
@@ -1070,7 +1487,11 @@ def list_follow_up(
 
 
 @app.get("/follow-up/stats")
-def follow_up_stats(class_id: int = None, db: Session = Depends(get_db)):
+def follow_up_stats(
+    class_id: int = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("vt.read"))
+):
     from sqlalchemy import func
     q = db.query(
         models.FollowUpStatus.final_status,
@@ -1109,10 +1530,14 @@ def follow_up_stats(class_id: int = None, db: Session = Depends(get_db)):
 
 
 class FollowUpRecalcIn(BaseModel):
-    class_id: int = None
+    class_id: int | None = None
 
 @app.post("/follow-up/recalculate")
-def recalculate_follow_ups(req: FollowUpRecalcIn, db: Session = Depends(get_db)):
+def recalculate_follow_ups(
+    req: FollowUpRecalcIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("vt.override"))
+):
     result = crud.recalculate_all_follow_ups(db, class_id=req.class_id)
     _ensure_ai_views()  # keep the AI view in sync
     return result
@@ -1124,11 +1549,15 @@ class FollowUpOverrideIn(BaseModel):
     changed_by: int = None
 
 @app.post("/follow-up/{follow_up_id}/override")
-def override_follow_up(follow_up_id: int, req: FollowUpOverrideIn,
-                       db: Session = Depends(get_db)):
+def override_follow_up(
+    follow_up_id: int,
+    req: FollowUpOverrideIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("vt.override"))
+):
     try:
         row = crud.override_follow_up(
-            db, follow_up_id, req.final_status, req.reason, req.changed_by)
+            db, follow_up_id, req.final_status, req.reason, current_user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     student = db.query(models.Student).filter_by(id=row.student_id).first()
@@ -1142,11 +1571,15 @@ class FollowUpRestoreIn(BaseModel):
     changed_by: int = None
 
 @app.post("/follow-up/{follow_up_id}/restore")
-def restore_follow_up(follow_up_id: int, req: FollowUpRestoreIn,
-                      db: Session = Depends(get_db)):
+def restore_follow_up(
+    follow_up_id: int,
+    req: FollowUpRestoreIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("vt.override"))
+):
     try:
         row = crud.restore_calculated_follow_up(
-            db, follow_up_id, req.reason, req.changed_by)
+            db, follow_up_id, req.reason, current_user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     student = db.query(models.Student).filter_by(id=row.student_id).first()
@@ -1168,7 +1601,11 @@ def _compulsory_follow_up_rows(db: Session, class_id: int = None):
 
 
 @app.get("/follow-up/export")
-def export_follow_up_excel(class_id: int = None, db: Session = Depends(get_db)):
+def export_follow_up_excel(
+    class_id: int = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("reports.export"))
+):
     rows = _compulsory_follow_up_rows(db, class_id)
     data = [{
         "Roll Number": s.roll_number,
@@ -1196,7 +1633,11 @@ def export_follow_up_excel(class_id: int = None, db: Session = Depends(get_db)):
 
 
 @app.get("/follow-up/export-pdf")
-def export_follow_up_pdf(class_id: int = None, db: Session = Depends(get_db)):
+def export_follow_up_pdf(
+    class_id: int = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("reports.export"))
+):
     rows = _compulsory_follow_up_rows(db, class_id)
     html = pdf_service.build_follow_up_list_html(rows)
     pdf_bytes = pdf_service.render_pdf(html)
@@ -1208,7 +1649,11 @@ def export_follow_up_pdf(class_id: int = None, db: Session = Depends(get_db)):
 
 
 @app.get("/mst/duties/{mst_exam_id}", response_model=list[schemas.DutyOut])
-def list_duties(mst_exam_id: int, db: Session = Depends(get_db)):
+def list_duties(
+    mst_exam_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("duty.read"))
+):
     duties = db.query(models.InvigilationDuty).filter_by(mst_exam_id=mst_exam_id).all()
     rooms = {r.id: r.room_number for r in db.query(models.Room).all()}
     fac = {f.id: f.name for f in db.query(models.Faculty).all()}
@@ -1223,7 +1668,11 @@ def list_duties(mst_exam_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/mst/duties/assign")
-def assign_duty(req: schemas.DutyAssignIn, db: Session = Depends(get_db)):
+def assign_duty(
+    req: schemas.DutyAssignIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("duty.assign"))
+):
     d = db.query(models.InvigilationDuty).filter_by(
         mst_exam_id=req.mst_exam_id, room_id=req.room_id).first()
     if not d:
@@ -1238,7 +1687,11 @@ def assign_duty(req: schemas.DutyAssignIn, db: Session = Depends(get_db)):
 
 
 @app.post("/mst/duties/unassign/{duty_id}")
-def unassign_duty(duty_id: int, db: Session = Depends(get_db)):
+def unassign_duty(
+    duty_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("duty.assign"))
+):
     d = db.query(models.InvigilationDuty).filter_by(id=duty_id).first()
     if not d:
         raise HTTPException(status_code=404, detail="Duty not found")
@@ -1252,7 +1705,11 @@ class AutoScheduleIn(BaseModel):
     mst_exam_ids: list[int]
 
 @app.post("/mst/duties/auto-schedule")
-def auto_schedule_duties(req: AutoScheduleIn, db: Session = Depends(get_db)):
+def auto_schedule_duties(
+    req: AutoScheduleIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("duty.generate"))
+):
     """Propose invigilation duties. Nothing is saved — review first, then apply."""
     if not req.mst_exam_ids:
         raise HTTPException(status_code=400, detail="Pick at least one exam")
@@ -1264,16 +1721,24 @@ class ApplyProposalIn(BaseModel):
     changed_by: int = None
 
 @app.post("/mst/duties/auto-schedule/apply")
-def apply_scheduled_duties(req: ApplyProposalIn, db: Session = Depends(get_db)):
+def apply_scheduled_duties(
+    req: ApplyProposalIn,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("duty.assign"))
+):
     """Save a reviewed proposal. Every assignment is audit-logged."""
     for a in req.assignments:
         if not all(k in a for k in ("mst_exam_id", "room_id", "faculty_id")):
             raise HTTPException(status_code=400, detail=f"Bad assignment: {a}")
-    return crud.apply_duty_proposal(db, req.assignments, req.changed_by)
+    return crud.apply_duty_proposal(db, req.assignments, current_user.id)
 
 
 @app.get("/mst/faculty-status", response_model=list[schemas.FacultyExamStatusOut])
-def faculty_status_for_exam(mst_exam_id: int, db: Session = Depends(get_db)):
+def faculty_status_for_exam(
+    mst_exam_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("duty.read"))
+):
     """
     Who can invigilate this exam: faculty with a class overlapping the exam
     slot are 'Teaching', already-assigned invigilators are 'On duty',
@@ -1336,7 +1801,10 @@ def faculty_status_for_exam(mst_exam_id: int, db: Session = Depends(get_db)):
 # ── Faculty × MST timetable grid ─────────────────────────────────────────────
 
 @app.get("/mst/faculty-grid")
-def faculty_exam_grid(db: Session = Depends(get_db)):
+def faculty_exam_grid(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("duty.read"))
+):
     """
     Returns every exam slot × every faculty member so the frontend can render
     a full free/busy timetable grid without multiple round-trips.
@@ -1409,21 +1877,37 @@ def faculty_exam_grid(db: Session = Depends(get_db)):
 # ── MST Roll-call attendance (no seating plan required) ──────────────────────
 
 @app.get("/mst/attendance/rollcall/{mst_exam_id}")
-def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_rollcall(
+    mst_exam_id: int,
+    room_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_permission("attendance.read"))
+):
     """
     Returns all eligible/seatable students for an exam with their current
     attendance status so the teacher can do a fast roll-call.
-    Works even when no seating plan has been generated.
+    Enforces invigilator room assignment authorization.
     """
     exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
+    # Resource authorization: verify invigilator is assigned to this room/exam
+    verify_invigilator_room_assignment(db, current_user, mst_exam_id=mst_exam_id, room_id=room_id)
+
     # Fetch students scoped to the exam's class (or all if no class attached)
     q = db.query(models.Student).filter_by(active=True)
     if exam.class_id:
         q = q.filter_by(class_id=exam.class_id)
+
+    if room_id:
+        seats = db.query(models.Seat).filter_by(mst_exam_id=mst_exam_id, room_id=room_id).all()
+        student_ids = {s.left_student for s in seats} | {s.right_student for s in seats}
+        student_ids.discard(None)
+        q = q.filter(models.Student.id.in_(student_ids))
+
     students = q.order_by(models.Student.roll_number).all()
+
 
     # Fetch existing attempt records
     attempts = {

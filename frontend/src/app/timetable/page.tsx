@@ -15,6 +15,7 @@ import {
   RefreshCw, Search, CheckCircle, BookOpen, Shield, Clock,
   AlertCircle, CalendarDays, Plus, X, Save, Table2,
 } from "lucide-react"
+import { apiFetch as baseApiFetch, getApiErrorMessage } from "@/lib/api"
 
 const DAYS = ["MON", "TUE", "WED", "THUR", "FRI"] as const
 const PERIODS = [
@@ -27,8 +28,6 @@ const PERIODS = [
   { label: "3:30-4:15",   start: "15:30", end: "16:15" },
   { label: "4:15-5:00",   start: "16:15", end: "17:00" },
 ]
-
-const API = "/api"
 
 type ClassMeta = { id: number; name: string; year: number; branch: string }
 type FacultyMeta = { id: number; name: string; abbreviation: string | null }
@@ -62,13 +61,14 @@ function formatDate(d: string | null) {
 }
 
 async function apiFetch(path: string, init?: RequestInit) {
-  const res = await fetch(`${API}${path}`, init)
+  const res = await baseApiFetch(path, init)
   if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as { detail?: string }
-    throw new Error(err.detail ?? `HTTP ${res.status}`)
+    const err = await getApiErrorMessage(res, `HTTP ${res.status}`)
+    throw new Error(err)
   }
   return res.json()
 }
+
 
 // Timetable Input Tab
 function TimetableInputTab() {
@@ -403,14 +403,14 @@ function FreeBusyGridTab() {
   async function load() {
     setLoading(true); setError(null)
     try {
-      const res = await fetch(`${API}/mst/faculty-grid`)
-      if (!res.ok) throw new Error(`Server returned ${res.status}`)
-      setGrid(await res.json())
+      const data = await apiFetch("/mst/faculty-grid")
+      setGrid(data)
     } catch (e) {
       setError((e as Error).message)
     } finally {
       setLoading(false)
     }
+
   }
 
   useEffect(() => { load() }, [])

@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useToast } from "@/components/ui/use-toast"
+import { apiFetch } from "@/lib/api"
 
 type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null }
 
@@ -36,7 +37,7 @@ export default function DutiesPage() {
   const { toast } = useToast()
 
   useEffect(() => {
-    fetch("/api/mst/exams").then((r) => r.ok ? r.json() : []).then(setExams).catch(() => {})
+    apiFetch("/mst/exams").then((r) => r.ok ? r.json() : []).then(setExams).catch(() => {})
   }, [])
 
   const toggle = (id: number) =>
@@ -50,7 +51,7 @@ export default function DutiesPage() {
     setBusy(true)
     setResult(null)
     try {
-      const res = await fetch("/api/mst/duties/auto-schedule", {
+      const res = await apiFetch("/mst/duties/auto-schedule", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mst_exam_ids: selected }),
@@ -68,7 +69,7 @@ export default function DutiesPage() {
     if (!result || result.proposal.length === 0) return
     setApplying(true)
     try {
-      const res = await fetch("/api/mst/duties/auto-schedule/apply", {
+      const res = await apiFetch("/mst/duties/auto-schedule/apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

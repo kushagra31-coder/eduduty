@@ -19,17 +19,80 @@ Never executes raw SQL from the model. Writes go through the ORM CRUD layer only
 API keys are never logged or returned to the client.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import time
+from typing import Optional
+import uuid
 import httpx
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import models
+
+# ── Trusted Identity Context Configuration (Stage B4.2B.2 & B4.2B.5) ──────────
+KNOWN_INSECURE_DEV_SECRET = "eduduty_insecure_default_hmac_secret_for_dev_only_32b"
+
+
+def get_rls_hmac_secret() -> str:
+    """
+    Retrieve and validate the HMAC signing key for PostgreSQL Row-Level Security identity context.
+    Fails closed if the secret is missing, empty, matches known insecure development defaults,
+    or has insufficient entropy (< 32 characters).
+    """
+    secret = os.environ.get("EDUDUTY_RLS_HMAC_SECRET", "").strip()
+    if not secret:
+        raise RuntimeError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: EDUDUTY_RLS_HMAC_SECRET environment variable "
+            "is missing or empty. A secure high-entropy signing secret must be supplied."
+        )
+    if secret == KNOWN_INSECURE_DEV_SECRET:
+        raise RuntimeError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: The known insecure development signing secret "
+            "is rejected. Production and deployable environments must configure a unique, high-entropy secret."
+        )
+    if len(secret) < 32:
+        raise RuntimeError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: EDUDUTY_RLS_HMAC_SECRET has insufficient entropy "
+            "(minimum 32 characters required)."
+        )
+    return secret
+
+
+def mint_signed_identity_context(current_user: Optional[models.User]) -> dict:
+    """
+    Generate an authenticated, cryptographically signed identity context for PostgreSQL queries.
+    Prevents unauthorized GUC manipulation or identity spoofing by untrusted database roles.
+    """
+    user_id_str = str(current_user.id) if (current_user and current_user.id is not None) else ""
+    fac_id_str = str(current_user.faculty_id) if (current_user and current_user.faculty_id is not None) else ""
+    role_str = (current_user.role or "").strip().lower() if current_user else ""
+    issued_at = str(int(time.time()))
+    nonce = uuid.uuid4().hex[:16]
+
+    secret = get_rls_hmac_secret()
+    canonical_payload = f"{user_id_str}:{fac_id_str}:{role_str}:{issued_at}:{nonce}"
+    sig = hmac.new(
+        secret.encode("utf-8"),
+        canonical_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return {
+        "uid": user_id_str,
+        "fac_id": fac_id_str,
+        "role": role_str,
+        "ts": issued_at,
+        "nonce": nonce,
+        "sig": sig,
+    }
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # Cloud-first: the AI works wherever the backend is hosted — no local Ollama needed.
@@ -84,7 +147,7 @@ READ_SYSTEM_PROMPT = """
 You are a read-only SQL assistant for an MST (midterm exam) operations database.
 You may ONLY query these views (no other tables):
 
-- ai_eligibility_summary(class_name, mst_label, eligible_count, ineligible_count, missing_count)
+- ai_eligibility_summary(class_name, mst_label, eligible_count, borderline_count, ineligible_count, missing_count)
 - ai_attendance_summary(class_name, roll_number, student_name, overall_pct, lowest_subject_pct)
 - ai_vt_candidates(class_name, roll_number, student_name, mst1_status, mst2_status)
 - ai_duty_roster(mst_label, exam_date, room_number, faculty_name, duty_status)
@@ -227,48 +290,219 @@ async def _llm_chat(system: str, user: str, temperature: float = 0.1) -> str:
 
 def _validate_read_sql(sql: str) -> str:
     """Raise ValueError if SQL is not a safe SELECT over allowed views."""
-    stripped = sql.strip().rstrip(";").strip()
+    # 1. Strip comments before validation
+    clean_sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    clean_sql = re.sub(r"--.*$", "", clean_sql, flags=re.MULTILINE)
+    stripped = clean_sql.strip().rstrip(";").strip()
+
+    # Reject multi-statement queries
+    if ";" in stripped:
+        raise ValueError("Multi-statement SQL queries are forbidden.")
 
     if not stripped.upper().startswith("SELECT"):
         raise ValueError("Only SELECT statements are allowed.")
 
-    # Block any dangerous keywords
+    # Reject schema prefixes (quoted or unquoted: main., "main"., public., etc.)
+    if re.search(r'(?:\b|")?(?:main|public|sqlite_master|information_schema)(?:\b|")?\s*\.', stripped, re.IGNORECASE):
+        raise ValueError("Schema-qualified table names are forbidden.")
+
+    # Block any dangerous keywords, session configuration changes, or CTE overrides
     dangerous = re.compile(
-        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|GRANT|TRUNCATE|EXEC|EXECUTE)\b",
+        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|GRANT|REVOKE|TRUNCATE|EXEC|EXECUTE|PRAGMA|WITH|SET|SET_CONFIG|CURRENT_SETTING)\b",
         re.IGNORECASE,
     )
     if dangerous.search(stripped):
-        raise ValueError("Statement contains forbidden keywords.")
+        raise ValueError("Statement contains forbidden keywords or WITH clauses.")
 
-    # Ensure only allowed views are referenced
-    token_pattern = re.compile(r"\b(FROM|JOIN)\s+([a-z_]+)", re.IGNORECASE)
+    # Ensure only allowed views are referenced (ignoring optional quotes)
+    token_pattern = re.compile(r'\b(?:FROM|JOIN)\s+(?:"?([a-z0-9_]+)"?)', re.IGNORECASE)
     for match in token_pattern.finditer(stripped):
-        table = match.group(2).lower()
+        table = match.group(1).lower()
         if table not in ALLOWED_READ_VIEWS:
             raise ValueError(f"Access to '{table}' is not permitted. Allowed: {ALLOWED_READ_VIEWS}")
 
     return stripped
 
+
+# ── Structured Reporting Operations (Production Path) ─────────────────────────
+
+STRUCTURED_REPORTING_OPS = {
+    "get_eligibility_summary": {
+        "description": "Aggregated count of eligible, borderline, ineligible, and missing students per class/exam.",
+        "view": "ai_eligibility_summary",
+        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
+        "pii": False,
+        "allowed_args": {"class_name", "mst_label"},
+    },
+    "get_attendance_summary": {
+        "description": "Per-student overall and lowest subject attendance percentages.",
+        "view": "ai_attendance_summary",
+        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
+        "pii": True,
+        "allowed_args": {"class_name", "roll_number", "min_pct", "max_pct"},
+    },
+    "get_vt_candidates": {
+        "description": "List students flagged for Virtual Test candidates based on MST status.",
+        "view": "ai_vt_candidates",
+        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
+        "pii": True,
+        "allowed_args": {"class_name", "roll_number"},
+    },
+    "get_duty_roster": {
+        "description": "Invigilation duty allocation details per exam date, room, and faculty.",
+        "view": "ai_duty_roster",
+        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
+        "pii": True,
+        "allowed_args": {"mst_label", "room_number", "faculty_name"},
+    },
+    "get_vt_follow_up_status": {
+        "description": "VT follow-up statuses, appearance records, and override reasons.",
+        "view": "v_vt_follow_up_status",
+        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
+        "pii": True,
+        "allowed_args": {"class_name", "roll_number", "final_status"},
+    },
+}
+
+
+def execute_structured_reporting_op(
+    op_name: str,
+    args: dict,
+    read_db: Session,
+    current_user: Optional[models.User] = None,
+    scope_class_names: Optional[set] = None,
+    user_faculty_name: Optional[str] = None,
+) -> dict:
+    """
+    Execute a production-grade fixed reporting query with typed arguments and server-enforced scope.
+    The LLM chooses the operation and arguments; the server owns SQL generation and authorization.
+    """
+    if op_name not in STRUCTURED_REPORTING_OPS:
+        raise ValueError(f"Unknown reporting operation '{op_name}'. Allowed: {set(STRUCTURED_REPORTING_OPS.keys())}")
+
+    meta = STRUCTURED_REPORTING_OPS[op_name]
+    user_role = current_user.role if current_user else "VIEWER"
+    if user_role not in meta["permitted_roles"]:
+        raise ValueError(f"Role '{user_role}' is not authorized to execute operation '{op_name}'.")
+
+    view_name = meta["view"]
+    where_clauses = []
+    params = {}
+
+    # 1. Enforce Server-Derived Role Scope
+    if scope_class_names is not None and view_name != "ai_duty_roster":
+        if scope_class_names:
+            p_keys = []
+            for idx, cname in enumerate(sorted(scope_class_names)):
+                pk = f"scope_cls_{idx}"
+                params[pk] = cname
+                p_keys.append(f":{pk}")
+            where_clauses.append(f"class_name IN ({', '.join(p_keys)})")
+        else:
+            where_clauses.append("1=0")
+
+    # 2. Process Typed User Arguments
+    for key, val in args.items():
+        if key not in meta["allowed_args"] or val is None:
+            continue
+        if key == "class_name":
+            params["arg_cname"] = str(val).strip()
+            where_clauses.append("class_name = :arg_cname")
+        elif key == "mst_label":
+            params["arg_mst"] = str(val).strip()
+            where_clauses.append("mst_label = :arg_mst")
+        elif key == "roll_number":
+            params["arg_roll"] = str(val).strip()
+            where_clauses.append("roll_number = :arg_roll")
+        elif key == "room_number":
+            params["arg_room"] = str(val).strip()
+            where_clauses.append("room_number = :arg_room")
+        elif key == "faculty_name":
+            params["arg_fac"] = f"%{str(val).strip()}%"
+            where_clauses.append("LOWER(faculty_name) LIKE LOWER(:arg_fac)")
+        elif key == "final_status":
+            params["arg_status"] = str(val).strip()
+            where_clauses.append("final_status = :arg_status")
+        elif key == "min_pct":
+            try:
+                params["arg_min_pct"] = float(val)
+                where_clauses.append("overall_pct >= :arg_min_pct")
+            except (ValueError, TypeError):
+                where_clauses.append("1=0")
+        elif key == "max_pct":
+            try:
+                params["arg_max_pct"] = float(val)
+                where_clauses.append("overall_pct <= :arg_max_pct")
+            except (ValueError, TypeError):
+                where_clauses.append("1=0")
+
+    where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    sql = f"SELECT * FROM {view_name}{where_sql}"
+
+    # Enforce transaction-scoped identity context on PostgreSQL
+    is_pg = False
+    try:
+        bind = read_db.get_bind()
+        is_pg = (bind.dialect.name == "postgresql") if bind else False
+    except Exception:
+        pass
+
+    try:
+        if is_pg:
+            ctx = mint_signed_identity_context(current_user)
+            read_db.execute(
+                text("""
+                    SELECT set_config('app.current_user_id', :uid, true),
+                           set_config('app.current_faculty_id', :fac_id, true),
+                           set_config('app.current_user_role', :role, true),
+                           set_config('app.current_context_issued_at', :ts, true),
+                           set_config('app.current_context_nonce', :nonce, true),
+                           set_config('app.current_context_signature', :sig, true)
+                """),
+                ctx,
+            )
+
+        rows = read_db.execute(text(sql), params).fetchmany(100)
+        data = [dict(r._mapping) for r in rows]
+    finally:
+        if is_pg:
+            try:
+                read_db.rollback()
+            except Exception:
+                pass
+
+    return {
+        "operation": op_name,
+        "view": view_name,
+        "pii_contained": meta["pii"],
+        "count": len(data),
+        "data": data,
+    }
+
+
 # ── Write op dispatcher ────────────────────────────────────────────────────────
 
-def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT") -> dict:
+def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.User] = None, ai_user_label: str = "AI_AGENT") -> dict:
     """
     Execute a validated write operation through the ORM (never raw SQL).
+    Enforces exact matching, actor audit tracking, and hard business constraint validation.
     Returns a dict describing what changed.
     """
     op = op_json.get("operation")
+    user_id = current_user.id if current_user else None
 
     if op == "override_eligibility":
-        roll    = op_json["roll_number"]
-        label   = op_json["mst_label"]
-        reason  = op_json["reason"]
+        roll    = str(op_json["roll_number"]).strip()
+        label   = str(op_json["mst_label"]).strip()
+        reason  = str(op_json["reason"]).strip()
 
-        student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{roll}%")).first()
+        # Enforce exact roll number matching (IDOR and precision protection)
+        student = db.query(models.Student).filter(models.Student.roll_number == roll).first()
         if not student:
-            raise ValueError(f"Student with roll number {roll} not found.")
+            raise ValueError(f"Student with roll number '{roll}' not found.")
         exam = db.query(models.MstExam).filter(models.MstExam.label == label).first()
         if not exam:
-            raise ValueError(f"Exam {label} not found.")
+            raise ValueError(f"Exam '{label}' not found.")
         el = db.query(models.MstEligibility).filter_by(
             student_id=student.id, mst_exam_id=exam.id
         ).first()
@@ -278,6 +512,7 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         old_override = el.override
         el.override = True
         el.override_reason = reason
+        el.override_by = user_id
 
         log = models.AuditLog(
             table_name="mst_eligibility",
@@ -285,6 +520,7 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
             field_changed="override",
             old_value=str(old_override),
             new_value="True",
+            changed_by=user_id,
             reason=f"[AI] {reason}",
         )
         db.add(log)
@@ -292,19 +528,24 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         return {"changed": "override_eligibility", "roll_number": roll, "exam": label, "reason": reason}
 
     elif op == "mark_attempt_status":
-        roll   = op_json["roll_number"]
-        label  = op_json["mst_label"]
-        status = op_json["status"]
+        roll   = str(op_json["roll_number"]).strip()
+        label  = str(op_json["mst_label"]).strip()
+        status = str(op_json["status"]).strip()
         allowed_statuses = {"Present", "Absent", "Late", "Excused", "Signature missing"}
         if status not in allowed_statuses:
             raise ValueError(f"Invalid status '{status}'. Must be one of {allowed_statuses}")
 
-        student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{roll}%")).first()
+        student = db.query(models.Student).filter(models.Student.roll_number == roll).first()
         if not student:
-            raise ValueError(f"Student {roll} not found.")
+            raise ValueError(f"Student '{roll}' not found.")
         exam = db.query(models.MstExam).filter(models.MstExam.label == label).first()
         if not exam:
-            raise ValueError(f"Exam {label} not found.")
+            raise ValueError(f"Exam '{label}' not found.")
+
+        # Enforce invigilator room assignment authorization if caller is operational user
+        if current_user and current_user.role in ("FACULTY", "INVIGILATOR"):
+            from api.dependencies import verify_invigilator_room_assignment
+            verify_invigilator_room_assignment(db, current_user, mst_exam_id=exam.id, student_id=student.id)
 
         attempt = db.query(models.MstAttempt).filter_by(
             student_id=student.id, mst_exam_id=exam.id
@@ -312,8 +553,14 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         if attempt:
             old_status = attempt.status
             attempt.status = status
+            attempt.marked_by = current_user.faculty_id if (current_user and current_user.faculty_id) else attempt.marked_by
         else:
-            attempt = models.MstAttempt(student_id=student.id, mst_exam_id=exam.id, status=status)
+            attempt = models.MstAttempt(
+                student_id=student.id,
+                mst_exam_id=exam.id,
+                status=status,
+                marked_by=current_user.faculty_id if (current_user and current_user.faculty_id) else None
+            )
             db.add(attempt)
             old_status = "None"
 
@@ -323,16 +570,17 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
             field_changed="status",
             old_value=old_status,
             new_value=status,
-            reason=f"[AI] mark_attempt_status",
+            changed_by=user_id,
+            reason="[AI] mark_attempt_status",
         )
         db.add(log)
         db.commit()
         return {"changed": "mark_attempt_status", "roll_number": roll, "exam": label, "status": status}
 
     elif op == "assign_duty":
-        faculty_name = op_json["faculty_name"]
-        label        = op_json["mst_label"]
-        room_number  = op_json["room_number"]
+        faculty_name = str(op_json["faculty_name"]).strip()
+        label        = str(op_json["mst_label"]).strip()
+        room_number  = str(op_json["room_number"]).strip()
 
         faculty = db.query(models.Faculty).filter(
             models.Faculty.name.ilike(f"%{faculty_name}%")
@@ -341,10 +589,28 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
             raise ValueError(f"Faculty '{faculty_name}' not found.")
         exam = db.query(models.MstExam).filter(models.MstExam.label == label).first()
         if not exam:
-            raise ValueError(f"Exam {label} not found.")
+            raise ValueError(f"Exam '{label}' not found.")
         room = db.query(models.Room).filter(models.Room.room_number == room_number).first()
         if not room:
-            raise ValueError(f"Room {room_number} not found.")
+            raise ValueError(f"Room '{room_number}' not found.")
+
+        # Hard constraint check: faculty duty exemption and timetable availability
+        if faculty.exempt_from_duty:
+            raise ValueError(f"Faculty '{faculty.name}' is exempt from invigilation duty ({faculty.exempt_reason or 'Exempt'}).")
+
+        import crud
+        day = exam.exam_date.strftime("%a").upper() if exam.exam_date else None
+        if day:
+            day = {"THU": "THUR"}.get(day, day)
+            start, end = "09:00", "12:00"
+            if exam.time_slot and "-" in exam.time_slot:
+                parts = [p.strip() for p in exam.time_slot.split("-", 1)]
+                if len(parts) == 2 and all(parts):
+                    start, end = parts
+            avail = crud.check_faculty_availability(db, day, start, end)
+            f_avail = next((a for a in avail if a.faculty_id == faculty.id), None)
+            if f_avail and f_avail.status == "Blocked":
+                raise ValueError(f"Faculty '{faculty.name}' has a timetable teaching conflict: {f_avail.reason}")
 
         duty = db.query(models.InvigilationDuty).filter_by(
             mst_exam_id=exam.id, room_id=room.id
@@ -352,7 +618,7 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         if not duty:
             raise ValueError("No duty slot found for that exam+room combination.")
         if duty.status == "Assigned":
-            raise ValueError(f"Duty already assigned to another faculty. Use replace workflow.")
+            raise ValueError("Duty already assigned to another faculty. Use replace workflow.")
 
         duty.faculty_id = faculty.id
         duty.status = "Assigned"
@@ -363,7 +629,8 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
             field_changed="faculty_id",
             old_value="None",
             new_value=str(faculty.id),
-            reason=f"[AI] assign_duty",
+            changed_by=user_id,
+            reason="[AI] assign_duty",
         )
         db.add(log)
         db.commit()
@@ -372,11 +639,49 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
     else:
         raise ValueError(f"Unsupported or unrecognised operation: '{op}'")
 
+
+STRUCTURED_READ_PROMPT = """
+You are a reporting assistant for an MST (midterm exam) operations database.
+Your job is to select the appropriate reporting operation and extract typed arguments as JSON.
+
+Available operations:
+1. get_eligibility_summary
+   Arguments: {"class_name": "...", "mst_label": "MST-1 or MST-2"}
+
+2. get_attendance_summary
+   Arguments: {"class_name": "...", "roll_number": "...", "min_pct": float, "max_pct": float}
+
+3. get_vt_candidates
+   Arguments: {"class_name": "...", "roll_number": "..."}
+
+4. get_duty_roster
+   Arguments: {"mst_label": "...", "room_number": "...", "faculty_name": "..."}
+
+5. get_vt_follow_up_status
+   Arguments: {"class_name": "...", "roll_number": "...", "final_status": "compulsory|excused|completed|not_required|under_review"}
+
+Rules:
+1. Return ONLY valid JSON: {"operation": "<op_name>", "arguments": {...}}
+2. Omit any arguments that are not explicitly present in the query.
+3. If the request is ambiguous or does not match these operations, return: {"operation": "unsupported", "arguments": {}}
+"""
+
+
 # ── Main AI query handler ──────────────────────────────────────────────────────
 
-async def handle_ai_message(message: str, db: Session) -> dict:
+async def handle_ai_message(
+    message: str,
+    db: Session,
+    read_db: Optional[Session] = None,
+    scope_class_names: Optional[set] = None,
+    user_faculty_name: Optional[str] = None,
+    current_user: Optional[models.User] = None,
+) -> dict:
     """
     Route a user message to read, write, or PDF path.
+    Enforces database isolation by executing all AI read queries strictly over read_db.
+    Enforces Layer 2 scope wrapping across all 5 approved views.
+    Production path uses Structured Reporting Operations (ENABLE_FREEFORM_SQL_READ=False).
     Returns a dict:
       { "type": "answer"|"write_proposal"|"pdf_link"|"error",
         "content": str | dict }
@@ -424,13 +729,130 @@ async def handle_ai_message(message: str, db: Session) -> dict:
         except (ConnectionError, RuntimeError) as e:
             return {"type": "error", "content": str(e)}
 
-    # ── Read / Q&A path ───────────────────────────────────────────────────────
+    # ── Read / Q&A path (SEC-04 Isolated Database Reader Execution) ───────────
+    _created_local_read_db = False
+    if read_db is None:
+        try:
+            from database import AIReaderSessionLocal
+            read_db = AIReaderSessionLocal()
+            _created_local_read_db = True
+        except Exception:
+            return {
+                "type": "error",
+                "content": "AI reader database connection is currently unavailable. Please contact system administrator."
+            }
+
     try:
+        app_env = os.environ.get("APP_ENV", "").strip().lower()
+        is_dev_env = app_env in ("development", "dev", "test", "testing")
+        raw_freeform = os.environ.get("ENABLE_FREEFORM_SQL_READ", "false").strip().lower() in ("true", "1", "yes")
+        enable_freeform = raw_freeform and is_dev_env
+
+        if not enable_freeform:
+            # ── Production Path: Structured Reporting Operations ───────────────
+            try:
+                raw_json = await _llm_chat(STRUCTURED_READ_PROMPT, message)
+                raw_json = re.sub(r"```[a-z]*\n?", "", raw_json).strip()
+                op_json  = json.loads(raw_json)
+
+                op_name = op_json.get("operation")
+                op_args = op_json.get("arguments", {})
+
+                if op_name == "unsupported" or op_name not in STRUCTURED_REPORTING_OPS:
+                    return {
+                        "type": "answer",
+                        "content": "I could not map your query to a supported reporting operation. Please specify a class, exam label, or roll number."
+                    }
+
+                op_res = execute_structured_reporting_op(
+                    op_name=op_name,
+                    args=op_args,
+                    read_db=read_db,
+                    current_user=current_user,
+                    scope_class_names=scope_class_names,
+                    user_faculty_name=user_faculty_name,
+                )
+
+                formatted = await _llm_chat(
+                    FORMAT_SYSTEM_PROMPT,
+                    f"Question: {message}\nQuery result: {op_res['data']}",
+                    temperature=0.3,
+                )
+                return {
+                    "type": "answer",
+                    "content": formatted,
+                    "structured_op": op_res
+                }
+
+            except (json.JSONDecodeError, ValueError) as e:
+                return {"type": "error", "content": f"Structured reporting classification failed: {e}"}
+
+        # ── Dev Fallback Path: Text-to-SQL + CTE Scope Injection ──────────────
         sql_raw = await _llm_chat(READ_SYSTEM_PROMPT, message)
         sql     = _validate_read_sql(sql_raw)
 
-        rows = db.execute(text(sql)).fetchall()
-        result_str = str([dict(r._mapping) for r in rows])
+        # Apply CTE Scope Header across all 5 approved views if restricted scope is active
+        query_params = {}
+        if scope_class_names is not None:
+            if scope_class_names:
+                param_names = []
+                for idx, cname in enumerate(sorted(scope_class_names)):
+                    pkey = f"scope_cls_{idx}"
+                    query_params[pkey] = cname
+                    param_names.append(f":{pkey}")
+                class_list_str = ", ".join(param_names)
+                where_class_clause = f"WHERE class_name IN ({class_list_str})"
+            else:
+                where_class_clause = "WHERE 1=0"
+
+            if user_faculty_name:
+                query_params["user_fac_name"] = user_faculty_name
+                where_fac_clause = "WHERE LOWER(faculty_name) = LOWER(:user_fac_name)"
+            else:
+                where_fac_clause = "WHERE 1=0"
+
+            cte_prefix = f"""WITH
+ai_eligibility_summary AS (SELECT * FROM main.ai_eligibility_summary {where_class_clause}),
+ai_attendance_summary AS (SELECT * FROM main.ai_attendance_summary {where_class_clause}),
+ai_vt_candidates AS (SELECT * FROM main.ai_vt_candidates {where_class_clause}),
+v_vt_follow_up_status AS (SELECT * FROM main.v_vt_follow_up_status {where_class_clause}),
+ai_duty_roster AS (SELECT * FROM main.ai_duty_roster {where_fac_clause})
+"""
+            final_sql = f"{cte_prefix}\n{sql}"
+        else:
+            final_sql = sql
+
+        # Route query STRICTLY through read_db connection
+        is_pg = False
+        try:
+            bind = read_db.get_bind()
+            is_pg = (bind.dialect.name == "postgresql") if bind else False
+        except Exception:
+            pass
+
+        try:
+            if is_pg:
+                ctx = mint_signed_identity_context(current_user)
+                read_db.execute(
+                    text("""
+                        SELECT set_config('app.current_user_id', :uid, true),
+                               set_config('app.current_faculty_id', :fac_id, true),
+                               set_config('app.current_user_role', :role, true),
+                               set_config('app.current_context_issued_at', :ts, true),
+                               set_config('app.current_context_nonce', :nonce, true),
+                               set_config('app.current_context_signature', :sig, true)
+                    """),
+                    ctx,
+                )
+
+            rows = read_db.execute(text(final_sql), query_params).fetchmany(100)
+            result_str = str([dict(r._mapping) for r in rows])
+        finally:
+            if is_pg:
+                try:
+                    read_db.rollback()
+                except Exception:
+                    pass
 
         # Format result in plain English
         formatted = await _llm_chat(
@@ -441,4 +863,15 @@ async def handle_ai_message(message: str, db: Session) -> dict:
         return {"type": "answer", "content": formatted}
 
     except Exception as e:
-        return {"type": "error", "content": f"Query failed: {e}"}
+        err_msg = str(e)
+        if any(k in err_msg.lower() for k in ["read-only", "readonly", "query_only", "permission denied", "cannot execute"]):
+            return {"type": "error", "content": "Database operation rejected: AI reader is restricted to read-only queries."}
+        return {"type": "error", "content": f"Query failed: {err_msg}"}
+    finally:
+        if _created_local_read_db and read_db:
+            try:
+                read_db.close()
+            except Exception:
+                pass
+
+

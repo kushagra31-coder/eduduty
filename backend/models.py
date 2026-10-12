@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Integer, String, Numeric, ForeignKey, SmallInteger, Date, DateTime, text
+from sqlalchemy import Boolean, Column, Integer, String, Numeric, ForeignKey, SmallInteger, Date, DateTime, UniqueConstraint, text
 from sqlalchemy.orm import relationship
 from database import Base
 import datetime
@@ -68,6 +68,9 @@ class MstExam(Base):
 
 class MstEligibility(Base):
     __tablename__ = "mst_eligibility"
+    __table_args__ = (
+        UniqueConstraint("student_id", "mst_exam_id", name="uq_mst_eligibility_student_exam"),
+    )
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
     mst_exam_id = Column(Integer, ForeignKey("mst_exams.id"), nullable=False)
@@ -80,6 +83,9 @@ class MstEligibility(Base):
 
 class MstAttempt(Base):
     __tablename__ = "mst_attempts"
+    __table_args__ = (
+        UniqueConstraint("student_id", "mst_exam_id", name="uq_mst_attempts_student_exam"),
+    )
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
     mst_exam_id = Column(Integer, ForeignKey("mst_exams.id"), nullable=False)
@@ -155,9 +161,11 @@ class DutyReplacement(Base):
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
+    supabase_uid = Column(String(100), unique=True, index=True)
     name = Column(String(100), nullable=False)
     role = Column(String(30), nullable=False)
     email = Column(String(150), unique=True)
+    faculty_id = Column(Integer, ForeignKey("faculty.id"))
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"

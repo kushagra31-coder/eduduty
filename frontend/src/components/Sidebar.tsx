@@ -2,34 +2,28 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, Upload, CheckSquare, Settings, Sun, Moon, Bot, CalendarDays, Armchair, ClipboardList, Users, ClipboardCheck } from 'lucide-react';
+import { Sun, Moon, LogOut, User as UserIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
-
-const NAV_LINKS = [
-  { href: "/dashboard",          label: "Dashboard",          icon: Home },
-  { href: "/attendance/upload",  label: "Upload Attendance",  icon: Upload },
-  { href: "/attendance/tracker", label: "MST Seat Map",       icon: Armchair },
-  { href: "/mst-rollcall",       label: "MST Roll Call",      icon: ClipboardCheck },
-  { href: "/eligibility",        label: "Eligibility",        icon: CheckSquare },
-  { href: "/follow-up",          label: "VT / Follow-up",     icon: ClipboardList },
-  { href: "/duties",             label: "Duty Scheduler",     icon: Users },
-  { href: "/timetable",          label: "Timetable",          icon: CalendarDays },
-  { href: "/ai",                 label: "AI Assistant",       icon: Bot },
-  { href: "/settings",           label: "Settings",           icon: Settings },
-];
+import { useAuth } from '@/lib/auth/context';
+import { getFilteredNavLinks } from '@/lib/nav';
 
 
 export function Sidebar({ className }: { className?: string }) {
   const { theme, setTheme } = useTheme();
   const pathname = usePathname();
   const [mounted, setMounted] = useState(false);
+  const { user, role, signOut } = useAuth();
 
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  if (pathname === '/login') {
+    return null;
+  }
 
   return (
     <div className={cn("pb-12 border-r bg-sidebar min-h-screen flex flex-col", className)}>
@@ -47,7 +41,7 @@ export function Sidebar({ className }: { className?: string }) {
             </div>
           </div>
           <div className="space-y-1">
-            {NAV_LINKS.map(({ href, label, icon: Icon }) => {
+            {getFilteredNavLinks(role).map(({ href, label, icon: Icon }) => {
               const active = pathname === href || pathname.startsWith(href + "/");
               return (
                 <Link
@@ -69,7 +63,16 @@ export function Sidebar({ className }: { className?: string }) {
         </div>
       </div>
       
-      <div className="p-4 border-t">
+      <div className="p-4 border-t space-y-2">
+        {user && (
+          <div className="px-2 py-1.5 flex items-center gap-2 text-xs text-muted-foreground border-b pb-2 mb-2">
+            <UserIcon className="h-4 w-4 shrink-0" />
+            <div className="overflow-hidden text-ellipsis whitespace-nowrap">
+              <p className="font-medium text-foreground text-xs">{user.email}</p>
+              <p className="text-[10px] text-muted-foreground capitalize">{role ? role.replace('_', ' ') : 'User'}</p>
+            </div>
+          </div>
+        )}
         {mounted && (
           <Button 
             variant="outline" 
@@ -80,7 +83,18 @@ export function Sidebar({ className }: { className?: string }) {
             Toggle Theme
           </Button>
         )}
+        {user && (
+          <Button 
+            variant="ghost" 
+            className="w-full justify-start gap-2 text-destructive hover:text-destructive hover:bg-destructive/10" 
+            onClick={() => signOut()}
+          >
+            <LogOut className="h-4 w-4" />
+            Sign Out
+          </Button>
+        )}
       </div>
     </div>
   );
 }
+
