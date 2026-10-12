@@ -17,6 +17,11 @@ Architecture:
 
 Never executes raw SQL from the model. Writes go through the ORM CRUD layer only.
 API keys are never logged or returned to the client.
+
+PRIVACY NOTE: Contextual query views and prompts sent to external LLM providers
+(Groq / Gemini) may contain student names and roll numbers. For strict student data
+privacy or air-gapped on-premises deployments, configure local Ollama
+(e.g., set AI_PROVIDERS=ollama, leaving cloud API keys unset).
 """
 
 import json
