@@ -55,10 +55,12 @@ def _ensure_ai_views():
             """,
             "ai_attendance_summary": """
                 SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
-                me.overall_pct, me.lowest_subject_pct
+                me.overall_pct, me.lowest_subject_pct,
+                me.mst_exam_id, e.label AS mst_label
                 FROM mst_eligibility me
                 JOIN students s ON s.id = me.student_id
                 JOIN classes c ON c.id = s.class_id
+                LEFT JOIN mst_exams e ON e.id = me.mst_exam_id
             """,
             "ai_vt_candidates": """
                 SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
