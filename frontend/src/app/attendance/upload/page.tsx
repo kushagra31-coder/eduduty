@@ -1,12 +1,23 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { UploadCloud, CheckCircle } from "lucide-react"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { UploadCloud, CheckCircle, AlertTriangle } from "lucide-react"
 import { useToast } from "@/components/ui/use-toast"
 
+interface ClassItem {
+  id: number
+  name: string
+  branch: string
+  year: number
+  section?: string | null
+}
+
 export default function AttendanceUpload() {
+  const [classes, setClasses] = useState<ClassItem[]>([])
+  const [selectedClassId, setSelectedClassId] = useState<string>("")
   const [isDragging, setIsDragging] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [isUploading, setIsUploading] = useState(false)
@@ -16,8 +27,27 @@ export default function AttendanceUpload() {
     subjects_imported?: number
     class?: string
     sheets?: { sheet: string; status: string; reason?: string; subject?: string; rows?: number }[]
+    class_conflicts?: { roll_number: string; name: string; existing_class: string; imported_class: string }[]
   } | null>(null)
   const { toast } = useToast()
+
+  useEffect(() => {
+    fetch('/api/classes')
+      .then(res => res.ok ? res.json() : [])
+      .then((data: ClassItem[]) => setClasses(data))
+      .catch(() => {})
+  }, [])
+
+  const preselectClassFromFilename = useCallback((fileName: string, classList: ClassItem[]) => {
+    const cleanFileName = fileName.toUpperCase().replace(/[_\-\s.]+/g, '')
+    for (const c of classList) {
+      const cleanClassName = c.name.toUpperCase().replace(/[_\-\s.]+/g, '')
+      if (cleanClassName && cleanFileName.includes(cleanClassName)) {
+        return String(c.id)
+      }
+    }
+    return null
+  }, [])
 
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -38,6 +68,8 @@ export default function AttendanceUpload() {
       const droppedFile = e.dataTransfer.files[0]
       if (droppedFile.name.endsWith('.xlsx') || droppedFile.name.endsWith('.xls')) {
         setFile(droppedFile)
+        const matched = preselectClassFromFilename(droppedFile.name, classes)
+        if (matched) setSelectedClassId(matched)
       } else {
         toast({
           title: "Invalid file type",
@@ -46,11 +78,14 @@ export default function AttendanceUpload() {
         })
       }
     }
-  }, [toast])
+  }, [classes, preselectClassFromFilename, toast])
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0])
+      const selected = e.target.files[0]
+      setFile(selected)
+      const matched = preselectClassFromFilename(selected.name, classes)
+      if (matched) setSelectedClassId(matched)
     }
   }
 
@@ -60,6 +95,9 @@ export default function AttendanceUpload() {
     setIsUploading(true)
     const formData = new FormData()
     formData.append('file', file)
+    if (selectedClassId) {
+      formData.append('class_id', selectedClassId)
+    }
 
     try {
       const res = await fetch('/api/upload-attendance/', {
@@ -70,8 +108,6 @@ export default function AttendanceUpload() {
       const data = await res.json().catch(() => null)
 
       if (!res.ok) {
-        // HTTP error from the backend (e.g. 400 "no subject sheets recognized") —
-        // show FastAPI's actual detail instead of a generic message.
         const detail = data?.detail ?? `Server returned status ${res.status}`
         toast({
           title: "Upload Failed",
@@ -85,11 +121,12 @@ export default function AttendanceUpload() {
       const skipped = (data.sheets ?? []).filter((s: { status: string }) => s.status !== 'imported')
       toast({
         title: "Upload Successful",
-        description: `Imported ${data.rows_imported} records across ${data.subjects_imported} subjects from ${data.filename}` +
+        description: `Imported ${data.rows_imported} records` +
+          (data.subjects_imported ? ` across ${data.subjects_imported} subjects` : '') +
+          ` from ${data.filename}` +
           (skipped.length ? ` (${skipped.length} sheet${skipped.length > 1 ? 's' : ''} skipped)` : ''),
       })
     } catch (e) {
-      // fetch() itself threw — network failure, backend unreachable.
       toast({
         title: "Upload Failed",
         description: e instanceof TypeError
@@ -119,7 +156,38 @@ export default function AttendanceUpload() {
           </CardHeader>
           <CardContent>
             {!uploadResult ? (
-              <div className="space-y-4">
+              <div className="space-y-5">
+                <div className="space-y-1.5">
+                  <label htmlFor="class-select" className="text-sm font-medium">
+                    Target Class <span className="text-muted-foreground font-normal text-xs">(required for flat rosters; pre-selected from filename)</span>
+                  </label>
+                  <div className="flex items-center gap-3">
+                    <Select value={selectedClassId} onValueChange={(val) => setSelectedClassId(val || "")}>
+                      <SelectTrigger id="class-select" className="w-full sm:w-80">
+                        <SelectValue placeholder="Select class..." />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {classes.map((c) => (
+                          <SelectItem key={c.id} value={String(c.id)}>
+                            {c.name} · Year {c.year} ({c.branch})
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {selectedClassId && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setSelectedClassId("")}
+                        className="text-xs text-muted-foreground hover:text-foreground"
+                      >
+                        Clear
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
                 <div 
                   className={`border-2 border-dashed rounded-lg p-12 text-center transition-colors cursor-pointer ${
                     isDragging ? 'border-primary bg-primary/5' : 'border-border hover:bg-accent hover:border-primary/50'
@@ -178,6 +246,27 @@ export default function AttendanceUpload() {
                   )}{' '}
                   from {uploadResult.filename}.
                 </p>
+
+                {uploadResult.class_conflicts && uploadResult.class_conflicts.length > 0 && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-left space-y-2">
+                    <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 font-semibold text-sm">
+                      <AlertTriangle className="h-4 w-4" />
+                      <span>Class Mismatch Warnings ({uploadResult.class_conflicts.length} student{uploadResult.class_conflicts.length > 1 ? 's' : ''})</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      The following students already belong to a different class and were kept in their original class:
+                    </p>
+                    <ul className="text-xs space-y-1 max-h-36 overflow-y-auto">
+                      {uploadResult.class_conflicts.map((c, idx) => (
+                        <li key={idx} className="flex justify-between py-1 border-b border-border/50 last:border-0">
+                          <span className="font-mono font-medium">{c.roll_number} ({c.name})</span>
+                          <span className="text-muted-foreground">Original: {c.existing_class} · Sheet: {c.imported_class}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
                 {uploadResult.sheets && uploadResult.sheets.some(s => s.status !== 'imported') && (
                   <details className="text-left text-sm mt-2">
                     <summary className="cursor-pointer text-muted-foreground hover:text-foreground">

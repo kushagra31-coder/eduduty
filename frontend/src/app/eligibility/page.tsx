@@ -112,10 +112,10 @@ export default function EligibilityPage() {
         const err = await res.json().catch(() => ({}))
         throw new Error(err.detail || "Failed to update override")
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       toast({
         title: "Error",
-        description: err.message || "Could not update the override status.",
+        description: err instanceof Error ? err.message : "Could not update the override status.",
         variant: "destructive"
       })
     }

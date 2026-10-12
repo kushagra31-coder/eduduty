@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy import or_
@@ -348,13 +348,23 @@ def get_non_attempted_exams_for_class(db: Session, class_id: int) -> list[models
     return non_attempted
 
 
-def _import_subject_workbook(db: Session, xls, filename: str):
+def _import_subject_workbook(db: Session, xls, filename: str, class_id: Optional[int] = None):
     """Import every per-subject sheet in the workbook."""
-    cls, semester = _class_from_filename(db, filename)
+    if class_id:
+        cls = db.query(models.Class).filter_by(id=class_id).first()
+        if not cls:
+            cls, semester = _class_from_filename(db, filename)
+        else:
+            _, semester = _class_from_filename(db, filename)
+    else:
+        cls, semester = _class_from_filename(db, filename)
+
     target_exams = get_non_attempted_exams_for_class(db, cls.id)
     sheets_summary = []
     total_records = 0
     students_seen = set()
+    class_conflicts = []
+    seen_conflicts = set()
 
     for sh in xls.sheet_names:
         df = xls.parse(sh, header=None)
@@ -384,9 +394,19 @@ def _import_subject_workbook(db: Session, xls, filename: str):
                 db.add(student)
                 db.commit()
                 db.refresh(student)
-            elif name != "Unknown" and student.name in ("Unknown", "", None):
-                student.name = name
-                db.commit()
+            else:
+                if student.class_id != cls.id and roll not in seen_conflicts:
+                    seen_conflicts.add(roll)
+                    existing_cls = db.query(models.Class).filter_by(id=student.class_id).first()
+                    class_conflicts.append({
+                        "roll_number": roll,
+                        "name": student.name,
+                        "existing_class": existing_cls.name if existing_cls else str(student.class_id),
+                        "imported_class": cls.name,
+                    })
+                if name != "Unknown" and student.name in ("Unknown", "", None):
+                    student.name = name
+                    db.commit()
             db.add(models.AttendanceRecord(
                 student_id=student.id,
                 faculty_id=faculty.id if faculty else None,
@@ -410,16 +430,19 @@ def _import_subject_workbook(db: Session, xls, filename: str):
             "total_classes": parsed["total_classes"],
         })
 
-    # Auto-assign batches by splitting the class in half
+    # Auto-assign batches only for students who do not already have a batch number
     all_class_students = db.query(models.Student).filter_by(class_id=cls.id).all()
     import re
     def natural_sort_key(s):
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s.roll_number or "")]
-    all_class_students.sort(key=natural_sort_key)
-    midpoint = (len(all_class_students) + 1) // 2
-    for i, s in enumerate(all_class_students):
-        s.batch_number = 1 if i < midpoint else 2
-    db.commit()
+
+    unassigned = [s for s in all_class_students if s.batch_number is None]
+    if unassigned:
+        unassigned.sort(key=natural_sort_key)
+        midpoint = (len(unassigned) + 1) // 2
+        for i, s in enumerate(unassigned):
+            s.batch_number = 1 if i < midpoint else 2
+        db.commit()
 
     for sid in students_seen:
         for exam in target_exams:
@@ -444,11 +467,14 @@ def _import_subject_workbook(db: Session, xls, filename: str):
             "class": cls.name,
             "subjects_imported": len(imported),
             "rows_imported": total_records,
-            "sheets": sheets_summary}
+            "sheets": sheets_summary,
+            "class_conflicts": class_conflicts}
 
 @app.post("/upload-attendance/")
 async def upload_attendance(
+    request: Request,
     file: UploadFile = File(...),
+    class_id: Optional[int] = Form(None),
     db: Session = Depends(get_db)
 ):
     if not file.filename.endswith(('.xls', '.xlsx')):
@@ -460,6 +486,15 @@ async def upload_attendance(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
 
+    target_class_id = class_id
+    if target_class_id is None:
+        q_id = request.query_params.get("class_id")
+        if q_id:
+            try:
+                target_class_id = int(q_id)
+            except ValueError:
+                pass
+
     # Per-subject workbook (e.g. CI-1 IV.xlsx): one sheet per subject with
     # 'Subject Code' / 'Enrollment No.' headers — parse every subject sheet.
     try:
@@ -468,7 +503,17 @@ async def upload_attendance(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
     if any(p for p in probe):
-        return _import_subject_workbook(db, xls, file.filename)
+        return _import_subject_workbook(db, xls, file.filename, class_id=target_class_id)
+
+    # Flat fallback: requires an explicit class_id
+    if not target_class_id:
+        raise HTTPException(
+            status_code=422,
+            detail="class_id is required for flat attendance file upload"
+        )
+    target_class = db.query(models.Class).filter_by(id=target_class_id).first()
+    if not target_class:
+        raise HTTPException(status_code=404, detail=f"Class with id {target_class_id} not found")
 
     try:
         df = xls.parse(xls.sheet_names[0])
@@ -494,6 +539,8 @@ async def upload_attendance(
                     return int(m.group(0))
             return None
         imported_count = 0
+        class_conflicts = []
+        seen_conflicts = set()
         for _, row in df.iterrows():
             roll_number = str(row.get(c_roll, '')).strip() if c_roll else ''
             if not roll_number or roll_number == 'nan':
@@ -504,16 +551,28 @@ async def upload_attendance(
             batch_number = row_batch(row)
             student  = crud.get_student_by_roll(db, roll_number)
             if not student:
-                c = crud.get_class_by_name(db, "CI-1")
-                if not c:
-                    c = models.Class(name="CI-1", branch="CSE", year=3)
-                    db.add(c); db.commit(); db.refresh(c)
-                student = models.Student(roll_number=roll_number, name=name, class_id=c.id,
-                                         batch_number=batch_number)
-                db.add(student); db.commit(); db.refresh(student)
-            elif batch_number and not student.batch_number:
-                student.batch_number = batch_number
+                student = models.Student(
+                    roll_number=roll_number,
+                    name=name,
+                    class_id=target_class.id,
+                    batch_number=batch_number
+                )
+                db.add(student)
                 db.commit()
+                db.refresh(student)
+            else:
+                if student.class_id != target_class.id and roll_number not in seen_conflicts:
+                    seen_conflicts.add(roll_number)
+                    existing_cls = db.query(models.Class).filter_by(id=student.class_id).first()
+                    class_conflicts.append({
+                        "roll_number": roll_number,
+                        "name": student.name,
+                        "existing_class": existing_cls.name if existing_cls else str(student.class_id),
+                        "imported_class": target_class.name,
+                    })
+                if batch_number and not student.batch_number:
+                    student.batch_number = batch_number
+                    db.commit()
             att = schemas.AttendanceRecordBase(
                 student_id=student.id,
                 classes_conducted=total,
@@ -533,7 +592,12 @@ async def upload_attendance(
             reason=file.filename,
         ))
         db.commit()
-        return {"filename": file.filename, "rows_imported": imported_count}
+        return {
+            "filename": file.filename,
+            "rows_imported": imported_count,
+            "class": target_class.name,
+            "class_conflicts": class_conflicts
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
