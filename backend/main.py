@@ -927,6 +927,15 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
     exam = db.query(models.MstExam).filter_by(id=req.mst_exam_id).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
+
+    # Gate: HTTP 409 if no eligibility records exist for this exam
+    elig_count = db.query(models.MstEligibility).filter_by(mst_exam_id=exam.id).count()
+    if elig_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="No eligibility records found for this exam. Upload attendance and compute eligibility first."
+        )
+
     # clear any previous chart for this exam
     db.query(models.Seat).filter_by(mst_exam_id=exam.id).delete()
     db.commit()
@@ -934,14 +943,29 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
     q = db.query(models.Student).filter_by(active=True)
     if exam.class_id:
         q = q.filter_by(class_id=exam.class_id)
-    students = q.all()
+    all_students = q.all()
+
+    # Filter students by eligibility (status == "Eligible" OR override == True)
+    elig_records = {
+        e.student_id: e
+        for e in db.query(models.MstEligibility).filter_by(mst_exam_id=exam.id).all()
+    }
+    eligible_students = []
+    excluded = []
+    for s in all_students:
+        el = elig_records.get(s.id)
+        if el and (el.status == "Eligible" or el.override is True):
+            eligible_students.append(s)
+        else:
+            excluded.append(s.roll_number)
+
     import re
     def natural_sort_key(s):
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s.roll_number or "")]
 
-    b1 = sorted([s for s in students if s.batch_number == 1], key=natural_sort_key)
-    b2 = sorted([s for s in students if s.batch_number == 2], key=natural_sort_key)
-    others = sorted([s for s in students if s.batch_number not in (1, 2)], key=natural_sort_key)
+    b1 = sorted([s for s in eligible_students if s.batch_number == 1], key=natural_sort_key)
+    b2 = sorted([s for s in eligible_students if s.batch_number == 2], key=natural_sort_key)
+    others = sorted([s for s in eligible_students if s.batch_number not in (1, 2)], key=natural_sort_key)
     pairs = [(l, r) for l, r in _zip_longest(b1, b2)]
     pairs += [(s, None) for s in others]
 
@@ -969,7 +993,12 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
             if s:
                 unseated.append(s.roll_number)
     db.commit()
-    return {"seats_created": created, "students_seated": seated, "unseated": unseated}
+    return {
+        "seats_created": created,
+        "students_seated": seated,
+        "unseated": unseated,
+        "excluded": excluded,
+    }
 
 
 @app.get("/mst/seating/{mst_exam_id}")
@@ -1451,11 +1480,30 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
+    # Gate: HTTP 409 if no eligibility records exist for this exam
+    elig_count = db.query(models.MstEligibility).filter_by(mst_exam_id=mst_exam_id).count()
+    if elig_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="No eligibility records found for this exam. Upload attendance and compute eligibility first."
+        )
+
+    elig_records = {
+        e.student_id: e
+        for e in db.query(models.MstEligibility).filter_by(mst_exam_id=mst_exam_id).all()
+    }
+
     # Fetch students scoped to the exam's class (or all if no class attached)
     q = db.query(models.Student).filter_by(active=True)
     if exam.class_id:
         q = q.filter_by(class_id=exam.class_id)
     students = q.order_by(models.Student.roll_number).all()
+
+    # Filter to eligible students (status == "Eligible" OR override == True)
+    eligible_students = [
+        s for s in students
+        if s.id in elig_records and (elig_records[s.id].status == "Eligible" or elig_records[s.id].override is True)
+    ]
 
     # Fetch existing attempt records
     attempts = {
@@ -1474,7 +1522,7 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
             "class_name": classes_map.get(s.class_id, ""),
             "status": attempts.get(s.id),  # None if not yet marked
         }
-        for s in students
+        for s in eligible_students
     ]
 
 
