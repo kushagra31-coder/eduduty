@@ -1,7 +1,10 @@
 import os
+from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
+
+DB_PATH = Path(__file__).resolve().parent / "eduduty.db"
 
 
 def _resolve_database_url() -> str:
@@ -13,7 +16,6 @@ def _resolve_database_url() -> str:
     """
     env_url = os.getenv("DATABASE_URL")
     if env_url:
-        print(f"database: using DATABASE_URL from environment", flush=True)
         return env_url
 
     pg_url = "postgresql+psycopg://postgres:postgres@localhost:54322/postgres"
@@ -24,18 +26,14 @@ def _resolve_database_url() -> str:
             "dbname=postgres connect_timeout=2"
         )
         conn.close()
-        print("database: using PostgreSQL at localhost:54322", flush=True)
         return pg_url
     except Exception as exc:
-        print(
-            f"database: PostgreSQL not reachable ({exc}); "
-            "using local SQLite file eduduty.db",
-            flush=True,
-        )
-        return "sqlite:///./eduduty.db"
+        print(f"database: PostgreSQL not reachable ({exc})", flush=True)
+        return f"sqlite:///{DB_PATH.as_posix()}"
 
 
 SQLALCHEMY_DATABASE_URL = _resolve_database_url()
+print(f"database: using {SQLALCHEMY_DATABASE_URL}", flush=True)
 
 connect_args = {}
 if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
