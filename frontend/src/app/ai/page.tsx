@@ -1,9 +1,14 @@
+'use client'
+
+import { useState } from 'react'
 import { AIChat } from '@/components/AIChat'
 import { Bot, Cloud, Lock, Cpu } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import AIHealthBanner from '@/components/AIHealthBanner'
 
 export default function AIPage() {
+  const [selectedPrompt, setSelectedPrompt] = useState<string>('')
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="flex justify-between items-start">
@@ -40,7 +45,7 @@ export default function AIPage() {
       {/* Example prompts */}
       <Card className="bg-muted/30 border-dashed">
         <CardContent className="pt-4 pb-3">
-          <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">Example prompts</p>
+          <p className="text-xs font-medium text-muted-foreground mb-2 uppercase tracking-wide">Example prompts (click to send)</p>
           <div className="flex flex-wrap gap-2 text-xs">
             {[
               'How many CI-1 students are eligible for MST-1?',
@@ -50,15 +55,20 @@ export default function AIPage() {
               'Mark roll 1042 as Absent for MST-2',
               'PDF for roll 2301',
             ].map(prompt => (
-              <span key={prompt} className="rounded-md bg-background border px-2 py-1 text-muted-foreground hover:text-foreground hover:border-primary/50 cursor-pointer transition-colors">
+              <button
+                key={prompt}
+                type="button"
+                onClick={() => setSelectedPrompt(prompt)}
+                className="rounded-md bg-background border px-2 py-1 text-muted-foreground hover:text-foreground hover:border-primary/50 cursor-pointer transition-colors text-left"
+              >
                 {prompt}
-              </span>
+              </button>
             ))}
           </div>
         </CardContent>
       </Card>
 
-      <AIChat />
+      <AIChat selectedPrompt={selectedPrompt} onPromptConsumed={() => setSelectedPrompt('')} />
     </div>
   )
 }

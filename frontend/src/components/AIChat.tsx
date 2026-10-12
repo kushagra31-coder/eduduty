@@ -88,7 +88,10 @@ function PDFLinkCard({ link, message }: { link: string; message: string }) {
   )
 }
 
-export function AIChat() {
+export function AIChat({ selectedPrompt, onPromptConsumed }: {
+  selectedPrompt?: string
+  onPromptConsumed?: () => void
+} = {}) {
   const [messages, setMessages]     = useState<ChatMessage[]>([
     {
       id: '0',
@@ -108,8 +111,19 @@ export function AIChat() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const sendMessage = async () => {
-    const text = input.trim()
+  useEffect(() => {
+    if (selectedPrompt) {
+      setInput(selectedPrompt)
+      sendText(selectedPrompt)
+      onPromptConsumed?.()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPrompt])
+
+  const sendMessage = () => sendText(input)
+
+  const sendText = async (rawText: string) => {
+    const text = rawText.trim()
     if (!text || loading) return
 
     const userMsg: ChatMessage = { id: Date.now().toString(), role: 'user', content: text }
