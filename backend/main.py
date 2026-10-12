@@ -618,8 +618,10 @@ def override_eligibility(
     reason: str = Body(...),
     db: Session = Depends(get_db)
 ):
+    if not reason or not reason.strip():
+        raise HTTPException(status_code=400, detail="A non-empty reason is required for eligibility override changes.")
     user_id = 1
-    record = crud.update_eligibility_override(db, eligibility_id, override, reason, user_id)
+    record = crud.update_eligibility_override(db, eligibility_id, override, reason.strip(), user_id)
     if not record:
         raise HTTPException(status_code=404, detail="Eligibility record not found")
     return {"message": "Override applied successfully"}

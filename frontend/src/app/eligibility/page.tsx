@@ -1,4 +1,4 @@
-﻿'use client'
+'use client'
 
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -82,8 +82,10 @@ export default function EligibilityPage() {
     setOverrideModalOpen(true)
   }
 
-  const submitOverride = async () => {
-    if (!selectedRecord || !overrideReason) {
+  const submitOverride = async (explicitOverride: boolean) => {
+    if (!selectedRecord) return
+    const reason = overrideReason.trim()
+    if (!reason) {
       toast({
         title: "Reason required",
         description: "You must provide a reason for the override.",
@@ -97,22 +99,23 @@ export default function EligibilityPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          override: !selectedRecord.override,
-          reason: overrideReason
+          override: explicitOverride,
+          reason
         })
       })
 
       if (res.ok) {
-        toast({ title: "Override updated successfully" })
+        toast({ title: explicitOverride ? "Override saved successfully" : "Override removed successfully" })
         setOverrideModalOpen(false)
         fetchRecords()
       } else {
-        throw new Error("Failed to update override")
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || "Failed to update override")
       }
-    } catch {
+    } catch (err: any) {
       toast({
         title: "Error",
-        description: "Could not update the override status.",
+        description: err.message || "Could not update the override status.",
         variant: "destructive"
       })
     }
@@ -231,9 +234,21 @@ export default function EligibilityPage() {
               </p>
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOverrideModalOpen(false)}>Cancel</Button>
-            <Button onClick={submitOverride}>Save changes</Button>
+          <DialogFooter className="flex flex-row justify-between items-center sm:justify-between w-full">
+            {selectedRecord?.override ? (
+              <Button 
+                variant="destructive" 
+                onClick={() => submitOverride(false)}
+              >
+                Remove override
+              </Button>
+            ) : <div />}
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setOverrideModalOpen(false)}>Cancel</Button>
+              <Button onClick={() => submitOverride(true)}>
+                {selectedRecord?.override ? "Update reason" : "Grant override"}
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>

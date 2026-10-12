@@ -52,22 +52,25 @@ def get_mst_eligibility(db: Session, mst_exam_id: int):
 def update_eligibility_override(db: Session, eligibility_id: int, override: bool, reason: str, user_id: int = None):
     db_record = db.query(models.MstEligibility).filter(models.MstEligibility.id == eligibility_id).first()
     if db_record:
+        old_val = str(db_record.override)
+        new_val = str(override)
+
         db_record.override = override
-        db_record.override_reason = reason
-        db_record.override_by = user_id
-        
-        # Log to audit (simplified)
+        db_record.override_reason = reason if override else None
+        db_record.override_by = user_id if override else None
+
+        # Log to audit with true old and new values
         log = models.AuditLog(
             table_name="mst_eligibility",
             record_id=eligibility_id,
             field_changed="override",
-            old_value=str(not override),
-            new_value=str(override),
+            old_value=old_val,
+            new_value=new_val,
             changed_by=user_id,
             reason=reason
         )
         db.add(log)
-        
+
         db.commit()
         db.refresh(db_record)
     return db_record
