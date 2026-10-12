@@ -99,7 +99,7 @@ def build_student_record_html(roll_number: str, db: Session) -> str:
     for rec in attendance_rows:
         subj = db.query(models.Subject).filter_by(id=rec.subject_id).first()
         subj_name = subj.name if subj else "—"
-        pct = rec.attendance_pct or 0
+        pct = rec.pct
         attendance_html += f"""
         <tr>
           <td>{subj_name}</td>

@@ -52,6 +52,13 @@ class AttendanceRecord(Base):
     source_file = Column(String(255))
     approved = Column(Boolean, default=False, nullable=False)
 
+    @property
+    def pct(self) -> float:
+        if not self.classes_conducted:
+            return 0.0
+        attended = self.classes_attended or 0
+        return round(100.0 * attended / self.classes_conducted, 2)
+
 class SystemRule(Base):
     __tablename__ = "system_rules"
     key = Column(String(50), primary_key=True)
