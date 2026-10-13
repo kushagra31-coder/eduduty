@@ -967,11 +967,35 @@ import datetime as _dt
 _DAY_ALIASES = {"THU": "THUR"}
 
 
-def _seat_student_out(s):
+def is_student_seated_or_markable(elig, seat_min_pct: float = 45.0) -> tuple[bool, str]:
+    if not elig:
+        return False, "No eligibility record found"
+    if elig.override is True:
+        return True, "Eligible by override"
+    if elig.status == "Missing":
+        return False, "Missing attendance data"
+    pct = float(elig.overall_pct) if elig.overall_pct is not None else 0.0
+    if elig.status == "Eligible":
+        return True, "Eligible"
+    if elig.status == "Borderline" or pct >= seat_min_pct:
+        if pct >= seat_min_pct:
+            return True, "Borderline (seated)"
+        return False, f"Attendance {pct:.2f}% below {seat_min_pct:.2f}% threshold"
+    return False, f"Not eligible ({pct:.2f}% < {seat_min_pct:.2f}%)"
+
+
+def _seat_student_out(s, el=None):
     if not s:
         return None
-    return {"id": s.id, "roll_number": s.roll_number, "name": s.name,
-            "batch_number": s.batch_number}
+    return {
+        "id": s.id,
+        "roll_number": s.roll_number,
+        "name": s.name,
+        "batch_number": s.batch_number,
+        "is_borderline": (el.status == "Borderline") if el else False,
+        "eligibility_status": el.status if el else None,
+        "override": el.override if el else False,
+    }
 
 
 @app.get("/mst/exams", response_model=list[schemas.MstExamOut])
@@ -1026,7 +1050,10 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
         q = q.filter_by(class_id=exam.class_id)
     all_students = q.all()
 
-    # Filter students by eligibility (status == "Eligible" OR override == True)
+    # Filter students by eligibility (read seat_min_pct from system_rules, default 45.0)
+    rule = db.query(models.SystemRule).filter_by(key="seat_min_pct").first()
+    seat_min_pct = float(rule.value) if rule and rule.value else 45.0
+
     elig_records = {
         e.student_id: e
         for e in db.query(models.MstEligibility).filter_by(mst_exam_id=exam.id).all()
@@ -1035,10 +1062,11 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
     excluded = []
     for s in all_students:
         el = elig_records.get(s.id)
-        if el and (el.status == "Eligible" or el.override is True):
+        seated, reason = is_student_seated_or_markable(el, seat_min_pct)
+        if seated:
             eligible_students.append(s)
         else:
-            excluded.append(s.roll_number)
+            excluded.append({"roll_number": s.roll_number, "reason": reason})
 
     import re
     def natural_sort_key(s):
@@ -1095,6 +1123,10 @@ def get_seating(mst_exam_id: int, db: Session = Depends(get_db)):
          db.query(models.Student).filter(models.Student.id.in_(want_ids)).all()}
         if want_ids else {}
     )
+    elig_records = {
+        e.student_id: e
+        for e in db.query(models.MstEligibility).filter_by(mst_exam_id=mst_exam_id).all()
+    }
     attempts = {
         a.student_id: a.status
         for a in db.query(models.MstAttempt).filter_by(mst_exam_id=mst_exam_id).all()
@@ -1119,8 +1151,8 @@ def get_seating(mst_exam_id: int, db: Session = Depends(get_db)):
                     "seat_number": s.seat_number,
                     "room_id": s.room_id,
                     "room_number": room.room_number if room else str(room_id),
-                    "left": _seat_student_out(students.get(s.left_student)),
-                    "right": _seat_student_out(students.get(s.right_student)),
+                    "left": _seat_student_out(students.get(s.left_student), elig_records.get(s.left_student)),
+                    "right": _seat_student_out(students.get(s.right_student), elig_records.get(s.right_student)),
                     "left_status": attempts.get(s.left_student),
                     "right_status": attempts.get(s.right_student),
                 }
@@ -1134,6 +1166,15 @@ def get_seating(mst_exam_id: int, db: Session = Depends(get_db)):
 def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)):
     if req.status not in ("Present", "Absent"):
         raise HTTPException(status_code=400, detail="status must be Present or Absent")
+
+    elig = db.query(models.MstEligibility).filter_by(
+        mst_exam_id=req.mst_exam_id, student_id=req.student_id).first()
+    rule = db.query(models.SystemRule).filter_by(key="seat_min_pct").first()
+    seat_min_pct = float(rule.value) if rule and rule.value else 45.0
+    markable, reason = is_student_seated_or_markable(elig, seat_min_pct)
+    if not markable:
+        raise HTTPException(status_code=403, detail=f"Student not eligible for exam: {reason}")
+
     att = db.query(models.MstAttempt).filter_by(
         mst_exam_id=req.mst_exam_id, student_id=req.student_id).first()
     if not att:
@@ -1189,6 +1230,9 @@ def mark_attendance_bulk(req: schemas.MarkAttendanceBulkIn, db: Session = Depend
         .all()
     }
 
+    rule = db.query(models.SystemRule).filter_by(key="seat_min_pct").first()
+    seat_min_pct = float(rule.value) if rule and rule.value else 45.0
+
     # Fetch existing attempt records for these students
     existing_attempts = {
         a.student_id: a
@@ -1205,12 +1249,13 @@ def mark_attendance_bulk(req: schemas.MarkAttendanceBulkIn, db: Session = Depend
     skipped = []
 
     for sid in req.student_ids:
-        # Check eligibility gate: student must be Eligible or have an active override
+        # Check eligibility gate using runtime seat_min_pct
         elig = elig_records.get(sid)
-        if not elig or (elig.status != "Eligible" and not elig.override):
+        markable, reason = is_student_seated_or_markable(elig, seat_min_pct)
+        if not markable:
             skipped.append({
                 "student_id": sid,
-                "reason": f"Not eligible for exam (status: {elig.status if elig else 'None'}, override: {elig.override if elig else False})"
+                "reason": f"Not eligible for exam: {reason}"
             })
             continue
 
@@ -1686,10 +1731,13 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
         q = q.filter_by(class_id=exam.class_id)
     students = q.order_by(models.Student.roll_number).all()
 
-    # Filter to eligible students (status == "Eligible" OR override == True)
+    rule = db.query(models.SystemRule).filter_by(key="seat_min_pct").first()
+    seat_min_pct = float(rule.value) if rule and rule.value else 45.0
+
+    # Filter to eligible/markable students using runtime seat_min_pct
     eligible_students = [
         s for s in students
-        if s.id in elig_records and (elig_records[s.id].status == "Eligible" or elig_records[s.id].override is True)
+        if is_student_seated_or_markable(elig_records.get(s.id), seat_min_pct)[0]
     ]
 
     # Fetch existing attempt records
@@ -1708,6 +1756,9 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
             "batch_number": s.batch_number,
             "class_name": classes_map.get(s.class_id, ""),
             "status": attempts.get(s.id),  # None if not yet marked
+            "is_borderline": (elig_records[s.id].status == "Borderline") if s.id in elig_records else False,
+            "eligibility_status": elig_records[s.id].status if s.id in elig_records else None,
+            "override": elig_records[s.id].override if s.id in elig_records else False,
         }
         for s in eligible_students
     ]

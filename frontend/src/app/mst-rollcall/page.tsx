@@ -19,6 +19,7 @@ type Exam = { id: number; label: string; exam_date: string | null; time_slot: st
 type Student = {
   student_id: number; roll_number: string; name: string
   batch_number: number | null; class_name: string; status: string | null
+  is_borderline?: boolean; eligibility_status?: string | null; override?: boolean
 }
 type Mark = "Present" | "Absent" | null
 
@@ -288,7 +289,14 @@ export default function RollCallPage() {
 
                       {/* Name + roll */}
                       <div className="min-w-0">
-                        <div className="font-medium text-sm truncate">{s.name}</div>
+                        <div className="font-medium text-sm truncate flex items-center gap-2">
+                          <span>{s.name}</span>
+                          {s.is_borderline && (
+                            <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30 text-[10px] px-1.5 py-0 font-normal">
+                              Borderline
+                            </Badge>
+                          )}
+                        </div>
                         <div className="font-mono text-xs text-muted-foreground">{s.roll_number}</div>
                       </div>
 
