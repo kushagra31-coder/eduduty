@@ -81,6 +81,7 @@ function TimetableInputTab() {
   const [grid, setGrid] = useState<Record<CellKey, TimetableEntry[]>>({})
   const [editing, setEditing] = useState<{ day: string; periodIdx: number } | null>(null)
   const [draft, setDraft] = useState<TimetableEntry>({ faculty_id: 0, subject_code: "", room: "", batch: "" })
+  const [draftSpan, setDraftSpan] = useState<number>(1)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -124,6 +125,7 @@ function TimetableInputTab() {
     if (!PERIODS[periodIdx].start) return
     setEditing({ day, periodIdx })
     setDraft({ faculty_id: 0, subject_code: "", room: "", batch: "" })
+    setDraftSpan(1)
   }
 
   function addEntryToCell() {
@@ -133,8 +135,20 @@ function TimetableInputTab() {
     }
     const fac = faculty.find(f => f.id === draft.faculty_id)
     const entry: TimetableEntry = { ...draft, faculty_name: fac?.name }
-    const k = cellKey(editing.day, editing.periodIdx)
-    setGrid(prev => ({ ...prev, [k]: [...(prev[k] ?? []), entry] }))
+    setGrid(prev => {
+      const updated = { ...prev }
+      let added = 0
+      let currIdx = editing.periodIdx
+      while (added < draftSpan && currIdx < PERIODS.length) {
+        if (PERIODS[currIdx].start) {
+          const k = cellKey(editing.day, currIdx)
+          updated[k] = [...(updated[k] ?? []), entry]
+          added++
+        }
+        currIdx++
+      }
+      return updated
+    })
     setEditing(null)
   }
 
@@ -372,6 +386,20 @@ function TimetableInputTab() {
                   onChange={e => setDraft(d => ({ ...d, batch: e.target.value }))}
                 />
               </div>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">Spans N periods</label>
+              <Select value={String(draftSpan)} onValueChange={v => setDraftSpan(Number(v))}>
+                <SelectTrigger id="tt-dialog-span">
+                  <SelectValue placeholder="1 period" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="1">1 period (default)</SelectItem>
+                  <SelectItem value="2">2 periods (Lab: e.g. 11:20–13:00)</SelectItem>
+                  <SelectItem value="3">3 periods</SelectItem>
+                  <SelectItem value="4">4 periods</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           </div>
           <DialogFooter>

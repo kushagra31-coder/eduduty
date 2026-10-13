@@ -90,6 +90,9 @@ def run_unique_constraint_migration(db_engine=None):
             conn.execute(text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_mst_attempt_student_exam ON mst_attempts(student_id, mst_exam_id)"
             ))
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_faculty_abbreviation ON faculty(abbreviation) WHERE abbreviation IS NOT NULL AND abbreviation != ''"
+            ))
         else:
             # Postgres: check if constraint already exists before adding
             conn.execute(text("""
@@ -107,6 +110,13 @@ def run_unique_constraint_migration(db_engine=None):
                     ) THEN
                         ALTER TABLE mst_attempts
                         ADD CONSTRAINT uq_mst_attempt_student_exam UNIQUE (student_id, mst_exam_id);
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'uq_faculty_abbreviation'
+                    ) THEN
+                        ALTER TABLE faculty
+                        ADD CONSTRAINT uq_faculty_abbreviation UNIQUE (abbreviation);
                     END IF;
                 END $$;
             """))

@@ -155,6 +155,16 @@ def main():
         db.commit()
 
         total = 0
+        unmapped_abbreviations = []
+        ABBR_ALIASES = {
+            "NV": "NY",  # CY sem III legend says NV, grid says NY (Prof. Neeraj Yadav)
+        }
+
+        def resolve_abbrs(raw: str) -> list[str]:
+            # Cells can hold two faculty (e.g. VK+SG, SHB+AG): one row per person
+            parts = re.split(r"[+/]", raw)
+            return [ABBR_ALIASES.get(p.strip(), p.strip()) for p in parts if p.strip()]
+
         for cname, c in classes.items():
             cls = cls_map[cname]
             ver = models.TimetableVersion(
@@ -170,21 +180,31 @@ def main():
                     start, end = periods[p]
                     for g in e["groups"]:
                         subj = subj_map[cname][g["subject"]]
-                        for abbr in g["faculty"]:
-                            db.add(models.FacultyTimetable(
-                                faculty_id=fac_map[cname][abbr].id,
-                                day_of_week=e["day"],
-                                period_start=start, period_end=end,
-                                subject_code=subj.code,
-                                subject_name=subj.name,
-                                room=g.get("room") or "",
-                                batch=g.get("batch"),
-                                class_id=cls.id, year=c["year"],
-                                semester=c["semester"],
-                                timetable_version_id=ver.id))
-                            total += 1
+                        for raw_abbr in g["faculty"]:
+                            for abbr in resolve_abbrs(raw_abbr):
+                                fac = fac_map[cname].get(abbr)
+                                if not fac:
+                                    fac = db.query(models.Faculty).filter_by(abbreviation=abbr).first()
+                                if not fac:
+                                    unmapped_abbreviations.append({"class": cname, "abbreviation": abbr})
+                                    print(f"  [UNMAPPED ABBREVIATION] '{abbr}' in {cname}")
+                                    continue
+                                db.add(models.FacultyTimetable(
+                                    faculty_id=fac.id,
+                                    day_of_week=e["day"],
+                                    period_start=start, period_end=end,
+                                    subject_code=subj.code,
+                                    subject_name=subj.name,
+                                    room=g.get("room") or "",
+                                    batch=g.get("batch"),
+                                    class_id=cls.id, year=c["year"],
+                                    semester=c["semester"],
+                                    timetable_version_id=ver.id))
+                                total += 1
             db.commit()
             print(f"  seeded {cname} (version {ver.id})")
+        if unmapped_abbreviations:
+            print(f"  Note: {len(unmapped_abbreviations)} unmapped abbreviations tracked: {unmapped_abbreviations}")
 
         # self-check: no faculty double-booked in the same day/period
         print("checking for double-booked faculty...")

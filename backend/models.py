@@ -29,7 +29,7 @@ class Faculty(Base):
     exempt_from_duty = Column(Boolean, default=False)
     exempt_reason = Column(String(200))
     max_duties_per_day = Column(SmallInteger, default=2)
-    abbreviation = Column(String(10))          # e.g. 'VK', 'MG' — from timetable legend
+    abbreviation = Column(String(10), unique=True)          # e.g. 'VK', 'MG' — from timetable legend
 
 class Subject(Base):
     __tablename__ = "subjects"

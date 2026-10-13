@@ -255,3 +255,127 @@ def test_atomic_put_timetable_endpoint():
         assert res_invalid.status_code == 422
     finally:
         app.dependency_overrides.clear()
+
+
+def test_m6_lab_spanning_blocks_faculty_for_full_interval():
+    """CI-1 sem III Monday lab 11:20-13:00 for AG -> AG is Blocked for a duty at 12:00-12:30."""
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    models.Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(bind=engine)
+    db = TestingSessionLocal()
+
+    cls = models.Class(name="CI-1", branch="CI", year=2)
+    ag = models.Faculty(name="Prof. Ashwinee Gadwal", abbreviation="AG")
+    db.add_all([cls, ag])
+    db.commit()
+
+    ver = models.TimetableVersion(
+        class_id=cls.id, semester="III", session="Jul-Dec 2026", active=True
+    )
+    db.add(ver)
+    db.commit()
+
+    # Lab occupying 11:20-13:00 for AG
+    entry = models.FacultyTimetable(
+        faculty_id=ag.id,
+        day_of_week="MON",
+        period_start="11:20",
+        period_end="13:00",
+        subject_code="CSIT-306",
+        subject_name="Java Programming Lab",
+        class_id=cls.id,
+        year=2,
+        semester="III",
+        timetable_version_id=ver.id,
+    )
+    db.add(entry)
+    db.commit()
+
+    # Check duty availability at 12:00-12:30 on Monday
+    results = crud.check_faculty_availability(db, "MON", "12:00", "12:30")
+    ag_res = next((r for r in results if r.faculty_id == ag.id), None)
+    assert ag_res is not None
+    assert ag_res.status == "Blocked"
+    assert "11:20" in ag_res.reason
+    assert "13:00" in ag_res.reason
+    db.close()
+
+
+def test_m6_double_booked_faculty_detected_by_duty_scheduler():
+    """One faculty teaching in two different classes at the same slot is detected by duty scheduler."""
+    import datetime
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    models.Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(bind=engine)
+    db = TestingSessionLocal()
+
+    cls1 = models.Class(name="CI-1", branch="CI", year=2)
+    cls2 = models.Class(name="CI-2", branch="CI", year=2)
+    fac = models.Faculty(name="Prof. Test Faculty", abbreviation="TF")
+    db.add_all([cls1, cls2, fac])
+    db.commit()
+
+    ver1 = models.TimetableVersion(class_id=cls1.id, semester="III", session="Jul-Dec 2026", active=True)
+    ver2 = models.TimetableVersion(class_id=cls2.id, semester="III", session="Jul-Dec 2026", active=True)
+    db.add_all([ver1, ver2])
+    db.commit()
+
+    # Faculty teaching in class 1 on MON 10:30-11:20
+    e1 = models.FacultyTimetable(
+        faculty_id=fac.id,
+        day_of_week="MON",
+        period_start="10:30",
+        period_end="11:20",
+        subject_code="CS101",
+        class_id=cls1.id,
+        year=2,
+        semester="III",
+        timetable_version_id=ver1.id,
+    )
+    # Faculty also double-booked in class 2 on MON 10:30-11:20
+    e2 = models.FacultyTimetable(
+        faculty_id=fac.id,
+        day_of_week="MON",
+        period_start="10:30",
+        period_end="11:20",
+        subject_code="CS102",
+        class_id=cls2.id,
+        year=2,
+        semester="III",
+        timetable_version_id=ver2.id,
+    )
+    db.add_all([e1, e2])
+    db.commit()
+
+    # MST Exam on Monday (2026-10-19 is a Monday) at 10:30-11:20
+    exam = models.MstExam(
+        label="MST-1",
+        exam_date=datetime.date(2026, 10, 19),
+        time_slot="10:30-11:20",
+        class_id=cls1.id,
+    )
+    room = models.Room(room_number="R101", capacity=30)
+    db.add_all([exam, room])
+    db.commit()
+
+    # A seat in room for this exam
+    seat = models.Seat(mst_exam_id=exam.id, room_id=room.id, seat_number="1")
+    db.add(seat)
+    db.commit()
+
+    # Auto-schedule proposal: fac has timetable clashes and MUST NOT be assigned
+    res = crud.propose_invigilation_duties(db, [exam.id])
+    assert len(res["proposal"]) == 0
+    assert len(res["unfilled"]) == 1
+    unfilled = res["unfilled"][0]
+    assert any("teaching" in b.lower() and fac.name in b for b in unfilled["blockers"])
+    db.close()
+
