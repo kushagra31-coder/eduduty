@@ -100,9 +100,16 @@ except Exception as exc:
 
 app = FastAPI(title="MST Operations Portal API")
 
+import os
+
+cors_origins_raw = os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip() and o.strip() != "*"]
+if not cors_origins:
+    cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
