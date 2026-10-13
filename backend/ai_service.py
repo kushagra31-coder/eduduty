@@ -27,6 +27,7 @@ privacy or air-gapped on-premises deployments, configure local Ollama
 import json
 import os
 import re
+import datetime
 import httpx
 from dotenv import load_dotenv
 
@@ -34,7 +35,12 @@ load_dotenv()
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import sqlglot
+from sqlglot import exp
+
 import models
+import crud
+from database import get_readonly_connection
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 # Cloud-first: the AI works wherever the backend is hosted — no local Ollama needed.
@@ -47,7 +53,7 @@ import models
 #   Optional overrides:
 #       $env:GROQ_MODEL="openai/gpt-oss-20b"   # if Groq deprecates the default
 #       $env:GEMINI_API_KEY="..."              # backup provider from https://aistudio.google.com/
-#       $env:AI_PROVIDERS="groq,ollama"        # change order / drop providers
+#       $env:AI_PROVIDERS="groq,gemini,ollama"        # change order / drop providers
 #   On Render / Railway / VPS: add GROQ_API_KEY as an environment variable.
 
 GROQ_API_KEY  = os.environ.get("GROQ_API_KEY")
@@ -67,6 +73,12 @@ AI_PROVIDERS = [
     for p in os.environ.get("AI_PROVIDERS", "groq,gemini,ollama").split(",")
     if p.strip()
 ]
+
+
+def _is_cloud_allowed() -> bool:
+    """Return True if external cloud LLM providers (Groq, Gemini) are permitted. Default is False."""
+    return os.environ.get("AI_ALLOW_CLOUD", "false").strip().lower() in ("true", "1", "yes")
+
 
 # Only these views are queryable by the AI (read path)
 ALLOWED_READ_VIEWS = {
@@ -200,17 +212,24 @@ async def _ollama_chat(system: str, user: str, temperature: float = 0.1) -> str:
 
 
 async def _llm_chat(system: str, user: str, temperature: float = 0.1) -> str:
-    """Try each configured provider in order; the first success wins."""
+    """Try each configured provider in order; the first success wins. Respects AI_ALLOW_CLOUD."""
+    allow_cloud = _is_cloud_allowed()
     errors = []
     for provider in AI_PROVIDERS:
         try:
             if provider == "groq":
+                if not allow_cloud:
+                    # Cloud provider disabled by AI_ALLOW_CLOUD policy
+                    continue
                 if not GROQ_API_KEY:
                     errors.append("groq: GROQ_API_KEY not set")
                     continue
                 return await _openai_compat_chat(
                     GROQ_BASE_URL, GROQ_API_KEY, GROQ_MODEL, system, user, temperature)
             elif provider == "gemini":
+                if not allow_cloud:
+                    # Cloud provider disabled by AI_ALLOW_CLOUD policy
+                    continue
                 if not GEMINI_API_KEY:
                     errors.append("gemini: GEMINI_API_KEY not set")
                     continue
@@ -224,39 +243,101 @@ async def _llm_chat(system: str, user: str, temperature: float = 0.1) -> str:
             errors.append(f"{provider}: {e}")
     raise RuntimeError(
         "AI is unreachable — " + " | ".join(errors) +
-        ". Get a free Groq key at https://console.groq.com/keys and set GROQ_API_KEY, "
-        "or run Ollama locally."
+        ". Configure Ollama locally or enable AI_ALLOW_CLOUD=true with valid cloud API keys."
     )
+
+
+def _aggregate_for_cloud(rows: list[dict]) -> str:
+    """Strip all PII (names, roll numbers) and aggregate data to summary numbers only."""
+    if not rows:
+        return json.dumps({"count": 0, "summary": "No matching records found."})
+
+    sensitive_keys = {"student_name", "name", "roll_number", "roll"}
+    has_pii = any(sensitive_keys.intersection(k.lower() for k in r.keys()) for r in rows)
+    if has_pii:
+        return json.dumps({
+            "total_records": len(rows),
+            "summary_counts": f"{len(rows)} matching records retrieved.",
+            "privacy_notice": "Individual names and roll numbers were stripped before cloud summarisation."
+        })
+    return json.dumps(rows)
+
 
 # ── SQL validator (read path) ──────────────────────────────────────────────────
 
 def _validate_read_sql(sql: str) -> str:
-    """Raise ValueError if SQL is not a safe SELECT over allowed views."""
-    stripped = sql.strip().rstrip(";").strip()
+    """Raise ValueError if SQL is not a safe SELECT over allowed views using sqlglot AST."""
+    if not sql or not sql.strip():
+        raise ValueError("Empty query.")
 
-    if not stripped.upper().startswith("SELECT"):
+    raw = sql.strip()
+
+    # Reject comments
+    if "/*" in raw or "--" in raw:
+        raise ValueError("Comments are not allowed in queries.")
+
+    # Reject semicolon chaining
+    stripped = raw.rstrip(";").strip()
+    if ";" in stripped:
+        raise ValueError("Multiple statements or semicolon-chaining are forbidden.")
+
+    # Reject PRAGMA or ATTACH
+    upper_raw = raw.upper()
+    if re.search(r"\b(PRAGMA|ATTACH)\b", upper_raw):
+        raise ValueError("PRAGMA and ATTACH commands are forbidden.")
+
+    try:
+        tokens = sqlglot.tokenize(stripped)
+        if any(t.comments for t in tokens):
+            raise ValueError("Comments are not allowed in queries.")
+        statements = sqlglot.parse(stripped)
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise
+        raise ValueError(f"Failed to parse SQL: {e}")
+
+    if len(statements) != 1:
+        raise ValueError("Exactly one SQL statement is allowed.")
+
+    stmt = statements[0]
+    if stmt is None or not isinstance(stmt, exp.Select):
         raise ValueError("Only SELECT statements are allowed.")
 
-    # Block any dangerous keywords
-    dangerous = re.compile(
-        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|GRANT|TRUNCATE|EXEC|EXECUTE)\b",
-        re.IGNORECASE,
+    # Block destructive or administrative operations inside CTEs or subqueries
+    forbidden_types = (
+        exp.Insert, exp.Update, exp.Delete, exp.Drop,
+        exp.Alter, exp.Create, exp.Command, exp.Pragma
     )
-    if dangerous.search(stripped):
-        raise ValueError("Statement contains forbidden keywords.")
+    for forbidden in forbidden_types:
+        if list(stmt.find_all(forbidden)):
+            raise ValueError("Query contains forbidden data manipulation or administrative operations.")
 
-    # Ensure only allowed views are referenced
-    token_pattern = re.compile(r"\b(FROM|JOIN)\s+([a-z_]+)", re.IGNORECASE)
-    for match in token_pattern.finditer(stripped):
-        table = match.group(2).lower()
+    # Collect CTE aliases
+    cte_names = set()
+    if stmt.ctes:
+        for cte in stmt.ctes:
+            if cte.alias_or_name:
+                cte_names.add(cte.alias_or_name.lower())
+
+    # Ensure all tables/views referenced are in ALLOWED_READ_VIEWS
+    tables = [t.name.lower() for t in stmt.find_all(exp.Table) if t.name]
+    for table in tables:
+        if table in cte_names:
+            continue
         if table not in ALLOWED_READ_VIEWS:
-            raise ValueError(f"Access to '{table}' is not permitted. Allowed: {ALLOWED_READ_VIEWS}")
+            raise ValueError(f"Access to '{table}' is not permitted. Allowed: {sorted(ALLOWED_READ_VIEWS)}")
 
     return stripped
 
+
 # ── Write op dispatcher ────────────────────────────────────────────────────────
 
-def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT") -> dict:
+def execute_write_op(
+    op_json: dict,
+    db: Session,
+    ai_user_label: str = "AI_AGENT",
+    confirming_user_id: int | None = None
+) -> dict:
     """
     Execute a validated write operation through the ORM (never raw SQL).
     Returns a dict describing what changed.
@@ -264,9 +345,11 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
     op = op_json.get("operation")
 
     if op == "override_eligibility":
-        roll    = op_json["roll_number"]
-        label   = op_json["mst_label"]
-        reason  = op_json["reason"]
+        roll    = op_json.get("roll_number")
+        label   = op_json.get("mst_label")
+        reason  = (op_json.get("reason") or "").strip()
+        if not reason:
+            raise ValueError("Reason is required for override_eligibility.")
 
         student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{roll}%")).first()
         if not student:
@@ -290,6 +373,7 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
             field_changed="override",
             old_value=str(old_override),
             new_value="True",
+            changed_by=confirming_user_id,
             reason=f"[AI] {reason}",
         )
         db.add(log)
@@ -297,9 +381,9 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         return {"changed": "override_eligibility", "roll_number": roll, "exam": label, "reason": reason}
 
     elif op == "mark_attempt_status":
-        roll   = op_json["roll_number"]
-        label  = op_json["mst_label"]
-        status = op_json["status"]
+        roll   = op_json.get("roll_number")
+        label  = op_json.get("mst_label")
+        status = op_json.get("status")
         allowed_statuses = {"Present", "Absent", "Late", "Excused", "Signature missing"}
         if status not in allowed_statuses:
             raise ValueError(f"Invalid status '{status}'. Must be one of {allowed_statuses}")
@@ -328,16 +412,17 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
             field_changed="status",
             old_value=old_status,
             new_value=status,
-            reason=f"[AI] mark_attempt_status",
+            changed_by=confirming_user_id,
+            reason="[AI] mark_attempt_status",
         )
         db.add(log)
         db.commit()
         return {"changed": "mark_attempt_status", "roll_number": roll, "exam": label, "status": status}
 
     elif op == "assign_duty":
-        faculty_name = op_json["faculty_name"]
-        label        = op_json["mst_label"]
-        room_number  = op_json["room_number"]
+        faculty_name = op_json.get("faculty_name")
+        label        = op_json.get("mst_label")
+        room_number  = op_json.get("room_number")
 
         faculty = db.query(models.Faculty).filter(
             models.Faculty.name.ilike(f"%{faculty_name}%")
@@ -351,24 +436,54 @@ def execute_write_op(op_json: dict, db: Session, ai_user_label: str = "AI_AGENT"
         if not room:
             raise ValueError(f"Room {room_number} not found.")
 
+        # Check clash availability via the exact same clash checker as UI path
+        day = exam.exam_date.strftime("%a").upper() if exam.exam_date else None
+        day_aliases = {
+            "MONDAY": "MON", "TUESDAY": "TUE", "WEDNESDAY": "WED",
+            "THURSDAY": "THUR", "FRIDAY": "FRI", "SATURDAY": "SAT", "THU": "THUR"
+        }
+        if day:
+            day = day_aliases.get(day, day)
+        start, end = "09:00", "12:00"
+        if exam.time_slot and "-" in exam.time_slot:
+            parts = [p.strip() for p in exam.time_slot.split("-", 1)]
+            if len(parts) == 2 and all(parts):
+                start, end = parts
+
+        avail_list = crud.check_faculty_availability(db, day or "MON", start, end)
+        fac_avail = next((a for a in avail_list if a.faculty_id == faculty.id), None)
+        if fac_avail and fac_avail.status in ("Blocked", "Exempt"):
+            raise ValueError(f"Faculty '{faculty.name}' cannot be assigned: {fac_avail.status} ({fac_avail.reason})")
+
+        existing_duty = db.query(models.InvigilationDuty).filter(
+            models.InvigilationDuty.mst_exam_id == exam.id,
+            models.InvigilationDuty.faculty_id == faculty.id,
+            models.InvigilationDuty.room_id != room.id
+        ).first()
+        if existing_duty:
+            raise ValueError(f"Faculty '{faculty.name}' is already assigned to another room for {label}.")
+
         duty = db.query(models.InvigilationDuty).filter_by(
             mst_exam_id=exam.id, room_id=room.id
         ).first()
         if not duty:
-            raise ValueError("No duty slot found for that exam+room combination.")
-        if duty.status == "Assigned":
-            raise ValueError(f"Duty already assigned to another faculty. Use replace workflow.")
+            duty = models.InvigilationDuty(mst_exam_id=exam.id, room_id=room.id, status="Unfilled")
+            db.add(duty)
+        elif duty.status == "Assigned" and duty.faculty_id != faculty.id:
+            raise ValueError("Duty already assigned to another faculty. Use replace workflow.")
 
         duty.faculty_id = faculty.id
         duty.status = "Assigned"
+        duty.assigned_at = datetime.datetime.utcnow()
 
         log = models.AuditLog(
             table_name="invigilation_duties",
-            record_id=duty.id,
+            record_id=duty.id if duty.id else 0,
             field_changed="faculty_id",
             old_value="None",
             new_value=str(faculty.id),
-            reason=f"[AI] assign_duty",
+            changed_by=confirming_user_id,
+            reason="[AI] assign_duty",
         )
         db.add(log)
         db.commit()
@@ -456,8 +571,15 @@ async def handle_ai_message(message: str, db: Session) -> dict:
         sql_raw = await _llm_chat(READ_SYSTEM_PROMPT, message)
         sql     = _validate_read_sql(sql_raw)
 
-        rows = db.execute(text(sql)).fetchall()
-        result_str = str([dict(r._mapping) for r in rows])
+        with get_readonly_connection() as ro_conn:
+            rows = ro_conn.execute(text(sql)).fetchall()
+
+        dict_rows = [dict(r._mapping) for r in rows]
+
+        if _is_cloud_allowed():
+            result_str = _aggregate_for_cloud(dict_rows)
+        else:
+            result_str = str(dict_rows)
 
         # Format result in plain English
         formatted = await _llm_chat(
@@ -469,3 +591,4 @@ async def handle_ai_message(message: str, db: Session) -> dict:
 
     except Exception as e:
         return {"type": "error", "content": f"Query failed: {e}"}
+
