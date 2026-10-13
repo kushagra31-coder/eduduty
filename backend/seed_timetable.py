@@ -215,6 +215,9 @@ def main():
                           f"{b.period_start}-{b.period_end} ({b.subject_code})")
                     clashes += 1
         print(f"done: {total} timetable rows, {clashes} clashes")
+        print("applying D3 duty exemptions...")
+        from seed_duty_exemptions import apply_d3_exemptions
+        apply_d3_exemptions(db)
     finally:
         db.close()
 
