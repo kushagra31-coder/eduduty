@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from typing import Union, List, Optional
 from database import engine, get_db
 import models, schemas, crud
-import ai_service, pdf_service
+import ai_service, pdf_service, auth
 import pandas as pd
 import io
 import re
@@ -115,9 +115,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def on_startup():
+    auth.validate_auth_startup()
+
 @app.get("/")
-def read_root():
+def read_root(user: models.User = Depends(auth.get_current_user)):
     return {"message": "MST Operations Portal Backend"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/auth/login", response_model=auth.TokenResponse)
+def login(req: auth.LoginRequest, db: Session = Depends(get_db)):
+    role = (req.role or "coordinator").lower()
+    user = db.query(models.User).filter_by(email=req.email).first()
+    if not user:
+        user = models.User(name=req.name or req.email.split("@")[0], role=role, email=req.email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    token = auth.create_jwt_token(user.id, user.role, user.email, user.name)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": user.role,
+        "user_id": user.id,
+        "name": user.name,
+    }
+
+@app.get("/auth/me")
+def get_me(user: models.User = Depends(auth.get_current_user)):
+    return {"id": user.id, "name": user.name, "role": user.role, "email": user.email}
+
 
 # ── Attendance upload ──────────────────────────────────────────────────────────
 
@@ -492,6 +523,7 @@ async def upload_attendance(
     request: Request,
     file: UploadFile = File(...),
     class_id: Optional[int] = Form(None),
+    user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty")),
     db: Session = Depends(get_db)
 ):
     if not file.filename.endswith(('.xls', '.xlsx')):
@@ -621,7 +653,11 @@ async def upload_attendance(
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 @app.get("/dashboard/stats")
-def dashboard_stats(mst_exam_id: Optional[int] = None, db: Session = Depends(get_db)):
+def dashboard_stats(
+    mst_exam_id: Optional[int] = None,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     if mst_exam_id:
         exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
     else:
@@ -660,7 +696,7 @@ def dashboard_stats(mst_exam_id: Optional[int] = None, db: Session = Depends(get
             bucket["ineligible"] += 1
 
     n_versions = db.query(models.TimetableVersion).count()
-    tt_entries = db.query(models.FacultyTimetable).all()
+    tt_entries = crud.active_timetable_query(db).all()
     tt_classes = sorted({classes[e.class_id].name
                          for e in tt_entries if e.class_id in classes})
 
@@ -718,7 +754,11 @@ def dashboard_stats(mst_exam_id: Optional[int] = None, db: Session = Depends(get
 # ── Eligibility ────────────────────────────────────────────────────────────────
 
 @app.get("/eligibility/{mst_exam_id}", response_model=list[schemas.MstEligibilityDisplay])
-def get_eligibility(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_eligibility(
+    mst_exam_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     return crud.get_mst_eligibility(db, mst_exam_id)
 
 @app.post("/eligibility/override/{eligibility_id}")
@@ -726,12 +766,12 @@ def override_eligibility(
     eligibility_id: int,
     override: bool = Body(...),
     reason: str = Body(...),
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
     db: Session = Depends(get_db)
 ):
     if not reason or not reason.strip():
         raise HTTPException(status_code=400, detail="A non-empty reason is required for eligibility override changes.")
-    user_id = 1
-    record = crud.update_eligibility_override(db, eligibility_id, override, reason.strip(), user_id)
+    record = crud.update_eligibility_override(db, eligibility_id, override, reason.strip(), user.id)
     if not record:
         raise HTTPException(status_code=404, detail="Eligibility record not found")
     return {"message": "Override applied successfully"}
@@ -745,7 +785,11 @@ class WriteConfirmRequest(BaseModel):
     op_json: dict
 
 @app.post("/ai/query")
-async def ai_query(req: AIMessageRequest, db: Session = Depends(get_db)):
+async def ai_query(
+    req: AIMessageRequest,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Route a natural language message to read / write-proposal / pdf path.
     Returns { type, content }
@@ -757,22 +801,31 @@ async def ai_query(req: AIMessageRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ai/confirm-write")
-def ai_confirm_write(req: WriteConfirmRequest, db: Session = Depends(get_db)):
+def ai_confirm_write(
+    req: WriteConfirmRequest,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     """
     Execute an AI-proposed write ONLY after the user has explicitly confirmed in the UI.
     """
     try:
-        result = ai_service.execute_write_op(req.op_json, db)
+        result = ai_service.execute_write_op(req.op_json, db, confirming_user_id=user.id)
         return {"success": True, "changed": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ── PDF generation ─────────────────────────────────────────────────────────────
 
 @app.get("/pdf/student/{roll_number}")
-def get_student_pdf(roll_number: str, db: Session = Depends(get_db)):
+def get_student_pdf(
+    roll_number: str,
+    user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty")),
+    db: Session = Depends(get_db)
+):
     """Generate and stream a formal student record PDF."""
     try:
         html      = pdf_service.build_student_record_html(roll_number, db)
@@ -788,7 +841,12 @@ def get_student_pdf(roll_number: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=str(e))
 
 @app.get("/pdf/seating/{mst_exam_id}/{room_id}")
-def get_seating_pdf(mst_exam_id: int, room_id: int, db: Session = Depends(get_db)):
+def get_seating_pdf(
+    mst_exam_id: int,
+    room_id: int,
+    user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty", "invigilator")),
+    db: Session = Depends(get_db)
+):
     """Generate and stream a seating chart + signature sheet PDF."""
     try:
         html      = pdf_service.build_seating_chart_html(mst_exam_id, room_id, db)
@@ -807,7 +865,11 @@ def get_seating_pdf(mst_exam_id: int, room_id: int, db: Session = Depends(get_db
         raise HTTPException(status_code=503, detail=str(e))
 
 @app.get("/pdf/student/{roll_number}/html")
-def get_student_html(roll_number: str, db: Session = Depends(get_db)):
+def get_student_html(
+    roll_number: str,
+    user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty")),
+    db: Session = Depends(get_db)
+):
     """Debug: returns raw HTML preview without WeasyPrint installed."""
     try:
         html = pdf_service.build_student_record_html(roll_number, db)
@@ -860,11 +922,17 @@ app.include_router(timetable_router)
 # ── Classes / Faculty helpers (used by timetable frontend) ─────────────────────
 
 @app.get("/classes", response_model=list[schemas.ClassOut])
-def list_classes(db: Session = Depends(get_db)):
+def list_classes(
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     return crud.get_classes(db)
 
 @app.get("/faculty")
-def list_faculty(db: Session = Depends(get_db)):
+def list_faculty(
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     rows = db.query(models.Faculty).all()
     return [
         {
@@ -899,7 +967,11 @@ class FacultyUpdate(BaseModel):
 
 
 @app.post("/faculty")
-def create_faculty(req: FacultyCreate, db: Session = Depends(get_db)):
+def create_faculty(
+    req: FacultyCreate,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     f = models.Faculty(
         name=req.name,
         abbreviation=req.abbreviation,
@@ -917,7 +989,12 @@ def create_faculty(req: FacultyCreate, db: Session = Depends(get_db)):
 
 
 @app.patch("/faculty/{faculty_id}")
-def update_faculty(faculty_id: int, req: FacultyUpdate, db: Session = Depends(get_db)):
+def update_faculty(
+    faculty_id: int,
+    req: FacultyUpdate,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     f = db.query(models.Faculty).filter_by(id=faculty_id).first()
     if not f:
         raise HTTPException(status_code=404, detail="Faculty not found")
@@ -948,12 +1025,17 @@ class ClassCreate(BaseModel):
 
 
 @app.post("/classes", response_model=schemas.ClassOut)
-def create_class(req: ClassCreate, db: Session = Depends(get_db)):
+def create_class(
+    req: ClassCreate,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     c = models.Class(name=req.name, branch=req.branch, year=req.year, section=req.section)
     db.add(c)
     db.commit()
     db.refresh(c)
     return c
+
 
 
 # Seating rule: Batch 1 roll n sits beside Batch 2 roll n (sorted by roll
@@ -999,12 +1081,19 @@ def _seat_student_out(s, el=None):
 
 
 @app.get("/mst/exams", response_model=list[schemas.MstExamOut])
-def list_mst_exams(db: Session = Depends(get_db)):
+def list_mst_exams(
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     return db.query(models.MstExam).order_by(models.MstExam.id.desc()).all()
 
 
 @app.post("/mst/exams", response_model=schemas.MstExamOut)
-def create_mst_exam(req: schemas.MstExamCreate, db: Session = Depends(get_db)):
+def create_mst_exam(
+    req: schemas.MstExamCreate,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     exam = models.MstExam(label=req.label, exam_date=req.exam_date,
                           time_slot=req.time_slot, class_id=req.class_id)
     db.add(exam)
@@ -1014,12 +1103,19 @@ def create_mst_exam(req: schemas.MstExamCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/rooms", response_model=list[schemas.RoomOut])
-def list_rooms(db: Session = Depends(get_db)):
+def list_rooms(
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     return db.query(models.Room).order_by(models.Room.room_number).all()
 
 
 @app.post("/rooms", response_model=schemas.RoomOut)
-def create_room(req: schemas.RoomCreate, db: Session = Depends(get_db)):
+def create_room(
+    req: schemas.RoomCreate,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     room = models.Room(room_number=req.room_number, capacity=req.capacity)
     db.add(room)
     db.commit()
@@ -1028,8 +1124,13 @@ def create_room(req: schemas.RoomCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/mst/seating/generate")
-def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_db)):
+def generate_seating(
+    req: schemas.SeatingGenerateIn,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     exam = db.query(models.MstExam).filter_by(id=req.mst_exam_id).first()
+
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
@@ -1111,7 +1212,11 @@ def generate_seating(req: schemas.SeatingGenerateIn, db: Session = Depends(get_d
 
 
 @app.get("/mst/seating/{mst_exam_id}")
-def get_seating(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_seating(
+    mst_exam_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     seats = db.query(models.Seat).filter_by(mst_exam_id=mst_exam_id).all()
     if not seats:
         return []
@@ -1163,9 +1268,32 @@ def get_seating(mst_exam_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/mst/attendance/mark", response_model=schemas.AttendanceMarkOut)
-def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)):
+def mark_attendance(
+    req: schemas.MarkAttendanceIn,
+    user: models.User = Depends(auth.require_role("invigilator", "coordinator", "hod")),
+    db: Session = Depends(get_db)
+):
     if req.status not in ("Present", "Absent"):
         raise HTTPException(status_code=400, detail="status must be Present or Absent")
+
+    if user.role == "invigilator":
+        fac = db.query(models.Faculty).filter(
+            or_(models.Faculty.email == user.email, models.Faculty.name == user.name)
+        ).first()
+        if not fac:
+            raise HTTPException(status_code=403, detail="Invigilator not mapped to faculty record")
+        fac_duties = db.query(models.InvigilationDuty).filter_by(
+            mst_exam_id=req.mst_exam_id, faculty_id=fac.id
+        ).all()
+        if not fac_duties:
+            raise HTTPException(status_code=403, detail="Invigilator not assigned to this exam")
+        assigned_room_ids = {d.room_id for d in fac_duties}
+        seat = db.query(models.MstSeat).filter(
+            models.MstSeat.mst_exam_id == req.mst_exam_id,
+            or_(models.MstSeat.left_student == req.student_id, models.MstSeat.right_student == req.student_id)
+        ).first()
+        if seat and seat.room_id not in assigned_room_ids:
+            raise HTTPException(status_code=403, detail="Invigilator not assigned to the room where student is seated")
 
     elig = db.query(models.MstEligibility).filter_by(
         mst_exam_id=req.mst_exam_id, student_id=req.student_id).first()
@@ -1180,11 +1308,12 @@ def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)
     if not att:
         att = models.MstAttempt(
             mst_exam_id=req.mst_exam_id, student_id=req.student_id,
-            status=req.status,
+            status=req.status, marked_by=user.id,
         )
         db.add(att)
     else:
         att.status = req.status
+        att.marked_by = user.id
     att.marked_at = _dt.datetime.utcnow()
     db.commit()
     db.refresh(att)
@@ -1194,13 +1323,40 @@ def mark_attendance(req: schemas.MarkAttendanceIn, db: Session = Depends(get_db)
 
 
 @app.post("/mst/attendance/mark-bulk", response_model=schemas.AttendanceMarkBulkOut)
-def mark_attendance_bulk(req: schemas.MarkAttendanceBulkIn, db: Session = Depends(get_db)):
+def mark_attendance_bulk(
+    req: schemas.MarkAttendanceBulkIn,
+    user: models.User = Depends(auth.require_role("invigilator", "coordinator", "hod")),
+    db: Session = Depends(get_db)
+):
     if req.status not in ("Present", "Absent"):
         raise HTTPException(status_code=400, detail="status must be Present or Absent")
 
     exam = db.query(models.MstExam).filter_by(id=req.mst_exam_id).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
+
+    if user.role == "invigilator":
+        fac = db.query(models.Faculty).filter(
+            or_(models.Faculty.email == user.email, models.Faculty.name == user.name)
+        ).first()
+        if not fac:
+            raise HTTPException(status_code=403, detail="Invigilator not mapped to faculty record")
+        fac_duties = db.query(models.InvigilationDuty).filter_by(
+            mst_exam_id=req.mst_exam_id, faculty_id=fac.id
+        ).all()
+        if not fac_duties:
+            raise HTTPException(status_code=403, detail="Invigilator not assigned to this exam")
+        assigned_room_ids = {d.room_id for d in fac_duties}
+        seats = db.query(models.MstSeat).filter(
+            models.MstSeat.mst_exam_id == req.mst_exam_id,
+            or_(
+                models.MstSeat.left_student.in_(req.student_ids),
+                models.MstSeat.right_student.in_(req.student_ids)
+            )
+        ).all()
+        for s in seats:
+            if s.room_id not in assigned_room_ids:
+                raise HTTPException(status_code=403, detail="Contains students seated in rooms not assigned to this invigilator")
 
     # Item 6 Eligibility Gate: HTTP 409 if no eligibility records exist for this exam
     elig_count = db.query(models.MstEligibility).filter_by(mst_exam_id=req.mst_exam_id).count()
@@ -1266,12 +1422,14 @@ def mark_attendance_bulk(req: schemas.MarkAttendanceBulkIn, db: Session = Depend
                 mst_exam_id=req.mst_exam_id,
                 student_id=sid,
                 status=req.status,
+                marked_by=user.id,
                 marked_at=now,
             )
             db.add(att)
             db.flush()  # populate att.id
         else:
             att.status = req.status
+            att.marked_by = user.id
             att.marked_at = now
 
         # One audit entry per student
@@ -1282,7 +1440,7 @@ def mark_attendance_bulk(req: schemas.MarkAttendanceBulkIn, db: Session = Depend
             old_value=old_status,
             new_value=req.status,
             reason=f"bulk attendance mark ({req.status}) for exam {req.mst_exam_id}",
-            changed_by="USER",
+            changed_by=user.id,
         ))
 
         marked_student_ids.append(sid)
@@ -1304,10 +1462,15 @@ def mark_attendance_bulk(req: schemas.MarkAttendanceBulkIn, db: Session = Depend
 
 
 @app.get("/mst/attendance/{mst_exam_id}")
-def get_attendance(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_attendance(
+    mst_exam_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     rows = db.query(models.MstAttempt).filter_by(mst_exam_id=mst_exam_id).all()
     return [{"student_id": a.student_id, "status": a.status, "marked_at": a.marked_at}
             for a in rows]
+
 
 
 # ── VT / follow-up ────────────────────────────────────────────────────────────
@@ -1337,6 +1500,7 @@ def list_follow_up(
     final_status: str = None,
     overridden: bool = None,
     search: str = None,
+    user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
     q = (
@@ -1363,7 +1527,11 @@ def list_follow_up(
 
 
 @app.get("/follow-up/stats")
-def follow_up_stats(class_id: int = None, db: Session = Depends(get_db)):
+def follow_up_stats(
+    class_id: int = None,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     from sqlalchemy import func
     q = db.query(
         models.FollowUpStatus.final_status,
@@ -1405,7 +1573,11 @@ class FollowUpRecalcIn(BaseModel):
     class_id: int = None
 
 @app.post("/follow-up/recalculate")
-def recalculate_follow_ups(req: FollowUpRecalcIn, db: Session = Depends(get_db)):
+def recalculate_follow_ups(
+    req: FollowUpRecalcIn,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     result = crud.recalculate_all_follow_ups(db, class_id=req.class_id)
     _ensure_ai_views()  # keep the AI view in sync
     return result
@@ -1417,11 +1589,15 @@ class FollowUpOverrideIn(BaseModel):
     changed_by: int = None
 
 @app.post("/follow-up/{follow_up_id}/override")
-def override_follow_up(follow_up_id: int, req: FollowUpOverrideIn,
-                       db: Session = Depends(get_db)):
+def override_follow_up(
+    follow_up_id: int,
+    req: FollowUpOverrideIn,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     try:
         row = crud.override_follow_up(
-            db, follow_up_id, req.final_status, req.reason, req.changed_by)
+            db, follow_up_id, req.final_status, req.reason, user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     student = db.query(models.Student).filter_by(id=row.student_id).first()
@@ -1435,11 +1611,15 @@ class FollowUpRestoreIn(BaseModel):
     changed_by: int = None
 
 @app.post("/follow-up/{follow_up_id}/restore")
-def restore_follow_up(follow_up_id: int, req: FollowUpRestoreIn,
-                      db: Session = Depends(get_db)):
+def restore_follow_up(
+    follow_up_id: int,
+    req: FollowUpRestoreIn,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     try:
         row = crud.restore_calculated_follow_up(
-            db, follow_up_id, req.reason, req.changed_by)
+            db, follow_up_id, req.reason, user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     student = db.query(models.Student).filter_by(id=row.student_id).first()
@@ -1461,7 +1641,11 @@ def _compulsory_follow_up_rows(db: Session, class_id: int = None):
 
 
 @app.get("/follow-up/export")
-def export_follow_up_excel(class_id: int = None, db: Session = Depends(get_db)):
+def export_follow_up_excel(
+    class_id: int = None,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     rows = _compulsory_follow_up_rows(db, class_id)
     data = [{
         "Roll Number": s.roll_number,
@@ -1489,7 +1673,11 @@ def export_follow_up_excel(class_id: int = None, db: Session = Depends(get_db)):
 
 
 @app.get("/follow-up/export-pdf")
-def export_follow_up_pdf(class_id: int = None, db: Session = Depends(get_db)):
+def export_follow_up_pdf(
+    class_id: int = None,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     rows = _compulsory_follow_up_rows(db, class_id)
     html = pdf_service.build_follow_up_list_html(rows)
     pdf_bytes = pdf_service.render_pdf(html)
@@ -1501,7 +1689,11 @@ def export_follow_up_pdf(class_id: int = None, db: Session = Depends(get_db)):
 
 
 @app.get("/mst/duties/{mst_exam_id}", response_model=list[schemas.DutyOut])
-def list_duties(mst_exam_id: int, db: Session = Depends(get_db)):
+def list_duties(
+    mst_exam_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     duties = db.query(models.InvigilationDuty).filter_by(mst_exam_id=mst_exam_id).all()
     rooms = {r.id: r.room_number for r in db.query(models.Room).all()}
     fac = {f.id: f.name for f in db.query(models.Faculty).all()}
@@ -1516,27 +1708,56 @@ def list_duties(mst_exam_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/mst/duties/assign")
-def assign_duty(req: schemas.DutyAssignIn, db: Session = Depends(get_db)):
+def assign_duty(
+    req: schemas.DutyAssignIn,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     d = db.query(models.InvigilationDuty).filter_by(
         mst_exam_id=req.mst_exam_id, room_id=req.room_id).first()
+    old_faculty = d.faculty_id if d else None
     if not d:
         d = models.InvigilationDuty(mst_exam_id=req.mst_exam_id, room_id=req.room_id,
                                     status="Unfilled")
         db.add(d)
+        db.flush()
     d.faculty_id = req.faculty_id
     d.status = "Assigned"
     d.assigned_at = _dt.datetime.utcnow()
+    db.add(models.AuditLog(
+        table_name="invigilation_duties",
+        record_id=d.id,
+        field_changed="faculty_id",
+        old_value=str(old_faculty) if old_faculty else None,
+        new_value=str(req.faculty_id),
+        reason="manual duty assignment",
+        changed_by=user.id,
+    ))
     db.commit()
     return {"ok": True}
 
 
 @app.post("/mst/duties/unassign/{duty_id}")
-def unassign_duty(duty_id: int, db: Session = Depends(get_db)):
+def unassign_duty(
+    duty_id: int,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     d = db.query(models.InvigilationDuty).filter_by(id=duty_id).first()
     if not d:
         raise HTTPException(status_code=404, detail="Duty not found")
+    old_faculty = d.faculty_id
     d.faculty_id = None
     d.status = "Unfilled"
+    db.add(models.AuditLog(
+        table_name="invigilation_duties",
+        record_id=d.id,
+        field_changed="faculty_id",
+        old_value=str(old_faculty) if old_faculty else None,
+        new_value="None",
+        reason="manual duty unassignment",
+        changed_by=user.id,
+    ))
     db.commit()
     return {"ok": True}
 
@@ -1545,7 +1766,11 @@ class AutoScheduleIn(BaseModel):
     mst_exam_ids: list[int]
 
 @app.post("/mst/duties/auto-schedule")
-def auto_schedule_duties(req: AutoScheduleIn, db: Session = Depends(get_db)):
+def auto_schedule_duties(
+    req: AutoScheduleIn,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     """Propose invigilation duties. Nothing is saved — review first, then apply."""
     if not req.mst_exam_ids:
         raise HTTPException(status_code=400, detail="Pick at least one exam")
@@ -1557,16 +1782,24 @@ class ApplyProposalIn(BaseModel):
     changed_by: int = None
 
 @app.post("/mst/duties/auto-schedule/apply")
-def apply_scheduled_duties(req: ApplyProposalIn, db: Session = Depends(get_db)):
+def apply_scheduled_duties(
+    req: ApplyProposalIn,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
     """Save a reviewed proposal. Every assignment is audit-logged."""
     for a in req.assignments:
         if not all(k in a for k in ("mst_exam_id", "room_id", "faculty_id")):
             raise HTTPException(status_code=400, detail=f"Bad assignment: {a}")
-    return crud.apply_duty_proposal(db, req.assignments, req.changed_by)
+    return crud.apply_duty_proposal(db, req.assignments, user.id)
 
 
 @app.get("/mst/faculty-status", response_model=list[schemas.FacultyExamStatusOut])
-def faculty_status_for_exam(mst_exam_id: int, db: Session = Depends(get_db)):
+def faculty_status_for_exam(
+    mst_exam_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Who can invigilate this exam: faculty with a class overlapping the exam
     slot are 'Teaching', already-assigned invigilators are 'On duty',
@@ -1629,7 +1862,10 @@ def faculty_status_for_exam(mst_exam_id: int, db: Session = Depends(get_db)):
 # ── Faculty × MST timetable grid ─────────────────────────────────────────────
 
 @app.get("/mst/faculty-grid")
-def faculty_exam_grid(db: Session = Depends(get_db)):
+def faculty_exam_grid(
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Returns every exam slot × every faculty member so the frontend can render
     a full free/busy timetable grid without multiple round-trips.
@@ -1702,7 +1938,11 @@ def faculty_exam_grid(db: Session = Depends(get_db)):
 # ── MST Roll-call attendance (no seating plan required) ──────────────────────
 
 @app.get("/mst/attendance/rollcall/{mst_exam_id}")
-def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
+def get_rollcall(
+    mst_exam_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Returns all eligible/seatable students for an exam with their current
     attendance status so the teacher can do a fast roll-call.
@@ -1767,7 +2007,7 @@ def get_rollcall(mst_exam_id: int, db: Session = Depends(get_db)):
 # ── AI health (provider status for the UI banner) ──────────────────────────────
 
 @app.get("/ai/health")
-async def ai_health():
+async def ai_health(user: models.User = Depends(auth.get_current_user)):
     """Returns which AI providers are configured so the UI can show a status."""
     import os
     providers = []
@@ -1799,6 +2039,7 @@ async def ai_health():
 def get_class_timetable_endpoint(
     class_id: int,
     semester: Optional[str] = None,
+    user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
     return crud.get_timetable_for_class(db, class_id=class_id, semester=semester)
@@ -1809,6 +2050,7 @@ def save_timetable_for_class(
     class_id: int,
     semester: str,
     payload: Union[schemas.TimetableSaveRequest, List[schemas.TimetableEntryCreate]],
+    user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty")),
     db: Session = Depends(get_db),
 ):
     cls = db.query(models.Class).filter_by(id=class_id).first()
@@ -1823,6 +2065,17 @@ def save_timetable_for_class(
         entries_data = payload.entries
     else:
         entries_data = payload
+
+    # If role is faculty, ensure faculty only saves their own timetable entries
+    if user.role == "faculty":
+        fac = db.query(models.Faculty).filter(
+            or_(models.Faculty.email == user.email, models.Faculty.name == user.name)
+        ).first()
+        for e in entries_data:
+            ed = e.dict() if hasattr(e, "dict") else dict(e)
+            fid = ed.get("faculty_id")
+            if fid and fac and fid != fac.id:
+                raise HTTPException(status_code=403, detail="Faculty can only save their own timetable entries")
 
     try:
         # Atomic transaction:
