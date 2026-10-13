@@ -465,6 +465,7 @@ function FreeBusyGridTab() {
 
   return (
     <div className="space-y-4">
+      {/* Legend + filters */}
       <div className="flex flex-wrap items-center gap-3">
         {(["all", "free", "teaching", "on_duty", "exempt"] as const).map(s => {
           const cfg = s === "all" ? null : STATUS_CONFIG[s]
