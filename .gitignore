@@ -2,3 +2,8 @@ __pycache__/
 .env
 *.env
 venv/
+
+# Local environment and database files
+backend/.env
+backend/eduduty.db
+backend/eduduty_demo.db

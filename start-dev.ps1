@@ -38,13 +38,73 @@ Write-Host "==========================================================" -Foregro
 Write-Host "                EduDuty Development Suite                 " -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
+# ── Function: Test-IsEduDutyProcess ───────────────────────────────────────────
+function Test-IsEduDutyProcess([int]$ProcessId, [int]$Port) {
+    if ($ProcessId -le 0) { return $false }
+    try {
+        $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
+        if (-not $procInfo) {
+            $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if (-not $p) { return $false }
+            if ($Port -eq 8000 -and $p.ProcessName -like "*python*") { return $true }
+            if ($Port -eq 3000 -and $p.ProcessName -like "*node*") { return $true }
+            return $false
+        }
+
+        $cmdLine = if ($procInfo.CommandLine) { $procInfo.CommandLine.ToLower() } else { "" }
+        $procName = if ($procInfo.Name) { $procInfo.Name.ToLower() } else { "" }
+
+        # Port 8000: FastAPI / Uvicorn Backend
+        if ($Port -eq 8000) {
+            if ($cmdLine -match "uvicorn" -or $cmdLine -match "main:app" -or $cmdLine -match "eduduty") {
+                return $true
+            }
+            if ($procName -like "*python*") {
+                if ($cmdLine -match "main\.py" -or $cmdLine -match "backend") {
+                    return $true
+                }
+            }
+            if ($procInfo.ParentProcessId -gt 0) {
+                $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($procInfo.ParentProcessId)" -ErrorAction SilentlyContinue
+                if ($parent -and $parent.CommandLine -and $parent.CommandLine -match "eduduty") {
+                    return $true
+                }
+            }
+            return $false
+        }
+
+        # Port 3000: Next.js Frontend
+        if ($Port -eq 3000) {
+            if ($cmdLine -match "next" -or $cmdLine -match "eduduty" -or $cmdLine -match "frontend") {
+                return $true
+            }
+            if ($procName -like "*node*") {
+                if ($cmdLine -match "next-server" -or $cmdLine -match "next dev" -or $cmdLine -match "3000") {
+                    return $true
+                }
+            }
+            if ($procInfo.ParentProcessId -gt 0) {
+                $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($procInfo.ParentProcessId)" -ErrorAction SilentlyContinue
+                if ($parent -and $parent.CommandLine -and $parent.CommandLine -match "eduduty") {
+                    return $true
+                }
+            }
+            return $false
+        }
+
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 # ── Function: Find-ListeningProcess ───────────────────────────────────────────
 function Find-ListeningProcess([int]$Port) {
+    $procs = @()
     try {
         $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
         if ($connections) {
             $pids = $connections | Select-Object -ExpandProperty OwningProcess -Unique
-            $procs = @()
             foreach ($p in $pids) {
                 if ($p -gt 0) {
                     $procObj = Get-Process -Id $p -ErrorAction SilentlyContinue
@@ -61,10 +121,9 @@ function Find-ListeningProcess([int]$Port) {
         # Fallback to netstat if Get-NetTCPConnection fails
         $lines = netstat -ano | Select-String ":$Port\s+.*LISTENING\s+(\d+)"
         if ($lines) {
-            $procs = @()
             foreach ($line in $lines) {
-                if ($line.Matches.Groups.Count -gt 1) {
-                    $p = [int]$line.Matches.Groups[1].Value
+                if ($line.Matches -and $line.Matches[0].Groups.Count -gt 1) {
+                    $p = [int]$line.Matches[0].Groups[1].Value
                     if ($p -gt 0) {
                         $procObj = Get-Process -Id $p -ErrorAction SilentlyContinue
                         $procs += [PSCustomObject]@{
@@ -78,38 +137,101 @@ function Find-ListeningProcess([int]$Port) {
             return $procs
         }
     }
-    return @()
+    return $procs
 }
 
 # ── Stop Routine ─────────────────────────────────────────────────────────────
 if ($Stop) {
     Write-Host "[STOP] Checking for running EduDuty processes..." -ForegroundColor Yellow
-    $bProcs = Find-ListeningProcess -Port 8000
-    $fProcs = Find-ListeningProcess -Port 3000
-    $all = $bProcs + $fProcs
+    $bProcs = @(Find-ListeningProcess -Port 8000)
+    $fProcs = @(Find-ListeningProcess -Port 3000)
+    $all = @($bProcs) + @($fProcs)
 
-    if ($all.Count -eq 0) {
+    # Check for recorded dev session launcher PIDs
+    $sessionFile = Join-Path ([System.IO.Path]::GetTempPath()) "eduduty-dev-session.json"
+    $sessionPids = @()
+    if (Test-Path $sessionFile) {
+        try {
+            $sessJson = Get-Content $sessionFile -Raw | ConvertFrom-Json
+            if ($sessJson.BackendCmdPID) { $sessionPids += [int]$sessJson.BackendCmdPID }
+            if ($sessJson.FrontendCmdPID) { $sessionPids += [int]$sessJson.FrontendCmdPID }
+        } catch {}
+    }
+
+    if ($all.Count -eq 0 -and $sessionPids.Count -eq 0) {
         Write-Host "[OK] No processes found listening on port 8000 or 3000." -ForegroundColor Green
+        if (Test-Path $sessionFile) { Remove-Item $sessionFile -Force -ErrorAction SilentlyContinue }
         exit 0
     }
 
     foreach ($item in $all) {
+        # Verify process is EduDuty-owned before killing
+        $isEduDuty = Test-IsEduDutyProcess -ProcessId $item.PID -Port $item.Port
+        if (-not $isEduDuty -and ($sessionPids -notcontains $item.PID)) {
+            Write-Warning "Process $($item.Name) (PID $($item.PID)) on port $($item.Port) does not match EduDuty signatures. Skipping."
+            continue
+        }
+
         Write-Host "Stopping Process $($item.Name) (PID $($item.PID)) on port $($item.Port)..." -ForegroundColor Yellow
         try {
+            $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $($item.PID)" -ErrorAction SilentlyContinue
+            $parentPid = if ($procInfo) { [int]$procInfo.ParentProcessId } else { 0 }
+
             Stop-Process -Id $item.PID -Force -ErrorAction SilentlyContinue
             Write-Host "  -> Terminated PID $($item.PID)" -ForegroundColor Green
+
+            # Terminate parent terminal window if it was spawned for EduDuty
+            if ($parentPid -gt 0 -and ($sessionPids -contains $parentPid)) {
+                Stop-Process -Id $parentPid -Force -ErrorAction SilentlyContinue
+                Write-Host "  -> Terminated console wrapper PID $parentPid" -ForegroundColor Green
+            } elseif ($parentPid -gt 0) {
+                $parentProc = Get-CimInstance Win32_Process -Filter "ProcessId = $parentPid" -ErrorAction SilentlyContinue
+                if ($parentProc -and $parentProc.CommandLine -and $parentProc.CommandLine -match "EduDuty") {
+                    Stop-Process -Id $parentPid -Force -ErrorAction SilentlyContinue
+                    Write-Host "  -> Terminated console wrapper PID $parentPid" -ForegroundColor Green
+                }
+            }
         } catch {
             Write-Warning "  -> Could not terminate PID $($item.PID): $_"
         }
     }
+
+    # Clean up recorded session launcher processes if still active
+    foreach ($sPid in $sessionPids) {
+        $p = Get-Process -Id $sPid -ErrorAction SilentlyContinue
+        if ($p) {
+            try {
+                Stop-Process -Id $sPid -Force -ErrorAction SilentlyContinue
+                Write-Host "  -> Terminated launcher PID $sPid" -ForegroundColor Green
+            } catch {}
+        }
+    }
+
+    if (Test-Path $sessionFile) {
+        Remove-Item $sessionFile -Force -ErrorAction SilentlyContinue
+    }
+
     Start-Sleep -Seconds 1
-    Write-Host "[OK] EduDuty services stopped." -ForegroundColor Green
+
+    # Verify both ports are released
+    $rem8000 = @(Find-ListeningProcess -Port 8000)
+    $rem3000 = @(Find-ListeningProcess -Port 3000)
+    if ($rem8000.Count -eq 0 -and $rem3000.Count -eq 0) {
+        Write-Host "[OK] EduDuty services stopped. Ports 8000 and 3000 are free." -ForegroundColor Green
+    } else {
+        if ($rem8000.Count -gt 0) {
+            Write-Warning "Port 8000 is still in use by PID $($rem8000[0].PID) ($($rem8000[0].Name))."
+        }
+        if ($rem3000.Count -gt 0) {
+            Write-Warning "Port 3000 is still in use by PID $($rem3000[0].PID) ($($rem3000[0].Name))."
+        }
+    }
     exit 0
 }
 
 # ── 1. Check for Port Conflicts ──────────────────────────────────────────────
 Write-Host "[1/5] Checking port availability..." -ForegroundColor White
-$backendPortConflict = Find-ListeningProcess -Port 8000
+$backendPortConflict = @(Find-ListeningProcess -Port 8000)
 if ($backendPortConflict.Count -gt 0) {
     $conflict = $backendPortConflict[0]
     Write-Host ""
@@ -121,7 +243,7 @@ if ($backendPortConflict.Count -gt 0) {
     exit 1
 }
 
-$frontendPortConflict = Find-ListeningProcess -Port 3000
+$frontendPortConflict = @(Find-ListeningProcess -Port 3000)
 if ($frontendPortConflict.Count -gt 0) {
     $conflict = $frontendPortConflict[0]
     Write-Host ""
@@ -148,12 +270,20 @@ if (-not (Test-Path $demoDbPath)) {
     exit 1
 }
 
-if (Test-Path $backendEnvPath) {
-    $envContent = Get-Content $backendEnvPath -Raw
-    if ($envContent -notmatch "DATABASE_URL=sqlite:///\./eduduty_demo\.db") {
-        Write-Warning "backend/.env does not appear to point to 'sqlite:///./eduduty_demo.db'."
-        Write-Warning "Ensure DATABASE_URL=sqlite:///./eduduty_demo.db is set to avoid touching eduduty.db."
-    }
+if (-not (Test-Path $backendEnvPath)) {
+    $backendEnvExamplePath = Join-Path $RootDir "backend\.env.example"
+    Write-Host ""
+    Write-Host "[ERROR] Backend environment configuration file not found at '$backendEnvPath'." -ForegroundColor Red
+    Write-Host "Action Required: Create backend/.env from backend/.env.example before starting:" -ForegroundColor Yellow
+    Write-Host "  Copy-Item backend\.env.example backend\.env" -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
+}
+
+$envContent = Get-Content $backendEnvPath -Raw
+if ($envContent -notmatch "DATABASE_URL=sqlite:///\./eduduty_demo\.db") {
+    Write-Warning "backend/.env does not appear to point to 'sqlite:///./eduduty_demo.db'."
+    Write-Warning "Ensure DATABASE_URL=sqlite:///./eduduty_demo.db is set to avoid touching eduduty.db."
 }
 Write-Host "  -> Demo database verified: backend/eduduty_demo.db" -ForegroundColor Green
 
@@ -271,36 +401,64 @@ if ($Headless) {
 Write-Host "  Backend PID:  $($backendProc.Id)" -ForegroundColor Cyan
 Write-Host "  Frontend PID: $($frontendProc.Id)" -ForegroundColor Cyan
 
+# Write session file to temp directory for robust stop tracking
+$sessionFile = Join-Path ([System.IO.Path]::GetTempPath()) "eduduty-dev-session.json"
+$sessionData = @{
+    BackendCmdPID  = $backendProc.Id
+    FrontendCmdPID = $frontendProc.Id
+    RootDir        = $RootDir
+    Timestamp      = (Get-Date).ToString("o")
+}
+try {
+    $sessionData | ConvertTo-Json | Set-Content -Path $sessionFile -Encoding UTF8 -ErrorAction SilentlyContinue
+} catch {}
+
 # ── 6. Health & Readiness Polling ─────────────────────────────────────────────
 Write-Host ""
 Write-Host "Waiting for services to become ready (max $TimeoutSeconds seconds)..." -ForegroundColor Yellow
 
 $backendReady = $false
 $frontendReady = $false
+$lastBackendError = $null
+$lastFrontendError = $null
 $startTime = Get-Date
 
 while (((Get-Date) - $startTime).TotalSeconds -lt $TimeoutSeconds) {
+    # Check if backend wrapper process unexpectedly died
+    if ($backendProc -and $backendProc.HasExited) {
+        Write-Host ""
+        Write-Host "  [ERROR] Backend process (PID $($backendProc.Id)) exited prematurely with code $($backendProc.ExitCode)." -ForegroundColor Red
+        break
+    }
+    if ($frontendProc -and $frontendProc.HasExited) {
+        Write-Host ""
+        Write-Host "  [ERROR] Frontend process (PID $($frontendProc.Id)) exited prematurely with code $($frontendProc.ExitCode)." -ForegroundColor Red
+        break
+    }
+
     if (-not $backendReady) {
+        $backendResp = $null
         try {
-            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:8000/health" -Method Get -TimeoutSec 2 -ErrorAction SilentlyContinue
-            if ($resp -and ($resp.status -eq "ok" -or $resp.status -eq "healthy")) {
+            $backendResp = Invoke-RestMethod -Uri "http://127.0.0.1:8000/health" -Method Get -TimeoutSec 2 -ErrorAction Stop
+            if ($backendResp -and ($backendResp.status -eq "ok" -or $backendResp.status -eq "healthy")) {
                 $backendReady = $true
                 Write-Host "  [OK] Backend healthy at http://127.0.0.1:8000/health" -ForegroundColor Green
             }
         } catch {
-            # Still warming up
+            $lastBackendError = $_.Exception.Message
         }
     }
 
     if (-not $frontendReady) {
+        $frontendResp = $null
         try {
-            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:3000/login" -Method Get -TimeoutSec 2 -UseBasicParsing -ErrorAction SilentlyContinue
-            if ($resp.StatusCode -eq 200) {
+            $frontendResp = Invoke-WebRequest -Uri "http://127.0.0.1:3000/login" -Method Get -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+            if ($frontendResp -and $frontendResp.StatusCode -eq 200) {
                 $frontendReady = $true
                 Write-Host "  [OK] Frontend responsive at http://127.0.0.1:3000/login" -ForegroundColor Green
             }
         } catch {
-            # Next.js compiles on first request
+            $lastFrontendError = $_.Exception.Message
         }
     }
 
@@ -338,7 +496,21 @@ if ($backendReady -and $frontendReady) {
     Write-Host "==========================================================" -ForegroundColor Red
     Write-Host "Timed out waiting for full service readiness after $TimeoutSeconds seconds." -ForegroundColor Red
     Write-Host "  Backend Ready : $backendReady" -ForegroundColor $(if ($backendReady) { "Green" } else { "Red" })
+    if (-not $backendReady) {
+        if ($lastBackendError) {
+            Write-Host "    -> Last probe error: $lastBackendError" -ForegroundColor Yellow
+        }
+        $p8000 = @(Find-ListeningProcess -Port 8000)
+        if ($p8000.Count -gt 0) {
+            Write-Host "    -> Port 8000 is listening by $($p8000[0].Name) (PID $($p8000[0].PID)), but /health did not return 'ok'." -ForegroundColor Yellow
+        } else {
+            Write-Host "    -> No process is listening on port 8000." -ForegroundColor Yellow
+        }
+    }
     Write-Host "  Frontend Ready: $frontendReady" -ForegroundColor $(if ($frontendReady) { "Green" } else { "Red" })
+    if (-not $frontendReady -and $lastFrontendError) {
+        Write-Host "    -> Last probe error: $lastFrontendError" -ForegroundColor Yellow
+    }
     Write-Host ""
     Write-Host "Check the spawned console windows for error traces." -ForegroundColor Yellow
     Write-Host "To shut down: .\start-dev.ps1 -Stop" -ForegroundColor Yellow

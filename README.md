@@ -67,6 +67,10 @@ graph TD
 
    # Install dependencies
    pip install -r backend/requirements.txt
+
+   # Create backend/.env from the example template
+   Copy-Item backend/.env.example backend/.env
+   # Or on macOS/Linux: cp backend/.env.example backend/.env
    ```
 
 3. **Frontend Setup:**
@@ -81,6 +85,15 @@ graph TD
 ## 4. Environment Configuration
 
 Environment files store configuration settings. **Never commit real credentials or production signing secrets to version control.**
+
+Before starting the application, create `backend/.env` from `backend/.env.example`:
+```powershell
+Copy-Item backend/.env.example backend/.env
+# On macOS / Linux:
+# cp backend/.env.example backend/.env
+```
+
+`backend/.env`, `backend/eduduty.db`, and `backend/eduduty_demo.db` are excluded from Git via `.gitignore`.
 
 ### Backend (`backend/.env`)
 | Variable | Description | Default / Example |
@@ -211,6 +224,9 @@ python seed_demo_data.py
   Run `cd frontend && npm install`.
 - **Supabase Local Service Offline:**
   EduDuty automatically falls back to development demo authentication when Supabase is not running. Single-click login on `/login` works out of the box.
+- **Missing Backend Environment Configuration:**
+  If `backend/.env` is missing, copy the template before launching:
+  `Copy-Item backend/.env.example backend/.env`
 - **Database URL Warning:**
   Verify that `backend/.env` contains `DATABASE_URL=sqlite:///./eduduty_demo.db`. Never set it to `eduduty.db`.
 
