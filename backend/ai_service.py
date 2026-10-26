@@ -542,6 +542,39 @@ async def handle_ai_message(message: str, db: Session) -> dict:
         # If entity could not be resolved, fall through to normal query path.
         # Do not return a hardcoded /pdf/seating/1/1 shortcut.
 
+    # ── Missing Class Attendance Guard ────────────────────────────────────────
+    # If user explicitly asked for attendance, eligibility, or borderline data of a class
+    # that has NO student attendance uploaded yet, inform them directly and helpfully!
+    classes_with_students = [
+        r[0] for r in db.execute(
+            text("SELECT DISTINCT c.name FROM students s JOIN classes c ON c.id = s.class_id WHERE s.active = 1")
+        ).fetchall()
+    ]
+    all_classes = [c.name for c in db.query(models.Class).all()]
+    target_class = None
+    for cname in all_classes:
+        digits = re.findall(r"\d+", cname)
+        synonyms = [cname.lower(), cname.lower().replace("-", " "), cname.lower().replace("-", "")]
+        if digits:
+            num = digits[0]
+            synonyms.extend([f"csit{num}", f"csit {num}", f"csit-{num}", f"ci{num}", f"ci {num}", f"ci-{num}", f"cs{num}", f"cs {num}"])
+        if any(re.search(rf"\b{re.escape(syn)}\b", msg_lower) for syn in synonyms):
+            target_class = cname
+            break
+
+    if target_class and target_class not in classes_with_students and not any(w in msg_lower for w in ["timetable", "schedule"]):
+        classes_list_str = ", ".join(f"**{c}**" for c in classes_with_students) if classes_with_students else "None"
+        return {
+            "type": "answer",
+            "content": (
+                f"### ⚠️ No Attendance Data Uploaded for {target_class}\n\n"
+                f"You requested attendance or borderline data for **{target_class}**, but student attendance records have **not been uploaded** for {target_class} yet.\n\n"
+                f"- **Classes currently in database with attendance**: {classes_list_str}\n"
+                f"- **Timetable Data**: Timetable entries are active in the **[Timetable](/timetable)** section.\n\n"
+                f"Please upload the {target_class} Excel attendance sheet on the **[Upload Attendance](/attendance/upload)** page to evaluate its students."
+            )
+        }
+
     # ── Write intent detection ────────────────────────────────────────────────
     write_keywords = ["override", "mark", "assign", "update", "change", "set"]
     if any(k in msg_lower for k in write_keywords):
@@ -656,6 +689,39 @@ def _heuristic_answer(message: str, db: Session) -> dict:
     msg = message.lower().strip()
 
     with get_readonly_connection() as conn:
+        # Detect if user mentioned a specific class (e.g. CI-1, CI-2, CSIT-2, CI3, CY)
+        classes_with_data = [
+            r[0] for r in conn.execute(
+                text("SELECT DISTINCT c.name FROM students s JOIN classes c ON c.id = s.class_id WHERE s.active = 1")
+            ).fetchall()
+        ]
+        all_classes_in_db = [r[0] for r in conn.execute(text("SELECT name FROM classes")).fetchall()]
+
+        target_class = None
+        for cname in all_classes_in_db:
+            digits = re.findall(r"\d+", cname)
+            synonyms = [cname.lower(), cname.lower().replace("-", " "), cname.lower().replace("-", "")]
+            if digits:
+                num = digits[0]
+                synonyms.extend([f"csit{num}", f"csit {num}", f"csit-{num}", f"ci{num}", f"ci {num}", f"ci-{num}", f"cs{num}", f"cs {num}"])
+            if any(re.search(rf"\b{re.escape(syn)}\b", msg) for syn in synonyms):
+                target_class = cname
+                break
+
+        # If user explicitly asked for attendance/eligibility/borderline of a class that has NO uploaded attendance data,
+        # inform them clearly instead of returning data from another class!
+        if target_class and target_class not in classes_with_data and not any(w in msg for w in ["timetable", "schedule"]):
+            classes_list_str = ", ".join(f"**{c}**" for c in classes_with_data) if classes_with_data else "None"
+            return {
+                "type": "answer",
+                "content": (
+                    f"### ⚠️ No Attendance Data Uploaded for {target_class}\n\n"
+                    f"You requested data for **{target_class}**, but attendance records have **not been uploaded** for {target_class} yet.\n\n"
+                    f"- **Classes currently in database with attendance**: {classes_list_str}\n\n"
+                    f"Please upload the {target_class} Excel attendance sheet on the **[Upload Attendance](/attendance/upload)** page first."
+                )
+            }
+
         # Check for roll number lookup
         roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{4,})\b", message)
         if roll_match:
@@ -682,28 +748,40 @@ def _heuristic_answer(message: str, db: Session) -> dict:
                 return {"type": "answer", "content": content}
 
         # Check for borderline queries
-        if "borderline" in msg:
-            rows = conn.execute(
-                text("SELECT roll_number, student_name, class_name, overall_pct FROM ai_attendance_summary WHERE overall_pct >= 45 AND overall_pct < 50 ORDER BY overall_pct ASC LIMIT 15")
-            ).fetchall()
-            if not rows:
-                # Also check eligibility table for borderline status
+        if "borderline" in msg or "border line" in msg:
+            if target_class:
                 rows = conn.execute(
-                    text("SELECT s.roll_number, s.name as student_name, c.name as class_name, me.overall_pct FROM mst_eligibility me JOIN students s ON s.id = me.student_id JOIN classes c ON c.id = s.class_id WHERE me.status = 'Borderline' LIMIT 15")
+                    text("SELECT roll_number, student_name, class_name, overall_pct FROM ai_attendance_summary WHERE overall_pct >= 45 AND overall_pct < 50 AND class_name = :cls ORDER BY overall_pct ASC LIMIT 25"),
+                    {"cls": target_class}
                 ).fetchall()
+                if not rows:
+                    rows = conn.execute(
+                        text("SELECT s.roll_number, s.name as student_name, c.name as class_name, me.overall_pct FROM mst_eligibility me JOIN students s ON s.id = me.student_id JOIN classes c ON c.id = s.class_id WHERE me.status = 'Borderline' AND c.name = :cls LIMIT 25"),
+                        {"cls": target_class}
+                    ).fetchall()
+            else:
+                rows = conn.execute(
+                    text("SELECT roll_number, student_name, class_name, overall_pct FROM ai_attendance_summary WHERE overall_pct >= 45 AND overall_pct < 50 ORDER BY overall_pct ASC LIMIT 25")
+                ).fetchall()
+                if not rows:
+                    rows = conn.execute(
+                        text("SELECT s.roll_number, s.name as student_name, c.name as class_name, me.overall_pct FROM mst_eligibility me JOIN students s ON s.id = me.student_id JOIN classes c ON c.id = s.class_id WHERE me.status = 'Borderline' LIMIT 25")
+                    ).fetchall()
 
             if rows:
                 table_lines = ["| Roll Number | Student Name | Class | Attendance |", "| :--- | :--- | :--- | :--- |"]
                 for r in rows:
                     m = dict(r._mapping)
                     table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | **{m['overall_pct']:.1f}%** |")
+                cls_title = f" in {target_class}" if target_class else ""
                 content = (
-                    f"### Borderline Students (45% - 49.9% Attendance)\n\n"
+                    f"### Borderline Students (45% - 49.9% Attendance){cls_title}\n\n"
                     f"Found **{len(rows)}** borderline candidates requiring departmental review:\n\n" +
                     "\n".join(table_lines)
                 )
                 return {"type": "answer", "content": content}
-            return {"type": "answer", "content": "No borderline students found with attendance between 45% and 50%."}
+            cls_msg = f" for class {target_class}" if target_class else ""
+            return {"type": "answer", "content": f"No borderline students found with attendance between 45% and 50%{cls_msg}."}
 
         # Check for VT candidates / remedial queries
         if any(w in msg for w in ["vt", "remedial", "follow-up", "follow up", "candidate"]):

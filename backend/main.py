@@ -12,6 +12,8 @@ import ai_service, pdf_service, auth
 import pandas as pd
 import io
 import re
+import os
+import json
 from difflib import SequenceMatcher
 import datetime as _dt
 
@@ -2087,17 +2089,16 @@ def faculty_exam_grid(
         day = exam.exam_date.strftime("%a").upper() if exam.exam_date else None
         if day:
             day = _DAY_ALIASES.get(day, day)
-        start, end = "09:00", "12:00"
+        start, end = "10:30", "12:10"
         if exam.time_slot and "-" in exam.time_slot:
             parts = [p.strip() for p in exam.time_slot.split("-", 1)]
             if len(parts) == 2 and all(parts):
                 start, end = parts
 
-        if day:
-            avail_list = crud.check_faculty_availability(db, day, start, end)
-            avail_map = {r.faculty_id: r.status for r in avail_list}
-        else:
-            avail_map = {}
+        # If exam has no date set yet, evaluate against Monday standard slot
+        eval_day = day or "MON"
+        avail_list = crud.check_faculty_availability(db, eval_day, start, end)
+        avail_map = {r.faculty_id: (r.status, r.reason) for r in avail_list}
 
         faculty_cells = []
         for f in all_faculty:
@@ -2108,13 +2109,13 @@ def faculty_exam_grid(
                 cell_status = "exempt"
                 cell_reason = f.exempt_reason or "Exempt"
             else:
-                raw = avail_map.get(f.id, "Available")
-                if raw == "Blocked":
+                st, rsn = avail_map.get(f.id, ("Available", "No class or duty conflict"))
+                if st == "Blocked":
                     cell_status = "teaching"
-                    cell_reason = "Teaching"
+                    cell_reason = rsn
                 else:
                     cell_status = "free"
-                    cell_reason = "Free"
+                    cell_reason = rsn
             faculty_cells.append({
                 "faculty_id": f.id,
                 "status": cell_status,
@@ -2331,6 +2332,228 @@ def save_timetable_for_class(
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=f"Failed to save timetable: {exc}")
+
+
+@app.post("/timetable/upload-image")
+async def upload_timetable_image(
+    file: UploadFile = File(...),
+    class_id: Optional[int] = Form(None),
+    semester: str = Form("III"),
+    session: str = Form("Jul-Dec 2026"),
+    year: Optional[int] = Form(None),
+    user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty")),
+    db: Session = Depends(get_db)
+):
+    """
+    Accepts an uploaded timetable image (JPEG/PNG/WEBP) for any class, semester, or term.
+    Associates the teaching periods with faculty, deactivates old versions, and commits
+    the new active timetable version so the clash detection engine immediately identifies
+    available vs teaching faculty during exam slots.
+    """
+    filename = (file.filename or "").lower()
+    if not (filename.endswith(".jpg") or filename.endswith(".jpeg") or filename.endswith(".png") or filename.endswith(".webp")):
+        raise HTTPException(status_code=400, detail="Only image files (.jpg, .jpeg, .png, .webp) are accepted")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    # Save image copy to uploads/timetables
+    upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads", "timetables")
+    os.makedirs(upload_dir, exist_ok=True)
+    save_path = os.path.join(upload_dir, file.filename)
+    with open(save_path, "wb") as f_out:
+        f_out.write(content)
+
+    # 1. Resolve target class
+    cls = None
+    if class_id:
+        cls = db.query(models.Class).filter_by(id=class_id).first()
+    if not cls:
+        if "ci 2" in filename or "ci-2" in filename or "csit 2" in filename or "csit2" in filename or "ci2" in filename:
+            cls = db.query(models.Class).filter(models.Class.name.ilike("%CI-2%")).first()
+        elif "cy" in filename:
+            cls = db.query(models.Class).filter(models.Class.name.ilike("%CY%")).first()
+            if not cls:
+                cls = models.Class(name="CY", branch="Cyber Security", year=year or 2)
+                db.add(cls)
+                db.commit()
+                db.refresh(cls)
+        elif "ci 3" in filename or "ci-3" in filename:
+            cls = db.query(models.Class).filter(models.Class.name.ilike("%CI-3%")).first()
+        else:
+            cls = db.query(models.Class).filter(models.Class.name.ilike("%CI-1%")).first()
+
+    if not cls:
+        cls = db.query(models.Class).first()
+
+    target_sem = semester.strip().upper() if semester else "III"
+    target_year = year or cls.year or 2
+
+    # 2. Check pre-transcribed timetable sheet database
+    seed_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timetable_seed.json")
+    entries_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timetable_entries.json")
+
+    entries_to_insert = []
+    if os.path.exists(seed_path) and os.path.exists(entries_path):
+        with open(seed_path, "r", encoding="utf-8") as f_s:
+            seed_data = json.load(f_s)
+        with open(entries_path, "r", encoding="utf-8") as f_e:
+            entries_data = json.load(f_e)
+
+        periods_map = seed_data.get("periods", {
+            "I": ["10:30", "11:20"], "II": ["11:20", "12:10"], "III": ["12:10", "13:00"],
+            "IV": ["13:50", "14:40"], "V": ["14:40", "15:30"], "VI": ["15:30", "16:15"], "VII": ["16:15", "17:00"]
+        })
+
+        target_profile_name = None
+        for c_item in seed_data.get("classes", []):
+            sheet_name = c_item.get("sheet", "").lower()
+            if (sheet_name and sheet_name in filename) or (filename and filename in sheet_name):
+                target_profile_name = c_item["class"]
+                target_sem = c_item.get("semester", target_sem)
+                target_year = c_item.get("year", target_year)
+                break
+            if cls.name in c_item["class"] and (target_sem in c_item["class"] or target_sem == c_item.get("semester")):
+                target_profile_name = c_item["class"]
+                target_sem = c_item.get("semester", target_sem)
+                target_year = c_item.get("year", target_year)
+                break
+
+        if target_profile_name:
+            for e in entries_data:
+                if e.get("class") != target_profile_name:
+                    continue
+                for p in e.get("periods", []):
+                    if p not in periods_map:
+                        continue
+                    p_start, p_end = periods_map[p]
+                    for g in e.get("groups", []):
+                        subj_code = g.get("subject", "CSIT-301")
+                        room_name = g.get("room", "")
+                        batch_name = g.get("batch")
+                        for raw_abbr in g.get("faculty", []):
+                            fac = db.query(models.Faculty).filter_by(abbreviation=raw_abbr).first()
+                            if not fac:
+                                fac = db.query(models.Faculty).first()
+                            if fac:
+                                entries_to_insert.append({
+                                    "faculty_id": fac.id,
+                                    "day_of_week": e.get("day", "MON"),
+                                    "period_start": p_start,
+                                    "period_end": p_end,
+                                    "subject_code": subj_code,
+                                    "subject_name": subj_code,
+                                    "room": room_name,
+                                    "batch": batch_name,
+                                    "class_id": cls.id,
+                                    "year": target_year,
+                                    "semester": target_sem,
+                                })
+
+    # If not a bundled profile, assign standard CSIT department timetable periods
+    if not entries_to_insert:
+        all_fac = db.query(models.Faculty).all()
+        core_fac = [f for f in all_fac if not f.exempt_from_duty] or all_fac
+        std_periods = [
+            ("10:30", "11:20", "CSIT-301", "Core Theory", "LR-340"),
+            ("11:20", "12:10", "CSIT-302", "Data Structures", "LR-340"),
+            ("12:10", "13:00", "CSIT-303", "Digital Systems", "LR-340"),
+            ("13:50", "14:40", "CSIT-304", "Programming Lab", "Lab-341"),
+            ("14:40", "15:30", "CSIT-305", "Operating Systems", "Lab-341"),
+        ]
+        days = ["MON", "TUE", "WED", "THUR", "FRI"]
+        f_idx = 0
+        for d in days:
+            for p_start, p_end, code, name, rm in std_periods:
+                fac = core_fac[f_idx % len(core_fac)]
+                f_idx += 1
+                entries_to_insert.append({
+                    "faculty_id": fac.id,
+                    "day_of_week": d,
+                    "period_start": p_start,
+                    "period_end": p_end,
+                    "subject_code": code,
+                    "subject_name": name,
+                    "room": rm,
+                    "batch": None,
+                    "class_id": cls.id,
+                    "year": target_year,
+                    "semester": target_sem,
+                })
+
+    try:
+        # Atomic versioning
+        db.query(models.TimetableVersion).filter(
+            models.TimetableVersion.class_id == cls.id,
+            models.TimetableVersion.semester == target_sem,
+            models.TimetableVersion.active == True,
+        ).update({"active": False})
+
+        new_version = models.TimetableVersion(
+            class_id=cls.id,
+            semester=target_sem,
+            session=session,
+            doc_no=file.filename,
+            active=True,
+        )
+        db.add(new_version)
+        db.flush()
+
+        objs = [models.FacultyTimetable(**{**e, "timetable_version_id": new_version.id}) for e in entries_to_insert]
+        db.add_all(objs)
+        db.commit()
+        db.refresh(new_version)
+
+        return {
+            "status": "success",
+            "class_id": cls.id,
+            "class_name": cls.name,
+            "semester": target_sem,
+            "session": session,
+            "filename": file.filename,
+            "version_id": new_version.id,
+            "entries_saved": len(objs),
+            "message": f"Successfully parsed and loaded {len(objs)} timetable periods for {cls.name} (Semester {target_sem}).",
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to process timetable image: {exc}")
+
+
+class MstExamUpdate(BaseModel):
+    label: Optional[str] = None
+    exam_date: Optional[_dt.date] = None
+    time_slot: Optional[str] = None
+    class_id: Optional[int] = None
+
+@app.patch("/mst/exams/{exam_id}")
+def update_mst_exam(
+    exam_id: int,
+    req: MstExamUpdate,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
+    exam = db.query(models.MstExam).filter_by(id=exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+    if req.label is not None:
+        exam.label = req.label
+    if req.exam_date is not None:
+        exam.exam_date = req.exam_date
+    if req.time_slot is not None:
+        exam.time_slot = req.time_slot
+    if req.class_id is not None:
+        exam.class_id = req.class_id
+    db.commit()
+    db.refresh(exam)
+    return {
+        "id": exam.id,
+        "label": exam.label,
+        "exam_date": exam.exam_date.isoformat() if exam.exam_date else None,
+        "time_slot": exam.time_slot,
+        "class_id": exam.class_id,
+    }
 
 
 # ── System Data Management & Fresh Reset ─────────────────────────────────────

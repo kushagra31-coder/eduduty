@@ -167,7 +167,17 @@ export default function FollowUpPage() {
       })
       if (!res.ok) throw new Error("recalc failed")
       const data = await res.json()
-      toast({ title: `Recalculated ${data.evaluated} students (${data.changed} changed)` })
+      if (data.changed > 0) {
+        toast({
+          title: "Recalculation Complete",
+          description: `Evaluated ${data.evaluated} students. Status updated for ${data.changed} students based on MST-1 and MST-2 roll call.`,
+        })
+      } else {
+        toast({
+          title: "Recalculation Complete",
+          description: `Evaluated ${data.evaluated} students. All students remain 'Under Review' because MST roll-call attendance has not been marked yet. Once roll-call attendance is marked, students absent in both MSTs will move to Compulsory Follow-up.`,
+        })
+      }
       fetchData()
     } catch {
       toast({ title: "Recalculation failed", variant: "destructive" })
@@ -348,7 +358,7 @@ export default function FollowUpPage() {
           <div className="flex items-center gap-2.5">
             <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
             <span>
-              <strong>{stats?.missing_records} students</strong> have missing or pending MST attendance data. Mark attendance in MST Roll Call or click Recalculate to evaluate.
+              <strong>{stats?.missing_records} students</strong> have missing or pending MST attendance data. Rule <code>absent-both-mst-v1</code> keeps them <strong>Under Review</strong> until both MST roll calls are recorded. Mark attendance in <strong>MST Roll Call</strong> to automatically flag double-absentees for compulsory remedial follow-up.
             </span>
           </div>
           <Button
