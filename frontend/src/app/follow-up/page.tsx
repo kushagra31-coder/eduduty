@@ -283,81 +283,79 @@ export default function FollowUpPage() {
         </div>
       </div>
 
+      {/* Modern KPI Header Cards - Open & Responsive Layout */}
       <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
-        <Card className="relative overflow-hidden border shadow-sm">
-          <CardHeader className="pb-2">
-            <div className="flex items-center justify-between text-muted-foreground">
-              <span className="text-xs font-semibold tracking-wide uppercase">Total Evaluated</span>
-              <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">
-                <Users className="w-4 h-4" />
-              </div>
+        {/* Total Evaluated */}
+        <div className="rounded-2xl border border-border/80 bg-card/80 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-border">
+          <div className="flex items-center justify-between text-muted-foreground mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Total Evaluated</span>
+            <div className="p-2 rounded-xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">
+              <Users className="w-4 h-4" />
             </div>
-            <CardTitle className="text-3xl font-mono font-bold tabular-nums mt-1">
-              {stats?.total_evaluated ?? 0}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0 text-xs text-muted-foreground">
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-foreground">
+            {stats?.total_evaluated ?? 0}
+          </div>
+          <p className="text-xs text-muted-foreground mt-1.5">
             Out of <span className="font-semibold text-foreground">{stats?.total_students ?? 0}</span> enrolled students
-          </CardContent>
-        </Card>
+          </p>
+        </div>
 
-        <Card className="relative overflow-hidden border border-rose-200 dark:border-rose-900/50 bg-rose-50/40 dark:bg-rose-950/20 shadow-sm">
-          <CardHeader className="pb-2">
-            <div className="flex items-center justify-between text-rose-700 dark:text-rose-300">
-              <span className="text-xs font-semibold tracking-wide uppercase">Compulsory Follow-up</span>
-              <div className="p-2 rounded-lg bg-rose-500/15 text-rose-600 dark:text-rose-400">
-                <AlertTriangle className="w-4 h-4" />
-              </div>
+        {/* Compulsory Follow-up */}
+        <div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-rose-500/50">
+          <div className="flex items-center justify-between text-rose-600 dark:text-rose-400 mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Compulsory Follow-up</span>
+            <div className="p-2 rounded-xl bg-rose-500/20 text-rose-600 dark:text-rose-400">
+              <AlertTriangle className="w-4 h-4" />
             </div>
-            <CardTitle className="text-3xl font-mono font-bold text-rose-600 dark:text-rose-400 tabular-nums mt-1">
-              {byFinal["compulsory"] ?? 0}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0 text-xs text-rose-700/80 dark:text-rose-300/80">
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-rose-600 dark:text-rose-400">
+            {byFinal["compulsory"] ?? 0}
+          </div>
+          <p className="text-xs text-rose-700/80 dark:text-rose-300/80 mt-1.5">
             Absent in both MST-1 & MST-2
-          </CardContent>
-        </Card>
+          </p>
+        </div>
 
-        <Card className="relative overflow-hidden border border-amber-200 dark:border-amber-900/50 bg-amber-50/30 dark:bg-amber-950/20 shadow-sm">
-          <CardHeader className="pb-2">
-            <div className="flex items-center justify-between text-amber-700 dark:text-amber-300">
-              <span className="text-xs font-semibold tracking-wide uppercase">Under Review & Excused</span>
-              <div className="p-2 rounded-lg bg-amber-500/15 text-amber-600 dark:text-amber-400">
-                <Clock className="w-4 h-4" />
-              </div>
+        {/* Under Review & Excused */}
+        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-amber-500/50">
+          <div className="flex items-center justify-between text-amber-600 dark:text-amber-400 mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Under Review & Excused</span>
+            <div className="p-2 rounded-xl bg-amber-500/20 text-amber-600 dark:text-amber-400">
+              <Clock className="w-4 h-4" />
             </div>
-            <CardTitle className="text-3xl font-mono font-bold text-amber-600 dark:text-amber-400 tabular-nums mt-1">
-              {(byFinal["under_review"] ?? 0) + (byFinal["excused"] ?? 0)}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0 text-xs text-amber-700/80 dark:text-amber-300/80">
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-amber-600 dark:text-amber-400">
+            {(byFinal["under_review"] ?? 0) + (byFinal["excused"] ?? 0)}
+          </div>
+          <p className="text-xs text-amber-700/80 dark:text-amber-300/80 mt-1.5">
             {byFinal["under_review"] ?? 0} pending data · {byFinal["excused"] ?? 0} excused
-          </CardContent>
-        </Card>
+          </p>
+        </div>
 
-        <Card className="relative overflow-hidden border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/30 dark:bg-emerald-950/20 shadow-sm">
-          <CardHeader className="pb-2">
-            <div className="flex items-center justify-between text-emerald-700 dark:text-emerald-300">
-              <span className="text-xs font-semibold tracking-wide uppercase">Completed & Exempted</span>
-              <div className="p-2 rounded-lg bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-                <CheckCircle2 className="w-4 h-4" />
-              </div>
+        {/* Completed & Exempted */}
+        <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-emerald-500/50">
+          <div className="flex items-center justify-between text-emerald-600 dark:text-emerald-400 mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Completed & Exempted</span>
+            <div className="p-2 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
+              <CheckCircle2 className="w-4 h-4" />
             </div>
-            <CardTitle className="text-3xl font-mono font-bold text-emerald-600 dark:text-emerald-400 tabular-nums mt-1">
-              {(byFinal["completed"] ?? 0) + (byFinal["not_required"] ?? 0)}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0 text-xs text-emerald-700/80 dark:text-emerald-300/80">
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-emerald-600 dark:text-emerald-400">
+            {(byFinal["completed"] ?? 0) + (byFinal["not_required"] ?? 0)}
+          </div>
+          <p className="text-xs text-emerald-700/80 dark:text-emerald-300/80 mt-1.5">
             {byFinal["completed"] ?? 0} completed · {byFinal["not_required"] ?? 0} exempted
-          </CardContent>
-        </Card>
+          </p>
+        </div>
       </div>
 
+      {/* Advisory Status Banner */}
       {(stats?.missing_records ?? 0) > 0 && (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-amber-300/60 bg-amber-500/10 p-3.5 text-xs text-amber-900 dark:text-amber-200">
-          <div className="flex items-center gap-2.5">
-            <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
-            <span>
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-900 dark:text-amber-200">
+          <div className="flex items-center gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0" />
+            <span className="leading-relaxed">
               <strong>{stats?.missing_records} students</strong> have missing or pending MST attendance data. Rule <code>absent-both-mst-v1</code> keeps them <strong>Under Review</strong> until both MST roll calls are recorded. Mark attendance in <strong>MST Roll Call</strong> to automatically flag double-absentees for compulsory remedial follow-up.
             </span>
           </div>
@@ -366,121 +364,124 @@ export default function FollowUpPage() {
             size="sm"
             onClick={recalculate}
             disabled={recalcBusy}
-            className="h-7 text-xs border-amber-400/60 hover:bg-amber-500/20 text-amber-950 dark:text-amber-100 shrink-0"
+            className="h-8 text-xs font-semibold border-amber-400/60 hover:bg-amber-500/20 text-amber-950 dark:text-amber-100 shrink-0 self-end sm:self-auto"
           >
             {recalcBusy ? "Recalculating…" : "Recalculate Now"}
           </Button>
         </div>
       )}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Follow-up Roster</CardTitle>
-          <CardDescription>Calculated by the rule engine; final status needs an authorized override with a typed reason.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-center gap-2 pb-2 border-b border-border/40">
-            <span className="text-xs font-semibold text-muted-foreground mr-1 flex items-center gap-1.5">
-              <Filter className="w-3.5 h-3.5" /> Filter by:
-            </span>
-            {statusFilters.map((f) => {
-              const active = finalFilter === f.key
-              return (
-                <button
-                  key={f.key}
-                  type="button"
-                  onClick={() => setFinalFilter(f.key)}
-                  className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all cursor-pointer ${
-                    active
-                      ? "bg-primary text-primary-foreground shadow-sm"
-                      : "bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground"
+      {/* Follow-up Roster Section */}
+      <div className="rounded-2xl border border-border/80 bg-card/60 backdrop-blur-sm shadow-sm overflow-hidden p-5 space-y-4">
+        <div className="space-y-1">
+          <h2 className="text-xl font-bold tracking-tight">Follow-up Roster</h2>
+          <p className="text-xs text-muted-foreground">
+            Calculated by the automated compliance engine; final status changes require an authorized coordinator decision with a mandatory typed reason.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 pb-2 border-b border-border/40">
+          <span className="text-xs font-semibold text-muted-foreground mr-1 flex items-center gap-1.5">
+            <Filter className="w-3.5 h-3.5" /> Filter by:
+          </span>
+          {statusFilters.map((f) => {
+            const active = finalFilter === f.key
+            return (
+              <button
+                key={f.key}
+                type="button"
+                onClick={() => setFinalFilter(f.key)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all cursor-pointer ${
+                  active
+                    ? "bg-primary text-primary-foreground shadow-sm"
+                    : "bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                <span>{f.label}</span>
+                <span
+                  className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                    active ? "bg-primary-foreground/20 text-primary-foreground" : "bg-background/90 text-foreground"
                   }`}
                 >
-                  <span>{f.label}</span>
-                  <span
-                    className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
-                      active ? "bg-primary-foreground/20 text-primary-foreground" : "bg-background/90 text-foreground"
-                    }`}
-                  >
-                    {f.count}
-                  </span>
-                </button>
-              )
-            })}
-          </div>
+                  {f.count}
+                </span>
+              </button>
+            )
+          })}
+        </div>
 
-          <div className="flex gap-3 flex-wrap items-center">
-            <Select value={classFilter} onValueChange={(v: string | null) => { if (v) setClassFilter(v) }}>
-              <SelectTrigger className="w-44"><SelectValue placeholder="Class" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All classes</SelectItem>
-                {classes.map((c) => <SelectItem key={c.id} value={String(c.id)}>{c.name}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            <Input
-              className="w-72"
-              placeholder="Search roll number or name…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-            {(finalFilter !== "all" || classFilter !== "all" || search.trim() !== "") && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  setFinalFilter("all")
-                  setClassFilter("all")
-                  setSearch("")
-                }}
-                className="text-xs text-muted-foreground hover:text-foreground h-9"
-              >
-                Reset filters
-              </Button>
-            )}
-          </div>
+        <div className="flex gap-3 flex-wrap items-center">
+          <Select value={classFilter} onValueChange={(v: string | null) => { if (v) setClassFilter(v) }}>
+            <SelectTrigger className="w-44"><SelectValue placeholder="Class" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All classes</SelectItem>
+              {classes.map((c) => <SelectItem key={c.id} value={String(c.id)}>{c.name}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Input
+            className="w-72"
+            placeholder="Search roll number or name…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          {(finalFilter !== "all" || classFilter !== "all" || search.trim() !== "") && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setFinalFilter("all")
+                setClassFilter("all")
+                setSearch("")
+              }}
+              className="text-xs text-muted-foreground hover:text-foreground h-9"
+            >
+              Reset filters
+            </Button>
+          )}
+        </div>
 
-          <div className="rounded-md border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Roll No.</TableHead>
-                  <TableHead>Name</TableHead>
-                  <TableHead>Class</TableHead>
-                  <TableHead>MST-1</TableHead>
-                  <TableHead>MST-2</TableHead>
-                  <TableHead>Calculated</TableHead>
-                  <TableHead>Final</TableHead>
-                  <TableHead className="text-right">Action</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoading ? (
-                  <TableRow><TableCell colSpan={8} className="h-24 text-center">Loading…</TableCell></TableRow>
-                ) : records.length === 0 ? (
-                  <TableRow><TableCell colSpan={8} className="h-24 text-center">No records. Mark MST attendance or hit Recalculate.</TableCell></TableRow>
-                ) : (
-                  records.map((r) => (
-                    <TableRow key={r.id} className={r.override ? "bg-muted/60" : ""}>
-                      <TableCell className="font-medium font-mono">{r.roll_number}</TableCell>
-                      <TableCell>{r.name}</TableCell>
-                      <TableCell>{r.class_name}</TableCell>
-                      <TableCell>{appearanceBadge(r.mst_1_appeared)}</TableCell>
-                      <TableCell>{appearanceBadge(r.mst_2_appeared)}</TableCell>
-                      <TableCell>{statusBadge(r.calculated_status, false)}</TableCell>
-                      <TableCell>{statusBadge(r.final_status, r.override)}</TableCell>
-                      <TableCell className="text-right">
-                        <Button variant="ghost" size="sm" onClick={() => openDialog(r)}>
-                          {r.override ? "Review Override" : "Review"}
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </div>
-        </CardContent>
-      </Card>
+        {/* Clean, Full-Width Table with horizontal scroll if needed to avoid column squishing */}
+        <div className="rounded-xl border border-border/80 bg-background overflow-x-auto shadow-sm">
+          <table className="w-full text-xs text-left border-collapse min-w-[880px]">
+            <thead>
+              <tr className="border-b bg-muted/40 text-muted-foreground font-semibold">
+                <th className="px-4 py-3 min-w-[130px]">Roll No.</th>
+                <th className="px-4 py-3 min-w-[160px]">Student Name</th>
+                <th className="px-3 py-3 w-24">Class</th>
+                <th className="px-3 py-3 w-28 text-center">MST-1</th>
+                <th className="px-3 py-3 w-28 text-center">MST-2</th>
+                <th className="px-3 py-3 min-w-[125px] text-center">Calculated</th>
+                <th className="px-3 py-3 min-w-[125px] text-center">Final</th>
+                <th className="px-4 py-3 min-w-[100px] text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/60">
+              {isLoading ? (
+                <tr><td colSpan={8} className="h-24 text-center text-muted-foreground">Loading roster records…</td></tr>
+              ) : records.length === 0 ? (
+                <tr><td colSpan={8} className="h-24 text-center text-muted-foreground">No records found. Mark MST attendance or hit Recalculate.</td></tr>
+              ) : (
+                records.map((r) => (
+                  <tr key={r.id} className={`hover:bg-muted/30 transition-colors ${r.override ? "bg-muted/40" : ""}`}>
+                    <td className="px-4 py-3 font-medium font-mono whitespace-nowrap">{r.roll_number}</td>
+                    <td className="px-4 py-3 font-medium whitespace-nowrap">{r.name}</td>
+                    <td className="px-3 py-3 whitespace-nowrap font-semibold text-muted-foreground">{r.class_name}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{appearanceBadge(r.mst_1_appeared)}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{appearanceBadge(r.mst_2_appeared)}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{statusBadge(r.calculated_status, false)}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{statusBadge(r.final_status, r.override)}</td>
+                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                      <Button variant="ghost" size="sm" onClick={() => openDialog(r)} className="h-7 text-xs font-medium px-2.5">
+                        {r.override ? "Review Override" : "Review"}
+                      </Button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent>

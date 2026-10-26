@@ -116,7 +116,7 @@ export default function Dashboard() {
   }, [])
 
   const handleResetData = async () => {
-    if (!confirm("Reset database to clean fresh state? This will wipe legacy/dummy student data and keep clean CI-1, CI-2, CI-3 classes ready for your upload.")) return
+    if (!confirm("Reset database to clean fresh state? This will wipe legacy/dummy student data and keep clean CI-1, CI-2, CY (Cyber Security) classes ready for your upload.")) return
     setResetting(true)
     try {
       const res = await fetch(`${API}/data/reset`, { method: "POST" })
@@ -124,7 +124,7 @@ export default function Dashboard() {
       if (res.ok) {
         toast({
           title: "Clean Slate Initialized",
-          description: "Classes CI-1, CI-2, CI-3 are ready. Legacy demo cache cleared.",
+          description: "Classes CI-1, CI-2, CY (Cyber Security) are ready. Legacy demo cache cleared.",
         })
         loadStats()
       } else {
@@ -160,7 +160,7 @@ export default function Dashboard() {
               Examination Command Center
             </h1>
             <p className="text-sm text-foreground/80 dark:text-zinc-300 leading-relaxed font-normal">
-              Automate eligibility audits, B1/B2 seating, conflict-free duty scheduling, and VT follow-up — partitioned cleanly across CI-1, CI-2, CI-3.
+              Automate eligibility audits, B1/B2 seating, conflict-free duty scheduling, and VT follow-up — partitioned cleanly across CI-1, CI-2, CY (Cyber Security).
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3 shrink-0">
@@ -188,7 +188,7 @@ export default function Dashboard() {
               onClick={handleResetData}
               disabled={resetting}
               className="gap-2 shadow-sm font-medium border-destructive/40 text-destructive hover:bg-destructive/15 hover:border-destructive"
-              title="Reset all dummy data to clean CI-1, CI-2, CI-3 state"
+              title="Reset all dummy data to clean CI-1, CI-2, CY state"
             >
               {resetting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
               <span>Clean Slate</span>

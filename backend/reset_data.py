@@ -1,7 +1,7 @@
 """
 EduDuty Data Reset & Clean Class Initialization Utility
 Wipes cached demo data (old CI21 students, dummy attendance, duplicate exams)
-and establishes clean, distinguished classes: CI-1, CI-2, CI-3 with standard rooms.
+and establishes clean, distinguished classes: CI-1, CI-2, CY (Cyber Security) with standard rooms.
 Leaves student and attendance tables completely clean and ready for user upload.
 """
 from database import engine, SessionLocal
@@ -32,11 +32,11 @@ def reset_to_fresh_state(preserve_rooms_and_faculty: bool = True):
             db.query(models.Faculty).delete()
         db.commit()
 
-        # 2. Seed clean, distinct classes: CI-1, CI-2, CI-3
+        # 2. Seed clean, distinct classes: CI-1, CI-2, CY
         classes_data = [
             {"id": 1, "name": "CI-1", "branch": "Computer Science (CI-1)", "year": 2, "section": "A"},
             {"id": 2, "name": "CI-2", "branch": "Computer Science (CI-2)", "year": 2, "section": "B"},
-            {"id": 3, "name": "CI-3", "branch": "Computer Science (CI-3)", "year": 2, "section": "C"},
+            {"id": 3, "name": "CY", "branch": "Cyber Security", "year": 2, "section": "Cyber"},
         ]
         created_classes = []
         for c in classes_data:
@@ -100,17 +100,17 @@ def reset_to_fresh_state(preserve_rooms_and_faculty: bool = True):
             record_id=0,
             field_changed="system_reset",
             old_value="legacy_seed_data",
-            new_value="Clean initialization with classes CI-1, CI-2, CI-3. Ready for user upload."
+            new_value="Clean initialization with classes CI-1, CI-2, CY. Ready for user upload."
         ))
         db.commit()
 
         print("Data successfully reset!")
-        print("Classes available: CI-1, CI-2, CI-3")
+        print("Classes available: CI-1, CI-2, CY (Cyber Security)")
         print("Students count: 0 (Ready for user upload)")
         print("Attendance records: 0")
         return {
             "status": "success",
-            "message": "System reset successfully. Initialized clean classes CI-1, CI-2, CI-3. All demo data wiped.",
+            "message": "System reset successfully. Initialized clean classes CI-1, CI-2, CY. All demo data wiped.",
             "classes": [c["name"] for c in classes_data],
             "students_count": 0,
             "attendance_count": 0

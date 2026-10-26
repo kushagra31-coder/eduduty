@@ -28,8 +28,8 @@ interface BatchItem {
 const SUGGESTED_LABELS = [
   "CI-1 MST-1", "CI-1 MST-2",
   "CI-2 MST-1", "CI-2 MST-2",
-  "CI-3 MST-1", "CI-3 MST-2",
-  "CI-1 Sem3", "CI-1 Sem5", "CI-2 Sem3", "CI-2 Sem5", "CI-3 Sem3", "CI-3 Sem5",
+  "CY MST-1", "CY MST-2",
+  "CI-1 Sem3", "CI-1 Sem5", "CI-2 Sem3", "CI-2 Sem5", "CY Sem3", "CY Sem5",
 ]
 
 export default function AttendanceUpload() {
@@ -190,7 +190,7 @@ export default function AttendanceUpload() {
   const [resetting, setResetting] = useState(false)
 
   const handleResetToFresh = async () => {
-    if (!confirm("Reset database to clean fresh state? This will wipe legacy/dummy student data and keep clean CI-1, CI-2, CI-3 classes ready for your upload.")) return
+    if (!confirm("Reset database to clean fresh state? This will wipe legacy/dummy student data and keep clean CI-1, CI-2, CY (Cyber Security) classes ready for your upload.")) return
     setResetting(true)
     try {
       const res = await fetch('/api/data/reset', { method: 'POST' })
@@ -198,7 +198,7 @@ export default function AttendanceUpload() {
       if (res.ok) {
         toast({
           title: "Clean Slate Initialized",
-          description: "Classes CI-1, CI-2, CI-3 are ready. All legacy cache has been removed.",
+          description: "Classes CI-1, CI-2, CY (Cyber Security) are ready. All legacy cache has been removed.",
         })
         setUploadResult(null)
         setFile(null)
@@ -447,7 +447,7 @@ export default function AttendanceUpload() {
             <div className="p-4 border-t bg-muted/10 space-y-2">
               <div className="text-[11px] text-muted-foreground flex items-center justify-between">
                 <span>Start from scratch?</span>
-                <span className="font-semibold text-primary">CI-1 · CI-2 · CI-3</span>
+                <span className="font-semibold text-primary">CI-1 · CI-2 · CY</span>
               </div>
               <Button
                 variant="outline"

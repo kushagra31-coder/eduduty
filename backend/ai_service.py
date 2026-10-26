@@ -785,26 +785,52 @@ def _heuristic_answer(message: str, db: Session) -> dict:
 
         # Check for VT candidates / remedial queries
         if any(w in msg for w in ["vt", "remedial", "follow-up", "follow up", "candidate"]):
-            rows = conn.execute(
-                text("SELECT roll_number, student_name, class_name, final_status, override_reason FROM v_vt_follow_up_status LIMIT 15")
+            where_cls = " WHERE class_name = :cls" if target_class else ""
+            params = {"cls": target_class} if target_class else {}
+
+            total_evaluated = conn.execute(
+                text(f"SELECT COUNT(*) FROM v_vt_follow_up_status{where_cls}"), params
+            ).scalar() or 0
+
+            status_rows = conn.execute(
+                text(f"SELECT final_status, COUNT(*) FROM v_vt_follow_up_status{where_cls} GROUP BY final_status"), params
             ).fetchall()
-            if rows:
-                compulsory = sum(1 for r in rows if dict(r._mapping).get("final_status") == "compulsory")
-                under_review = sum(1 for r in rows if dict(r._mapping).get("final_status") == "under_review")
-                excused = sum(1 for r in rows if dict(r._mapping).get("final_status") == "excused")
+            counts = {r[0]: r[1] for r in status_rows}
+
+            compulsory = counts.get("compulsory", 0)
+            under_review = counts.get("under_review", 0)
+            excused = counts.get("excused", 0)
+            not_required = counts.get("not_required", 0)
+            completed = counts.get("completed", 0)
+
+            # Get students requiring action (compulsory, under_review, excused)
+            action_rows = conn.execute(
+                text(f"SELECT roll_number, student_name, class_name, final_status, override_reason FROM v_vt_follow_up_status WHERE final_status IN ('compulsory', 'under_review', 'excused'){' AND class_name = :cls' if target_class else ''} ORDER BY CASE WHEN final_status = 'compulsory' THEN 1 WHEN final_status = 'excused' THEN 2 ELSE 3 END, roll_number ASC LIMIT 30"),
+                params
+            ).fetchall()
+
+            table_section = ""
+            if action_rows:
                 table_lines = ["| Roll Number | Student Name | Class | VT Status | Reason / Notes |", "| :--- | :--- | :--- | :--- | :--- |"]
-                for r in rows:
+                for r in action_rows:
                     m = dict(r._mapping)
-                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | **{m['final_status']}** | {m.get('override_reason') or 'Rule evaluation'} |")
-                content = (
-                    f"### Vocational Training (VT) / Follow-up Status Overview\n\n"
-                    f"- **Compulsory Remedial**: `{compulsory}`\n"
-                    f"- **Under Review**: `{under_review}`\n"
-                    f"- **Excused / Approved**: `{excused}`\n\n" +
-                    "\n".join(table_lines)
-                )
-                return {"type": "answer", "content": content}
-            return {"type": "answer", "content": "No students are currently flagged as compulsory for VT follow-up."}
+                    badge_status = f"**{m['final_status'].upper()}**" if m['final_status'] == 'compulsory' else m['final_status']
+                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | {badge_status} | {m.get('override_reason') or 'Absent in both MST-1 & MST-2'} |")
+                table_section = "\n\n### Students Flagged for Follow-Up Action\n" + "\n".join(table_lines)
+            elif compulsory == 0:
+                table_section = f"\n\n*Zero students are currently flagged as compulsory for VT follow-up. All {total_evaluated} evaluated students have cleared MST or are excused.*"
+
+            cls_suffix = f" for {target_class}" if target_class else ""
+            content = (
+                f"### Vocational Training (VT) / Follow-up Status Overview{cls_suffix}\n\n"
+                f"- **Total Students Evaluated**: `{total_evaluated}`\n"
+                f"- **Compulsory Follow-Up** (Absent in both MST-1 & MST-2): `{compulsory}`\n"
+                f"- **Completed & Exempted** (Cleared MST): `{not_required + completed}`\n"
+                f"- **Under Review** (Pending roll-call data): `{under_review}`\n"
+                f"- **Excused / Approved** (Authorized overrides): `{excused}`"
+                f"{table_section}"
+            )
+            return {"type": "answer", "content": content}
 
         # Check for Duty roster queries
         if any(w in msg for w in ["duty", "duties", "invigilat", "roster", "schedule"]):
@@ -831,14 +857,16 @@ def _heuristic_answer(message: str, db: Session) -> dict:
         if rows:
             total_eligible = sum(dict(r._mapping).get("eligible_count", 0) for r in rows)
             total_ineligible = sum(dict(r._mapping).get("ineligible_count", 0) for r in rows)
-            table_lines = ["| Class | Exam | Eligible | Ineligible | Missing Records |", "| :--- | :--- | :--- | :--- | :--- |"]
+            total_missing = sum(dict(r._mapping).get("missing_count", 0) for r in rows)
+            table_lines = ["| Class | Exam | Eligible Students | Ineligible (<45%) | Pending Attendance |", "| :--- | :--- | :--- | :--- | :--- |"]
             for r in rows:
                 m = dict(r._mapping)
-                table_lines.append(f"| {m['class_name']} | {m['mst_label']} | **{m['eligible_count']}** | {m['ineligible_count']} | {m['missing_count']} |")
+                table_lines.append(f"| **{m['class_name']}** | {m['mst_label']} | **{m['eligible_count']}** eligible | {m['ineligible_count']} ineligible | {m['missing_count']} pending |")
             content = (
-                f"### MST Eligibility Overview\n\n"
-                f"- **Total Eligible Students**: `{total_eligible}`\n"
-                f"- **Total Ineligible Students**: `{total_ineligible}`\n\n" +
+                f"### Examination Eligibility Summary\n\n"
+                f"- **Total Eligible Records**: `{total_eligible}`\n"
+                f"- **Total Ineligible Records**: `{total_ineligible}`\n"
+                f"- **Pending Attendance Records**: `{total_missing}`\n\n" +
                 "\n".join(table_lines)
             )
             return {"type": "answer", "content": content}

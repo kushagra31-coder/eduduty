@@ -1772,7 +1772,7 @@ def follow_up_stats(
 
 
 class FollowUpRecalcIn(BaseModel):
-    class_id: int = None
+    class_id: Optional[int] = None
 
 @app.post("/follow-up/recalculate")
 def recalculate_follow_ups(
@@ -2372,15 +2372,13 @@ async def upload_timetable_image(
     if not cls:
         if "ci 2" in filename or "ci-2" in filename or "csit 2" in filename or "csit2" in filename or "ci2" in filename:
             cls = db.query(models.Class).filter(models.Class.name.ilike("%CI-2%")).first()
-        elif "cy" in filename:
+        elif "cy" in filename or "cyber" in filename:
             cls = db.query(models.Class).filter(models.Class.name.ilike("%CY%")).first()
             if not cls:
                 cls = models.Class(name="CY", branch="Cyber Security", year=year or 2)
                 db.add(cls)
                 db.commit()
                 db.refresh(cls)
-        elif "ci 3" in filename or "ci-3" in filename:
-            cls = db.query(models.Class).filter(models.Class.name.ilike("%CI-3%")).first()
         else:
             cls = db.query(models.Class).filter(models.Class.name.ilike("%CI-1%")).first()
 
@@ -2565,7 +2563,7 @@ def reset_system_data(
 ):
     """
     Wipes legacy seed and cached demo data (old CI21, dummy students, duplicate exams)
-    and initializes clean distinct classes: CI-1, CI-2, CI-3.
+    and initializes clean distinct classes: CI-1, CI-2, CY (Cyber Security).
     Prepares system for fresh user spreadsheet uploads.
     """
     try:
