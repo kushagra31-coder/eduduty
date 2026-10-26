@@ -25,6 +25,7 @@ SELECT
     s.roll_number,
     s.name AS student_name,
     c.name AS class_name,
+    c.year AS class_year,
     e1.label AS mst_1_label,
     e2.label AS mst_2_label,
     fs.mst_1_appeared,
@@ -47,7 +48,7 @@ def _ensure_ai_views():
         views = {
             "v_vt_follow_up_status": _FOLLOW_UP_VIEW_BODY,
             "ai_eligibility_summary": """
-                SELECT c.name AS class_name, e.label AS mst_label,
+                SELECT c.name AS class_name, c.year AS class_year, e.label AS mst_label, e.id AS mst_exam_id,
                 SUM(CASE WHEN me.status = 'Eligible' THEN 1 ELSE 0 END) AS eligible_count,
                 SUM(CASE WHEN me.status = 'Not eligible' THEN 1 ELSE 0 END) AS ineligible_count,
                 SUM(CASE WHEN me.status = 'Missing' THEN 1 ELSE 0 END) AS missing_count
@@ -55,10 +56,10 @@ def _ensure_ai_views():
                 JOIN students s ON s.id = me.student_id
                 JOIN classes c ON c.id = s.class_id
                 JOIN mst_exams e ON e.id = me.mst_exam_id
-                GROUP BY c.name, e.label
+                GROUP BY c.name, c.year, e.id, e.label
             """,
             "ai_attendance_summary": """
-                SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
+                SELECT c.name AS class_name, c.year AS class_year, s.roll_number, s.name AS student_name,
                 me.overall_pct, me.lowest_subject_pct,
                 me.mst_exam_id, e.label AS mst_label
                 FROM mst_eligibility me
@@ -67,7 +68,7 @@ def _ensure_ai_views():
                 LEFT JOIN mst_exams e ON e.id = me.mst_exam_id
             """,
             "ai_vt_candidates": """
-                SELECT c.name AS class_name, s.roll_number, s.name AS student_name,
+                SELECT c.name AS class_name, c.year AS class_year, s.roll_number, s.name AS student_name,
                 CASE WHEN fs.mst_1_appeared IS NULL THEN 'Missing' WHEN fs.mst_1_appeared THEN 'Present' ELSE 'Absent' END AS mst1_status,
                 CASE WHEN fs.mst_2_appeared IS NULL THEN 'Missing' WHEN fs.mst_2_appeared THEN 'Present' ELSE 'Absent' END AS mst2_status
                 FROM follow_up_statuses fs
@@ -1260,7 +1261,25 @@ def list_mst_exams(
     user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db)
 ):
-    return db.query(models.MstExam).order_by(models.MstExam.id.desc()).all()
+    exams = db.query(models.MstExam).order_by(models.MstExam.id.asc()).all()
+    results = []
+    for e in exams:
+        cls = db.query(models.Class).filter_by(id=e.class_id).first() if e.class_id else None
+        cls_name = cls.name if cls else "All Classes"
+        year = cls.year if cls else None
+        cls_label = f"{cls.name} (Yr {cls.year})" if (cls and "Yr" not in cls.name and cls.year) else (cls.name if cls else "All Classes")
+        display_name = f"{e.label} · {cls_label}"
+        results.append(schemas.MstExamOut(
+            id=e.id,
+            label=e.label,
+            exam_date=e.exam_date,
+            time_slot=e.time_slot,
+            class_id=e.class_id,
+            class_name=cls_name,
+            year=year,
+            display_name=display_name
+        ))
+    return results
 
 
 @app.post("/mst/exams", response_model=schemas.MstExamOut)
@@ -1274,7 +1293,21 @@ def create_mst_exam(
     db.add(exam)
     db.commit()
     db.refresh(exam)
-    return exam
+    cls = db.query(models.Class).filter_by(id=exam.class_id).first() if exam.class_id else None
+    cls_name = cls.name if cls else "All Classes"
+    year = cls.year if cls else None
+    cls_label = f"{cls.name} (Yr {cls.year})" if (cls and "Yr" not in cls.name and cls.year) else (cls.name if cls else "All Classes")
+    display_name = f"{exam.label} · {cls_label}"
+    return schemas.MstExamOut(
+        id=exam.id,
+        label=exam.label,
+        exam_date=exam.exam_date,
+        time_slot=exam.time_slot,
+        class_id=exam.class_id,
+        class_name=cls_name,
+        year=year,
+        display_name=display_name
+    )
 
 
 @app.get("/rooms", response_model=list[schemas.RoomOut])
@@ -1660,6 +1693,86 @@ def mark_attendance_bulk(
         "status": req.status,
         "student_ids": marked_student_ids,
         "skipped": skipped,
+    }
+
+
+@app.post("/mst/attendance/submit", response_model=schemas.AttendanceSubmitOut)
+def submit_attendance(
+    req: schemas.AttendanceSubmitIn,
+    user: models.User = Depends(auth.require_role("invigilator", "coordinator", "hod")),
+    db: Session = Depends(get_db)
+):
+    """
+    Submits and finalizes attendance for an exam session.
+    Persists any pending status updates, triggers full VT / follow-up recalculation
+    for all students, and logs the submission audit event.
+    """
+    exam = db.query(models.MstExam).filter_by(id=req.mst_exam_id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    now = _dt.datetime.utcnow()
+    if req.records:
+        for sid_raw, status in req.records.items():
+            sid = int(sid_raw)
+            if status in ("Present", "Absent"):
+                att = db.query(models.MstAttempt).filter_by(
+                    mst_exam_id=req.mst_exam_id, student_id=sid
+                ).first()
+                if not att:
+                    att = models.MstAttempt(
+                        mst_exam_id=req.mst_exam_id,
+                        student_id=sid,
+                        status=status,
+                        marked_by=user.id,
+                        marked_at=now,
+                    )
+                    db.add(att)
+                else:
+                    att.status = status
+                    att.marked_by = user.id
+                    att.marked_at = now
+        db.commit()
+
+    attempts = db.query(models.MstAttempt).filter_by(mst_exam_id=req.mst_exam_id).all()
+    present_count = sum(1 for a in attempts if a.status == "Present")
+    absent_count = sum(1 for a in attempts if a.status == "Absent")
+    marked_sids = [a.student_id for a in attempts if a.status in ("Present", "Absent")]
+
+    if exam.class_id:
+        total_enrolled = db.query(models.Student).filter_by(class_id=exam.class_id, active=True).count()
+    else:
+        total_enrolled = len(attempts)
+
+    # Recalculate follow-up / VT rules for all enrolled students in this exam's class
+    vt_recalculated = 0
+    enrolled_sids = [s.id for s in db.query(models.Student).filter_by(class_id=exam.class_id, active=True).all()] if exam.class_id else marked_sids
+    for sid in enrolled_sids:
+        crud.recalculate_follow_up(db, sid)
+        vt_recalculated += 1
+
+    # Log submission audit
+    db.add(models.AuditLog(
+        table_name="mst_attempts",
+        record_id=req.mst_exam_id,
+        field_changed="submit_attendance",
+        old_value=None,
+        new_value=f"Submitted: {present_count} Present, {absent_count} Absent",
+        reason=f"Attendance submitted and finalized by {user.name} ({user.role})",
+        changed_by=user.id,
+    ))
+    db.commit()
+
+    return {
+        "success": True,
+        "mst_exam_id": req.mst_exam_id,
+        "total_enrolled": total_enrolled,
+        "marked_count": len(marked_sids),
+        "present_count": present_count,
+        "absent_count": absent_count,
+        "unmarked_count": max(0, total_enrolled - len(marked_sids)),
+        "vt_recalculated": vt_recalculated,
+        "message": f"Successfully submitted attendance for {exam.label}: {present_count} Present, {absent_count} Absent. VT compliance recalculated."
     }
 
 

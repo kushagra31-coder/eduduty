@@ -21,7 +21,7 @@ import {
 
 const API = "/api"
 
-type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null }
+type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null; class_name?: string | null; year?: number | null; display_name?: string | null }
 type Room = { id: number; room_number: string; capacity: number | null }
 type SeatStudent = { id: number; roll_number: string; name: string; batch_number: number | null; status?: string | null }
 type Seat = {
@@ -448,15 +448,15 @@ export default function SeatingTrackerPage() {
         <div className="flex flex-wrap items-center gap-2.5">
           {/* Exam Selector */}
           <Select value={examId != null ? String(examId) : ""} onValueChange={(v) => { if (v) setExamId(Number(v)) }}>
-            <SelectTrigger className="min-w-[230px] sm:w-[280px] h-9 text-xs font-medium shadow-sm">
+            <SelectTrigger className="min-w-[280px] sm:w-[320px] h-9 text-xs font-medium shadow-sm">
               <SelectValue placeholder="Select Exam">
-                {exam ? `${exam.label} ${exam.exam_date ? `(${exam.exam_date})` : ""}` : "Select Exam"}
+                {exam ? `${exam.display_name || exam.label} ${exam.exam_date ? `(${exam.exam_date})` : ""}` : "Select Exam"}
               </SelectValue>
             </SelectTrigger>
             <SelectContent className="z-50 min-w-[280px] bg-popover/95 backdrop-blur-md shadow-xl border border-border">
               {exams.map((e) => (
                 <SelectItem key={e.id} value={String(e.id)} className="text-xs py-1.5 cursor-pointer">
-                  <span className="font-semibold">{e.label}</span>
+                  <span className="font-semibold">{e.display_name || e.label}</span>
                   {e.exam_date && <span className="text-muted-foreground ml-1.5 font-mono text-[11px]">({e.exam_date})</span>}
                 </SelectItem>
               ))}

@@ -16,7 +16,7 @@ import {
   ChevronRight, Edit3, Trash2
 } from 'lucide-react'
 
-type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null }
+type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null; class_name?: string | null; year?: number | null; display_name?: string | null }
 
 type Faculty = {
   id: number
@@ -447,7 +447,7 @@ export default function DutiesPage() {
                         />
                         <div className="min-w-0 flex-1">
                           <div className="text-xs font-bold font-mono text-foreground flex items-center justify-between">
-                            <span>{e.label}</span>
+                            <span>{e.display_name || e.label}</span>
                             {!canSchedule && <Badge variant="secondary" className="text-[9px]">no slot</Badge>}
                           </div>
                           <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-1">
@@ -689,13 +689,13 @@ export default function DutiesPage() {
                 value={activeExamId != null ? String(activeExamId) : ""}
                 onValueChange={(v) => setActiveExamId(Number(v))}
               >
-                <SelectTrigger className="w-[200px] h-9 text-xs font-medium">
+                <SelectTrigger className="min-w-[260px] h-9 text-xs font-medium">
                   <SelectValue placeholder="Pick Exam" />
                 </SelectTrigger>
                 <SelectContent>
                   {exams.map((e) => (
                     <SelectItem key={e.id} value={String(e.id)} className="text-xs">
-                      <span className="font-semibold">{e.label}</span>
+                      <span className="font-semibold">{e.display_name || e.label}</span>
                       {e.exam_date && <span className="text-muted-foreground ml-1.5 font-mono">({e.exam_date})</span>}
                     </SelectItem>
                   ))}

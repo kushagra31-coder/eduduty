@@ -32,11 +32,14 @@ def reset_to_fresh_state(preserve_rooms_and_faculty: bool = True):
             db.query(models.Faculty).delete()
         db.commit()
 
-        # 2. Seed clean, distinct classes: CI-1, CI-2, CY
+        # 2. Seed clean, distinct classes for 2nd and 3rd Year: CI-1, CI-2, CY
         classes_data = [
             {"id": 1, "name": "CI-1", "branch": "Computer Science (CI-1)", "year": 2, "section": "A"},
             {"id": 2, "name": "CI-2", "branch": "Computer Science (CI-2)", "year": 2, "section": "B"},
             {"id": 3, "name": "CY", "branch": "Cyber Security", "year": 2, "section": "Cyber"},
+            {"id": 4, "name": "CI-1 (Yr 3)", "branch": "Computer Science (CI-1)", "year": 3, "section": "A"},
+            {"id": 5, "name": "CI-2 (Yr 3)", "branch": "Computer Science (CI-2)", "year": 3, "section": "B"},
+            {"id": 6, "name": "CY (Yr 3)", "branch": "Cyber Security", "year": 3, "section": "Cyber"},
         ]
         created_classes = []
         for c in classes_data:
@@ -105,12 +108,12 @@ def reset_to_fresh_state(preserve_rooms_and_faculty: bool = True):
         db.commit()
 
         print("Data successfully reset!")
-        print("Classes available: CI-1, CI-2, CY (Cyber Security)")
+        print("Classes available: CI-1, CI-2, CY (2nd & 3rd Year)")
         print("Students count: 0 (Ready for user upload)")
         print("Attendance records: 0")
         return {
             "status": "success",
-            "message": "System reset successfully. Initialized clean classes CI-1, CI-2, CY. All demo data wiped.",
+            "message": "System reset successfully. Initialized clean classes CI-1, CI-2, CY for 2nd and 3rd Year. All demo data wiped.",
             "classes": [c["name"] for c in classes_data],
             "students_count": 0,
             "attendance_count": 0

@@ -167,6 +167,9 @@ class MstExamOut(BaseModel):
     exam_date: Optional[date] = None
     time_slot: Optional[str] = None
     class_id: Optional[int] = None
+    class_name: Optional[str] = None
+    year: Optional[int] = None
+    display_name: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -228,6 +231,22 @@ class AttendanceMarkBulkOut(BaseModel):
     status: str
     student_ids: list[int]
     skipped: list[dict] = []
+
+class AttendanceSubmitIn(BaseModel):
+    mst_exam_id: int
+    # Optional dictionary mapping student_id -> "Present" | "Absent"
+    records: Optional[dict[int, str]] = None
+
+class AttendanceSubmitOut(BaseModel):
+    success: bool
+    mst_exam_id: int
+    total_enrolled: int
+    marked_count: int
+    present_count: int
+    absent_count: int
+    unmarked_count: int
+    vt_recalculated: int
+    message: str
 
 class DutyAssignIn(BaseModel):
     mst_exam_id: int

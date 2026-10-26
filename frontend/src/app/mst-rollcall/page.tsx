@@ -15,7 +15,16 @@ import {
 
 const API = "/api"
 
-type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null }
+type Exam = {
+  id: number
+  label: string
+  exam_date: string | null
+  time_slot: string | null
+  class_id: number | null
+  class_name?: string | null
+  year?: number | null
+  display_name?: string | null
+}
 type Student = {
   student_id: number; roll_number: string; name: string
   batch_number: number | null; class_name: string; status: string | null
@@ -56,6 +65,7 @@ export default function RollCallPage() {
   const [search,   setSearch]   = useState("")
   const [filter,   setFilter]   = useState<"all" | "present" | "absent" | "unmarked">("all")
   const [loading,  setLoading]  = useState(false)
+  const [submitting, setSubmitting] = useState(false)
   const [saving,   setSaving]   = useState<Record<number, boolean>>({})
   const [error, setError] = useState<string | null>(null)
   const { toast } = useToast()
@@ -136,6 +146,35 @@ export default function RollCallPage() {
     }
   }
 
+  // Submit and finalize attendance to backend + trigger VT recalculation
+  async function submitAttendance() {
+    if (!examId) return
+    setSubmitting(true)
+    try {
+      const res = await apiFetch("/mst/attendance/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mst_exam_id: examId,
+          records: marks,
+        }),
+      })
+      toast({
+        title: "Attendance Submitted Successfully",
+        description: `${res.present_count} Present, ${res.absent_count} Absent. VT compliance & AI assistant synced (${res.vt_recalculated} records updated).`,
+      })
+      await loadRollcall(examId)
+    } catch (e) {
+      toast({
+        title: "Attendance submission failed",
+        description: (e as Error).message,
+        variant: "destructive",
+      })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
   // Counts
   const counts = useMemo(() => {
     let present = 0, absent = 0, unmarked = 0
@@ -177,13 +216,13 @@ export default function RollCallPage() {
       {/* Exam selector */}
       <div className="flex flex-wrap items-center gap-3">
         <Select value={examId ? String(examId) : ""} onValueChange={v => setExamId(Number(v))}>
-          <SelectTrigger id="rollcall-exam-select" className="w-72">
+          <SelectTrigger id="rollcall-exam-select" className="min-w-[320px] max-w-md">
             <SelectValue placeholder="Pick an exam…" />
           </SelectTrigger>
           <SelectContent>
             {exams.map(e => (
               <SelectItem key={e.id} value={String(e.id)}>
-                {e.label} {e.exam_date ? `· ${e.exam_date}` : ""} {e.time_slot ? `· ${e.time_slot}` : ""}
+                {e.display_name || `${e.label} · ${e.class_name || ""} (Yr ${e.year || ""})`} {e.exam_date ? `· ${e.exam_date}` : ""} {e.time_slot ? `· ${e.time_slot}` : ""}
               </SelectItem>
             ))}
           </SelectContent>
@@ -206,7 +245,7 @@ export default function RollCallPage() {
       {examId && (
         <>
           {/* Stats bar */}
-          <div className="grid grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             {[
               { label: "Total", value: counts.total,    icon: <Users className="h-4 w-4" />,        color: "" },
               { label: "Present", value: counts.present, icon: <UserCheck className="h-4 w-4" />,   color: "text-emerald-600 dark:text-emerald-400" },
@@ -223,15 +262,15 @@ export default function RollCallPage() {
             ))}
           </div>
 
-          {/* Filter + search + bulk actions */}
-          <div className="flex flex-wrap items-center gap-3">
+          {/* Sticky filter + search + bulk actions + SUBMIT ATTENDANCE */}
+          <div className="sticky top-0 z-20 bg-background/95 backdrop-blur-sm py-2.5 border-y flex flex-wrap items-center gap-3">
             {(["all", "present", "absent", "unmarked"] as const).map(f => (
               <button
                 key={f}
                 onClick={() => setFilter(f)}
                 className={`rounded-full border px-3 py-1 text-xs font-medium capitalize transition-all ${
                   filter === f
-                    ? "bg-foreground text-background border-foreground"
+                    ? "bg-foreground text-background border-foreground shadow-sm"
                     : "border-muted-foreground/30 text-muted-foreground hover:border-foreground/50"
                 }`}
               >
@@ -239,20 +278,32 @@ export default function RollCallPage() {
               </button>
             ))}
 
-            <div className="relative ml-auto">
+            <div className="relative">
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
               <Input
                 id="rollcall-search"
                 placeholder="Roll or name…"
                 value={search}
                 onChange={e => setSearch(e.target.value)}
-                className="pl-8 h-8 w-44 text-sm"
+                className="pl-8 h-8 w-40 md:w-52 text-sm"
               />
             </div>
 
             <Button variant="outline" size="sm" className="h-8" onClick={markAllPresent}>
               <CheckCircle2 className="h-3.5 w-3.5 mr-1.5 text-emerald-500" />
               All Present
+            </Button>
+
+            {/* Main Submit Attendance Button */}
+            <Button
+              id="submit-attendance-btn"
+              size="sm"
+              className="h-8 ml-auto bg-emerald-600 hover:bg-emerald-700 text-white font-semibold gap-1.5 shadow-sm px-4"
+              onClick={submitAttendance}
+              disabled={submitting || students.length === 0}
+            >
+              {submitting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+              {submitting ? "Submitting..." : `Submit Attendance (${counts.present + counts.absent}/${counts.total})`}
             </Button>
           </div>
 
@@ -306,15 +357,15 @@ export default function RollCallPage() {
               </Button>
             </div>
           ) : (
-            /* Roll call list */
-            <div className="rounded-xl border overflow-hidden">
-              <div className="grid grid-cols-[auto_1fr_auto_auto] text-xs font-semibold text-muted-foreground uppercase tracking-wide bg-muted/40 border-b px-4 py-2 gap-4">
+            /* Roll call list with smooth scrolling and sticky header */
+            <div className="rounded-xl border bg-card/50 overflow-hidden shadow-sm">
+              <div className="grid grid-cols-[auto_1fr_auto_auto] text-xs font-semibold text-muted-foreground uppercase tracking-wide bg-muted/70 border-b px-4 py-3 gap-4">
                 <span>#</span>
                 <span>Student</span>
                 <span>Batch</span>
                 <span className="text-right pr-2">Status</span>
               </div>
-              <div className="divide-y max-h-[calc(100vh-28rem)] overflow-y-auto">
+              <div className="divide-y max-h-[600px] overflow-y-auto overscroll-contain">
                 {filtered.map((s, i) => {
                   const mark = marks[s.student_id] ?? null
                   const isSaving = saving[s.student_id]
@@ -324,7 +375,7 @@ export default function RollCallPage() {
                       id={`rollcall-row-${s.roll_number}`}
                       onClick={() => toggle(s.student_id)}
                       disabled={isSaving}
-                      className={`w-full grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-3 text-left transition-all active:scale-[0.99] ${markStyle(mark)} ${isSaving ? "opacity-60" : ""}`}
+                      className={`w-full grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-3 text-left transition-colors ${markStyle(mark)} ${isSaving ? "opacity-60" : ""}`}
                     >
                       {/* Row number + status icon */}
                       <div className="flex items-center gap-2 min-w-[2.5rem]">
@@ -354,13 +405,29 @@ export default function RollCallPage() {
 
                       {/* Status badge */}
                       <div className="pr-2">
-                        {mark === "Present" && <Badge className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20">Present</Badge>}
-                        {mark === "Absent"  && <Badge className="bg-red-500/20 text-red-700 dark:text-red-400 border-red-500/30 hover:bg-red-500/20">Absent</Badge>}
+                        {mark === "Present" && <Badge className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20 font-medium">Present</Badge>}
+                        {mark === "Absent"  && <Badge className="bg-red-500/20 text-red-700 dark:text-red-400 border-red-500/30 hover:bg-red-500/20 font-medium">Absent</Badge>}
                         {!mark && <span className="text-xs text-muted-foreground italic">Tap to mark</span>}
                       </div>
                     </button>
                   )
                 })}
+              </div>
+
+              {/* Bottom submission footer */}
+              <div className="p-3 bg-muted/30 border-t flex flex-wrap items-center justify-between gap-3">
+                <span className="text-xs text-muted-foreground font-medium">
+                  {counts.present} Present · {counts.absent} Absent · {counts.unmarked} Unmarked
+                </span>
+                <Button
+                  size="sm"
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold gap-1.5 shadow-sm"
+                  onClick={submitAttendance}
+                  disabled={submitting || students.length === 0}
+                >
+                  {submitting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                  Submit & Sync VT Compliance
+                </Button>
               </div>
             </div>
           )}

@@ -164,14 +164,22 @@ function UploadTimetableModal({
         <div className="space-y-4 py-2">
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Target Class (Optional)</label>
-            <Select value={classId} onValueChange={v => setClassId(v ?? "")}>
+            <Select value={classId} onValueChange={v => {
+              const val = v ?? ""
+              setClassId(val)
+              const cls = classes.find(c => String(c.id) === val)
+              if (cls) {
+                if (cls.year === 3) setSemester("V")
+                else if (cls.year === 2) setSemester("III")
+              }
+            }}>
               <SelectTrigger>
                 <SelectValue placeholder="Auto-detect from image or select class..." />
               </SelectTrigger>
               <SelectContent>
                 {classes.map(c => (
                   <SelectItem key={c.id} value={String(c.id)}>
-                    {c.name} · Year {c.year} ({c.branch})
+                    {c.name.includes("Yr") ? c.name : `${c.name} · Year ${c.year}`} ({c.branch})
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -457,14 +465,25 @@ function TimetableInputTab({
       <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1">
           <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Class</label>
-          <Select onValueChange={v => setClassId(Number(v))}>
-            <SelectTrigger id="tt-class-select" className="w-52">
+          <Select onValueChange={v => {
+            const cid = Number(v)
+            setClassId(cid)
+            const cls = classes.find(c => c.id === cid)
+            if (cls) {
+              if (cls.year === 3 && (semester === "III" || semester === "IV" || !semester)) {
+                setSemester("V")
+              } else if (cls.year === 2 && (semester === "V" || semester === "VI" || !semester)) {
+                setSemester("III")
+              }
+            }
+          }}>
+            <SelectTrigger id="tt-class-select" className="w-56">
               <SelectValue placeholder="Select class..." />
             </SelectTrigger>
             <SelectContent>
               {classes.map(c => (
                 <SelectItem key={c.id} value={String(c.id)}>
-                  {c.name} · Yr {c.year}
+                  {c.name.includes("Yr") ? c.name : `${c.name} · Yr ${c.year}`}
                 </SelectItem>
               ))}
             </SelectContent>

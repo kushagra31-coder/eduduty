@@ -101,33 +101,36 @@ READ_SYSTEM_PROMPT = """
 You are a read-only SQL assistant for an MST (midterm exam) operations database.
 You may ONLY query these views (no other tables):
 
-- ai_eligibility_summary(class_name, mst_label, eligible_count, ineligible_count, missing_count)
-- ai_attendance_summary(class_name, roll_number, student_name, overall_pct, lowest_subject_pct, mst_exam_id, mst_label)
-- ai_vt_candidates(class_name, roll_number, student_name, mst1_status, mst2_status)
+- ai_eligibility_summary(class_name, class_year, mst_label, mst_exam_id, eligible_count, ineligible_count, missing_count)
+- ai_attendance_summary(class_name, class_year, roll_number, student_name, overall_pct, lowest_subject_pct, mst_exam_id, mst_label)
+- ai_vt_candidates(class_name, class_year, roll_number, student_name, mst1_status, mst2_status)
 - ai_duty_roster(mst_label, exam_date, room_number, faculty_name, duty_status)
-- v_vt_follow_up_status(roll_number, student_name, class_name, mst_1_label, mst_2_label,
+- v_vt_follow_up_status(roll_number, student_name, class_name, class_year, mst_1_label, mst_2_label,
     mst_1_appeared, mst_2_appeared, calculated_status, final_status, overridden,
     override_reason, rule_version, updated_at)
   calculated_status/final_status are one of: not_required, compulsory, under_review, excused, completed.
   mst_1_appeared/mst_2_appeared are TRUE (present), FALSE (absent), or NULL (missing record).
+  class_year is 2 for 2nd Year (Semester 3/4) and 3 for 3rd Year (Semester 5/6).
+  class_name is 'CI-1', 'CI-2', 'CY', or 'CI-1 (Yr 3)', etc.
 
 Rules:
 1. Only generate SELECT statements.
 2. No subqueries that touch tables not in the list above.
 3. Return ONLY the SQL, nothing else. No markdown, no explanation.
+4. Distinguish clearly between MST-1 and MST-2, between classes (CI-1, CI-2, CY), and between years (class_year=2 vs class_year=3).
 
 Examples:
-Q: How many CI-1 students are eligible for MST-1?
-A: SELECT eligible_count FROM ai_eligibility_summary WHERE class_name='CI-1' AND mst_label='MST-1';
+Q: How many 2nd year CI-1 students are eligible for MST-1?
+A: SELECT eligible_count FROM ai_eligibility_summary WHERE class_name LIKE '%CI-1%' AND class_year=2 AND mst_label='MST-1';
 
 Q: List borderline students in CI-2
-A: SELECT roll_number, student_name, overall_pct FROM ai_attendance_summary WHERE class_name='CI-2' AND overall_pct >= 45 AND overall_pct < 50;
+A: SELECT roll_number, student_name, overall_pct FROM ai_attendance_summary WHERE class_name LIKE '%CI-2%' AND overall_pct >= 45 AND overall_pct < 50;
 
-Q: How many CI-1 students are compulsory for VT?
-A: SELECT COUNT(*) FROM v_vt_follow_up_status WHERE class_name='CI-1' AND final_status='compulsory';
+Q: Who is absent in both MST-1 and MST-2 in 2nd year?
+A: SELECT roll_number, student_name, class_name FROM v_vt_follow_up_status WHERE class_year=2 AND final_status='compulsory';
 
-Q: Which compulsory VT students have been excused?
-A: SELECT roll_number, student_name, override_reason FROM v_vt_follow_up_status WHERE final_status='excused';
+Q: What are the VT candidate stats for 3rd year?
+A: SELECT final_status, COUNT(*) FROM v_vt_follow_up_status WHERE class_year=3 GROUP BY final_status;
 """
 
 WRITE_SYSTEM_PROMPT = """
@@ -685,11 +688,24 @@ def _fallback_write_intent(message: str, db: Session) -> dict | None:
 
 
 def _heuristic_answer(message: str, db: Session) -> dict:
-    """Accurately answers queries directly from the SQLite views when external LLMs are offline."""
+    """Accurately answers queries directly from the database views with clear distinction of year, class, and exam."""
     msg = message.lower().strip()
 
+    # 1. Parse Year
+    target_year = None
+    if any(w in msg for w in ["3rd year", "year 3", "yr 3", "3rd yr", "sem 5", "sem v", "semester 5", "semester v"]):
+        target_year = 3
+    elif any(w in msg for w in ["2nd year", "year 2", "yr 2", "2nd yr", "sem 3", "sem iii", "semester 3", "semester iii"]):
+        target_year = 2
+
+    # 2. Parse Exam (MST-1 vs MST-2)
+    target_exam = None
+    if any(w in msg for w in ["mst 2", "mst-2", "mst2", "second mst"]):
+        target_exam = "MST-2"
+    elif any(w in msg for w in ["mst 1", "mst-1", "mst1", "first mst"]):
+        target_exam = "MST-1"
+
     with get_readonly_connection() as conn:
-        # Detect if user mentioned a specific class (e.g. CI-1, CI-2, CSIT-2, CI3, CY)
         classes_with_data = [
             r[0] for r in conn.execute(
                 text("SELECT DISTINCT c.name FROM students s JOIN classes c ON c.id = s.class_id WHERE s.active = 1")
@@ -697,27 +713,34 @@ def _heuristic_answer(message: str, db: Session) -> dict:
         ]
         all_classes_in_db = [r[0] for r in conn.execute(text("SELECT name FROM classes")).fetchall()]
 
+        # 3. Parse Class
         target_class = None
-        for cname in all_classes_in_db:
-            digits = re.findall(r"\d+", cname)
-            synonyms = [cname.lower(), cname.lower().replace("-", " "), cname.lower().replace("-", "")]
-            if digits:
-                num = digits[0]
-                synonyms.extend([f"csit{num}", f"csit {num}", f"csit-{num}", f"ci{num}", f"ci {num}", f"ci-{num}", f"cs{num}", f"cs {num}"])
-            if any(re.search(rf"\b{re.escape(syn)}\b", msg) for syn in synonyms):
-                target_class = cname
-                break
+        if target_year == 3:
+            if any(w in msg for w in ["cyber", "cy"]):
+                target_class = "CY (Yr 3)"
+            elif any(w in msg for w in ["ci 2", "ci-2", "csit 2", "csit-2", "ci2", "csit2"]):
+                target_class = "CI-2 (Yr 3)"
+            elif any(w in msg for w in ["ci 1", "ci-1", "csit 1", "csit-1", "ci1", "csit1"]):
+                target_class = "CI-1 (Yr 3)"
+        else:
+            if any(w in msg for w in ["cyber", "cy"]):
+                target_class = "CY"
+            elif any(w in msg for w in ["ci 2", "ci-2", "csit 2", "csit-2", "ci2", "csit2"]):
+                target_class = "CI-2"
+            elif any(w in msg for w in ["ci 1", "ci-1", "csit 1", "csit-1", "ci1", "csit1"]):
+                target_class = "CI-1"
 
-        # If user explicitly asked for attendance/eligibility/borderline of a class that has NO uploaded attendance data,
-        # inform them clearly instead of returning data from another class!
+        # Missing class attendance guard
         if target_class and target_class not in classes_with_data and not any(w in msg for w in ["timetable", "schedule"]):
             classes_list_str = ", ".join(f"**{c}**" for c in classes_with_data) if classes_with_data else "None"
+            yr_str = f" ({target_year}rd Year)" if target_year == 3 else f" ({target_year}nd Year)" if target_year else ""
             return {
                 "type": "answer",
                 "content": (
-                    f"### ⚠️ No Attendance Data Uploaded for {target_class}\n\n"
-                    f"You requested data for **{target_class}**, but attendance records have **not been uploaded** for {target_class} yet.\n\n"
-                    f"- **Classes currently in database with attendance**: {classes_list_str}\n\n"
+                    f"### ⚠️ No Attendance Data Uploaded for {target_class}{yr_str}\n\n"
+                    f"You requested data for **{target_class}**, but student attendance records have **not been uploaded** for {target_class} yet.\n\n"
+                    f"- **Classes currently in database with uploaded attendance**: {classes_list_str}\n"
+                    f"- **Timetable Data**: Timetable entries are active in the **[Timetable](/timetable)** section.\n\n"
                     f"Please upload the {target_class} Excel attendance sheet on the **[Upload Attendance](/attendance/upload)** page first."
                 )
             }
@@ -738,62 +761,103 @@ def _heuristic_answer(message: str, db: Session) -> dict:
                 ).fetchone()
                 status = elig_row[0] if elig_row else "Unknown"
                 override = " (Overridden)" if elig_row and elig_row[1] else ""
+                yr_val = m.get('class_year', 2)
                 content = (
                     f"### Student Record: {m.get('student_name')} (`{m.get('roll_number')}`)\n\n"
-                    f"- **Class**: {m.get('class_name')}\n"
+                    f"- **Class & Year**: {m.get('class_name')} · Year {yr_val}\n"
                     f"- **Overall Attendance**: `{m.get('overall_pct', 0):.1f}%`\n"
                     f"- **Lowest Subject Attendance**: `{m.get('lowest_subject_pct', 0):.1f}%`\n"
                     f"- **MST Eligibility Status**: **{status}**{override}\n"
                 )
                 return {"type": "answer", "content": content}
 
-        # Check for borderline queries
-        if "borderline" in msg or "border line" in msg:
-            if target_class:
-                rows = conn.execute(
-                    text("SELECT roll_number, student_name, class_name, overall_pct FROM ai_attendance_summary WHERE overall_pct >= 45 AND overall_pct < 50 AND class_name = :cls ORDER BY overall_pct ASC LIMIT 25"),
-                    {"cls": target_class}
-                ).fetchall()
-                if not rows:
-                    rows = conn.execute(
-                        text("SELECT s.roll_number, s.name as student_name, c.name as class_name, me.overall_pct FROM mst_eligibility me JOIN students s ON s.id = me.student_id JOIN classes c ON c.id = s.class_id WHERE me.status = 'Borderline' AND c.name = :cls LIMIT 25"),
-                        {"cls": target_class}
-                    ).fetchall()
-            else:
-                rows = conn.execute(
-                    text("SELECT roll_number, student_name, class_name, overall_pct FROM ai_attendance_summary WHERE overall_pct >= 45 AND overall_pct < 50 ORDER BY overall_pct ASC LIMIT 25")
-                ).fetchall()
-                if not rows:
-                    rows = conn.execute(
-                        text("SELECT s.roll_number, s.name as student_name, c.name as class_name, me.overall_pct FROM mst_eligibility me JOIN students s ON s.id = me.student_id JOIN classes c ON c.id = s.class_id WHERE me.status = 'Borderline' LIMIT 25")
-                    ).fetchall()
-
+        # Check for teaching / timetable clashes during exams
+        if any(w in msg for w in ["teaching", "clash", "free faculty", "available faculty", "duty free"]):
+            rows = conn.execute(
+                text("""
+                    SELECT ft.day_of_week, ft.period_start, ft.period_end, ft.subject_code, ft.room,
+                           c.name AS class_name, ft.year, f.name AS faculty_name
+                    FROM faculty_timetable ft
+                    JOIN faculty f ON f.id = ft.faculty_id
+                    JOIN classes c ON c.id = ft.class_id
+                    ORDER BY ft.day_of_week, ft.period_start
+                    LIMIT 20
+                """)
+            ).fetchall()
             if rows:
-                table_lines = ["| Roll Number | Student Name | Class | Attendance |", "| :--- | :--- | :--- | :--- |"]
+                table_lines = ["| Faculty | Class & Year | Day | Time Slot | Subject | Room |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
                 for r in rows:
                     m = dict(r._mapping)
-                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | **{m['overall_pct']:.1f}%** |")
-                cls_title = f" in {target_class}" if target_class else ""
+                    table_lines.append(f"| **{m['faculty_name']}** | {m['class_name']} (Yr {m['year']}) | {m['day_of_week']} | {m['period_start']}-{m['period_end']} | {m['subject_code']} | {m.get('room') or '—'} |")
                 content = (
-                    f"### Borderline Students (45% - 49.9% Attendance){cls_title}\n\n"
+                    f"### Faculty Teaching Schedule & Exam Clash Matrix\n\n"
+                    f"The duty scheduler automatically cross-references these teaching periods to prevent booking faculty who are actively teaching other classes during exam hours:\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+
+        # Check for borderline queries
+        if "borderline" in msg or "border line" in msg:
+            conds = ["overall_pct >= 45", "overall_pct < 50"]
+            params = {}
+            if target_class:
+                conds.append("class_name = :cls")
+                params["cls"] = target_class
+            if target_year:
+                conds.append("class_year = :yr")
+                params["yr"] = target_year
+            if target_exam:
+                conds.append("mst_label = :exam")
+                params["exam"] = target_exam
+
+            where_str = " WHERE " + " AND ".join(conds)
+            rows = conn.execute(
+                text(f"SELECT roll_number, student_name, class_name, class_year, mst_label, overall_pct FROM ai_attendance_summary{where_str} ORDER BY overall_pct ASC LIMIT 30"),
+                params
+            ).fetchall()
+
+            if rows:
+                table_lines = ["| Roll Number | Student Name | Class | Year | Exam | Attendance |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | Yr {m['class_year']} | {m.get('mst_label') or 'MST-1'} | **{m['overall_pct']:.1f}%** |")
+                sub_title_parts = []
+                if target_class: sub_title_parts.append(target_class)
+                if target_year: sub_title_parts.append(f"Year {target_year}")
+                if target_exam: sub_title_parts.append(target_exam)
+                sub_title = f" ({', '.join(sub_title_parts)})" if sub_title_parts else ""
+                content = (
+                    f"### Borderline Students (45% - 49.9% Attendance){sub_title}\n\n"
                     f"Found **{len(rows)}** borderline candidates requiring departmental review:\n\n" +
                     "\n".join(table_lines)
                 )
                 return {"type": "answer", "content": content}
-            cls_msg = f" for class {target_class}" if target_class else ""
-            return {"type": "answer", "content": f"No borderline students found with attendance between 45% and 50%{cls_msg}."}
+            desc_parts = []
+            if target_class: desc_parts.append(f"for {target_class}")
+            if target_year: desc_parts.append(f"in Year {target_year}")
+            if target_exam: desc_parts.append(f"for {target_exam}")
+            desc = " " + " ".join(desc_parts) if desc_parts else ""
+            return {"type": "answer", "content": f"No borderline students found with attendance between 45% and 50%{desc}."}
 
         # Check for VT candidates / remedial queries
         if any(w in msg for w in ["vt", "remedial", "follow-up", "follow up", "candidate"]):
-            where_cls = " WHERE class_name = :cls" if target_class else ""
-            params = {"cls": target_class} if target_class else {}
+            conds = []
+            params = {}
+            if target_class:
+                conds.append("class_name = :cls")
+                params["cls"] = target_class
+            if target_year:
+                conds.append("class_year = :yr")
+                params["yr"] = target_year
+
+            where_str = (" WHERE " + " AND ".join(conds)) if conds else ""
 
             total_evaluated = conn.execute(
-                text(f"SELECT COUNT(*) FROM v_vt_follow_up_status{where_cls}"), params
+                text(f"SELECT COUNT(*) FROM v_vt_follow_up_status{where_str}"), params
             ).scalar() or 0
 
             status_rows = conn.execute(
-                text(f"SELECT final_status, COUNT(*) FROM v_vt_follow_up_status{where_cls} GROUP BY final_status"), params
+                text(f"SELECT final_status, COUNT(*) FROM v_vt_follow_up_status{where_str} GROUP BY final_status"), params
             ).fetchall()
             counts = {r[0]: r[1] for r in status_rows}
 
@@ -803,26 +867,35 @@ def _heuristic_answer(message: str, db: Session) -> dict:
             not_required = counts.get("not_required", 0)
             completed = counts.get("completed", 0)
 
-            # Get students requiring action (compulsory, under_review, excused)
+            action_conds = ["final_status IN ('compulsory', 'under_review', 'excused')"]
+            if target_class: action_conds.append("class_name = :cls")
+            if target_year: action_conds.append("class_year = :yr")
+            action_where = " WHERE " + " AND ".join(action_conds)
+
             action_rows = conn.execute(
-                text(f"SELECT roll_number, student_name, class_name, final_status, override_reason FROM v_vt_follow_up_status WHERE final_status IN ('compulsory', 'under_review', 'excused'){' AND class_name = :cls' if target_class else ''} ORDER BY CASE WHEN final_status = 'compulsory' THEN 1 WHEN final_status = 'excused' THEN 2 ELSE 3 END, roll_number ASC LIMIT 30"),
+                text(f"SELECT roll_number, student_name, class_name, class_year, mst_1_label, mst_2_label, final_status, override_reason FROM v_vt_follow_up_status{action_where} ORDER BY CASE WHEN final_status = 'compulsory' THEN 1 WHEN final_status = 'excused' THEN 2 ELSE 3 END, roll_number ASC LIMIT 30"),
                 params
             ).fetchall()
 
             table_section = ""
             if action_rows:
-                table_lines = ["| Roll Number | Student Name | Class | VT Status | Reason / Notes |", "| :--- | :--- | :--- | :--- | :--- |"]
+                table_lines = ["| Roll Number | Student Name | Class | Year | VT Status | Reason / Notes |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
                 for r in action_rows:
                     m = dict(r._mapping)
                     badge_status = f"**{m['final_status'].upper()}**" if m['final_status'] == 'compulsory' else m['final_status']
-                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | {badge_status} | {m.get('override_reason') or 'Absent in both MST-1 & MST-2'} |")
+                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | Yr {m['class_year']} | {badge_status} | {m.get('override_reason') or 'Absent in both MST-1 & MST-2'} |")
                 table_section = "\n\n### Students Flagged for Follow-Up Action\n" + "\n".join(table_lines)
             elif compulsory == 0:
                 table_section = f"\n\n*Zero students are currently flagged as compulsory for VT follow-up. All {total_evaluated} evaluated students have cleared MST or are excused.*"
 
-            cls_suffix = f" for {target_class}" if target_class else ""
+            title_parts = []
+            if target_class: title_parts.append(target_class)
+            if target_year: title_parts.append(f"Year {target_year}")
+            title_suffix = f" ({', '.join(title_parts)})" if title_parts else ""
+
             content = (
-                f"### Vocational Training (VT) / Follow-up Status Overview{cls_suffix}\n\n"
+                f"### Vocational Training (VT) / Follow-up Status Overview{title_suffix}\n\n"
+                f"- **Rule Engine**: Students absent in **both MST-1 and MST-2** are flagged for compulsory remedial VT.\n"
                 f"- **Total Students Evaluated**: `{total_evaluated}`\n"
                 f"- **Compulsory Follow-Up** (Absent in both MST-1 & MST-2): `{compulsory}`\n"
                 f"- **Completed & Exempted** (Cleared MST): `{not_required + completed}`\n"
@@ -833,7 +906,7 @@ def _heuristic_answer(message: str, db: Session) -> dict:
             return {"type": "answer", "content": content}
 
         # Check for Duty roster queries
-        if any(w in msg for w in ["duty", "duties", "invigilat", "roster", "schedule"]):
+        if any(w in msg for w in ["duty", "duties", "invigilat", "roster"]):
             rows = conn.execute(
                 text("SELECT mst_label, exam_date, room_number, faculty_name, duty_status FROM ai_duty_roster ORDER BY exam_date DESC LIMIT 15")
             ).fetchall()
@@ -851,19 +924,41 @@ def _heuristic_answer(message: str, db: Session) -> dict:
             return {"type": "answer", "content": "No duty assignments have been created yet. Generate them in the Duty Scheduler tab."}
 
         # Check for Eligibility count / general stats
+        conds = []
+        params = {}
+        if target_class:
+            conds.append("class_name = :cls")
+            params["cls"] = target_class
+        if target_year:
+            conds.append("class_year = :yr")
+            params["yr"] = target_year
+        if target_exam:
+            conds.append("mst_label = :exam")
+            params["exam"] = target_exam
+
+        where_str = (" WHERE " + " AND ".join(conds)) if conds else ""
         rows = conn.execute(
-            text("SELECT class_name, mst_label, eligible_count, ineligible_count, missing_count FROM ai_eligibility_summary")
+            text(f"SELECT class_name, class_year, mst_label, eligible_count, ineligible_count, missing_count FROM ai_eligibility_summary{where_str} ORDER BY class_year, class_name, mst_label"),
+            params
         ).fetchall()
+
         if rows:
             total_eligible = sum(dict(r._mapping).get("eligible_count", 0) for r in rows)
             total_ineligible = sum(dict(r._mapping).get("ineligible_count", 0) for r in rows)
             total_missing = sum(dict(r._mapping).get("missing_count", 0) for r in rows)
-            table_lines = ["| Class | Exam | Eligible Students | Ineligible (<45%) | Pending Attendance |", "| :--- | :--- | :--- | :--- | :--- |"]
+            table_lines = ["| Class | Year | Exam | Eligible (>=45%) | Ineligible (<45%) | Pending Attendance |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
             for r in rows:
                 m = dict(r._mapping)
-                table_lines.append(f"| **{m['class_name']}** | {m['mst_label']} | **{m['eligible_count']}** eligible | {m['ineligible_count']} ineligible | {m['missing_count']} pending |")
+                table_lines.append(f"| **{m['class_name']}** | Yr {m['class_year']} | {m['mst_label']} | **{m['eligible_count']}** eligible | {m['ineligible_count']} ineligible | {m['missing_count']} pending |")
+
+            title_parts = []
+            if target_class: title_parts.append(target_class)
+            if target_year: title_parts.append(f"Year {target_year}")
+            if target_exam: title_parts.append(target_exam)
+            title_suffix = f" ({', '.join(title_parts)})" if title_parts else ""
+
             content = (
-                f"### Examination Eligibility Summary\n\n"
+                f"### Examination Eligibility Summary{title_suffix}\n\n"
                 f"- **Total Eligible Records**: `{total_eligible}`\n"
                 f"- **Total Ineligible Records**: `{total_ineligible}`\n"
                 f"- **Pending Attendance Records**: `{total_missing}`\n\n" +
@@ -871,7 +966,7 @@ def _heuristic_answer(message: str, db: Session) -> dict:
             )
             return {"type": "answer", "content": content}
 
-        # Default fallback
+        # Default fallback overview
         total_students = conn.execute(text("SELECT COUNT(*) FROM students")).scalar() or 0
         total_classes = conn.execute(text("SELECT COUNT(*) FROM classes")).scalar() or 0
         total_rooms = conn.execute(text("SELECT COUNT(*) FROM rooms")).scalar() or 0
@@ -879,13 +974,14 @@ def _heuristic_answer(message: str, db: Session) -> dict:
             "type": "answer",
             "content": (
                 f"### MST Operations Portal Assistant\n\n"
-                f"System status: **{total_students} students**, **{total_classes} classes**, and **{total_rooms} examination rooms** loaded.\n\n"
+                f"System status: **{total_students} students**, **{total_classes} classes (2nd & 3rd Year)**, and **{total_rooms} examination rooms** loaded.\n\n"
                 f"You can ask me to:\n"
-                f"- Check eligibility: *'How many students are eligible for MST-1?'*\n"
-                f"- List borderline students: *'List borderline students in CI-2'*\n"
-                f"- Check VT candidates: *'Who are the VT candidates after MST-2?'*\n"
-                f"- Inspect a student: *'Attendance for roll 0827CI241101'*\n"
-                f"- Show invigilation duties: *'Show current duty roster'*"
+                f"- Check eligibility: *'How many students are eligible for MST-1 in CI-1?'*\n"
+                f"- Compare MSTs: *'Show eligibility comparison for MST-1 and MST-2'* \n"
+                f"- List borderline students: *'List borderline students in 2nd year'* \n"
+                f"- Check VT candidates: *'Who are the VT candidates after MST-2 in CI-1?'*\n"
+                f"- Check teaching clashes: *'Show teachers who are teaching other classes during exam'* \n"
+                f"- Inspect a student: *'Attendance for roll 0827CI241001'*"
             )
         }
 
