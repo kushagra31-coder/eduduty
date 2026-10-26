@@ -15,13 +15,13 @@ type ToastOptions = {
  * Uses the module-level toast manager (the same one `<Toaster />`
  * subscribes to), so it never depends on provider context during render.
  */
-export function useToast() {
-  const toast = (opts: ToastOptions) =>
-    toastManager.add({
-      title: opts.title,
-      description: opts.description,
-      type: opts.variant === "destructive" ? "error" : "success",
-    });
+const toast = (opts: ToastOptions) =>
+  toastManager.add({
+    title: opts.title,
+    description: opts.description,
+    type: opts.variant === "destructive" ? "error" : "success",
+  });
 
+export function useToast() {
   return { toast };
 }

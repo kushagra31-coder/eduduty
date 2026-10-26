@@ -20,7 +20,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useToast } from "@/components/ui/use-toast"
 
-type Exam = { id: number; label: string }
+type Exam = { id: number; label: string; exam_date?: string | null }
 
 type EligibilityRecord = {
   id: number
@@ -142,13 +142,18 @@ export default function EligibilityPage() {
         </div>
         <div className="flex items-center gap-2">
           {exams.length > 0 && (
-            <Select value={String(examId)} onValueChange={v => setExamId(Number(v))}>
-              <SelectTrigger className="w-40">
-                <SelectValue placeholder="Select exam" />
+            <Select value={examId ? String(examId) : ""} onValueChange={v => { if (v) setExamId(Number(v)) }}>
+              <SelectTrigger className="min-w-[220px] sm:w-[260px] h-9 text-xs font-medium shadow-sm">
+                <SelectValue placeholder="Select exam">
+                  {selectedExam ? selectedExam.label : "Select exam"}
+                </SelectValue>
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent className="z-50 min-w-[260px] bg-popover/95 backdrop-blur-md shadow-xl border border-border">
                 {exams.map(e => (
-                  <SelectItem key={e.id} value={String(e.id)}>{e.label}</SelectItem>
+                  <SelectItem key={e.id} value={String(e.id)} className="text-xs py-1.5 cursor-pointer">
+                    <span className="font-semibold">{e.label}</span>
+                    {e.exam_date && <span className="text-muted-foreground ml-1.5 font-mono text-[11px]">({e.exam_date})</span>}
+                  </SelectItem>
                 ))}
               </SelectContent>
             </Select>

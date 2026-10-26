@@ -98,6 +98,17 @@ try:
 except Exception as exc:
     print(f"warning: unique constraint migration: {exc}", flush=True)
 
+# ── Column migrations (safe – only add if not present) ─────────────────────────
+try:
+    with engine.connect() as _mc:
+        _col_names = [row[1] for row in _mc.execute(models.text("PRAGMA table_info(attendance_records)")).fetchall()]
+        if "batch_label" not in _col_names:
+            _mc.execute(models.text("ALTER TABLE attendance_records ADD COLUMN batch_label VARCHAR(100)"))
+            _mc.commit()
+            print("Migration: added batch_label to attendance_records", flush=True)
+except Exception as _me:
+    print(f"warning: column migration: {_me}", flush=True)
+
 app = FastAPI(title="MST Operations Portal API")
 
 import os
@@ -345,7 +356,15 @@ def _get_or_create_faculty(db: Session, raw_name: str):
 
 
 def _class_from_filename(db: Session, filename: str):
-    """Derive the class from workbook names like 'CI-1 IV.xlsx' / 'CY VI.xlsx'."""
+    """Derive the class from workbook names like 'CI-1 IV.xlsx' / 'CI-2.xlsx' / 'CY VI.xlsx'."""
+    clean_fn = re.sub(r"[^A-Za-z0-9]", "", (filename or "").upper())
+    for existing in db.query(models.Class).all():
+        clean_name = re.sub(r"[^A-Za-z0-9]", "", existing.name.upper())
+        if clean_name and (clean_name in clean_fn or clean_fn.startswith(clean_name)):
+            sem_m = re.search(r"\b(II|III|IV|V|VI)\b", (filename or "").upper())
+            roman = sem_m.group(1) if sem_m else None
+            return existing, roman
+
     m = re.match(r"\s*([A-Za-z]+-\d+|[A-Za-z]+)", filename or "")
     branch = m.group(1).upper() if m else "CI-1"
     sem_m = re.search(r"\b(II|III|IV|V|VI)\b", (filename or "").upper())
@@ -396,7 +415,7 @@ def get_non_attempted_exams_for_class(db: Session, class_id: int) -> list[models
     return non_attempted
 
 
-def _import_subject_workbook(db: Session, xls, filename: str, class_id: Optional[int] = None):
+def _import_subject_workbook(db: Session, xls, filename: str, class_id: Optional[int] = None, batch_label: Optional[str] = None):
     """Import every per-subject sheet in the workbook."""
     if class_id:
         cls = db.query(models.Class).filter_by(id=class_id).first()
@@ -463,6 +482,7 @@ def _import_subject_workbook(db: Session, xls, filename: str, class_id: Optional
                 classes_conducted=parsed["total_classes"],
                 classes_attended=attended,
                 source_file=filename,
+                batch_label=batch_label,
             ))
             n += 1
             students_seen.add(student.id)
@@ -518,11 +538,13 @@ def _import_subject_workbook(db: Session, xls, filename: str, class_id: Optional
             "sheets": sheets_summary,
             "class_conflicts": class_conflicts}
 
+@app.post("/upload-attendance")
 @app.post("/upload-attendance/")
 async def upload_attendance(
     request: Request,
     file: UploadFile = File(...),
     class_id: Optional[int] = Form(None),
+    batch_label: Optional[str] = Form(None),
     user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty")),
     db: Session = Depends(get_db)
 ):
@@ -544,6 +566,24 @@ async def upload_attendance(
             except ValueError:
                 pass
 
+    # Infer target class from batch_label if not provided directly
+    if target_class_id is None and batch_label:
+        bl_upper = re.sub(r"[^A-Za-z0-9]", "", batch_label.upper())
+        for c in db.query(models.Class).all():
+            c_name_clean = re.sub(r"[^A-Za-z0-9]", "", c.name.upper())
+            if c_name_clean and (c_name_clean in bl_upper or bl_upper.startswith(c_name_clean)):
+                target_class_id = c.id
+                break
+
+    # Infer target class from filename if still not found
+    if target_class_id is None:
+        clean_fn = re.sub(r"[^A-Za-z0-9]", "", file.filename.upper())
+        for c in db.query(models.Class).all():
+            c_name_clean = re.sub(r"[^A-Za-z0-9]", "", c.name.upper())
+            if c_name_clean and (c_name_clean in clean_fn or clean_fn.startswith(c_name_clean)):
+                target_class_id = c.id
+                break
+
     # Per-subject workbook (e.g. CI-1 IV.xlsx): one sheet per subject with
     # 'Subject Code' / 'Enrollment No.' headers — parse every subject sheet.
     try:
@@ -552,14 +592,23 @@ async def upload_attendance(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
     if any(p for p in probe):
-        return _import_subject_workbook(db, xls, file.filename, class_id=target_class_id)
+        try:
+            return _import_subject_workbook(db, xls, file.filename, class_id=target_class_id, batch_label=batch_label or file.filename)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=400, detail=f"Subject workbook import failed: {exc}")
 
-    # Flat fallback: requires an explicit class_id
+    # Flat fallback: if target_class_id still unassigned, pick first registered class
     if not target_class_id:
-        raise HTTPException(
-            status_code=422,
-            detail="class_id is required for flat attendance file upload"
-        )
+        first_cls = db.query(models.Class).order_by(models.Class.id.asc()).first()
+        if first_cls:
+            target_class_id = first_cls.id
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="class_id is required for flat attendance file upload"
+            )
     target_class = db.query(models.Class).filter_by(id=target_class_id).first()
     if not target_class:
         raise HTTPException(status_code=404, detail=f"Class with id {target_class_id} not found")
@@ -573,10 +622,10 @@ async def upload_attendance(
                 if n in colmap:
                     return colmap[n]
             return None
-        c_roll = col("roll number", "roll no", "roll")
-        c_name = col("name", "student name")
-        c_total = col("total classes", "classes conducted", "total")
-        c_att = col("attended", "classes attended", "attended classes")
+        c_roll = col("roll number", "roll no", "roll", "enrollment number", "enrollment no", "enrollment", "scholar no", "scholar", "id", "student id")
+        c_name = col("name", "student name", "candidate name", "student", "full name")
+        c_total = col("total classes", "classes conducted", "total", "conducted", "held", "lectures held", "total lectures", "total class")
+        c_att = col("attended", "classes attended", "attended classes", "present", "lectures attended", "total attended")
         c_batch = [colmap[k] for k in ("batch", "batch number", "batch no") if k in colmap]
         def row_batch(row):
             for cb in c_batch:
@@ -587,16 +636,24 @@ async def upload_attendance(
                 if m:
                     return int(m.group(0))
             return None
+        def safe_int(v, default=0):
+            try:
+                if pd.isna(v) or v is None:
+                    return default
+                return int(float(v))
+            except Exception:
+                return default
+
         imported_count = 0
         class_conflicts = []
         seen_conflicts = set()
         for _, row in df.iterrows():
             roll_number = str(row.get(c_roll, '')).strip() if c_roll else ''
-            if not roll_number or roll_number == 'nan':
+            if not roll_number or roll_number.lower() in ('nan', 'none', ''):
                 continue
             name     = str(row.get(c_name, 'Unknown')).strip() if c_name else 'Unknown'
-            total    = int(row.get(c_total, 0)) if c_total else 0
-            attended = int(row.get(c_att, 0)) if c_att else 0
+            total    = safe_int(row.get(c_total, 0)) if c_total else 0
+            attended = safe_int(row.get(c_att, 0)) if c_att else 0
             batch_number = row_batch(row)
             student  = crud.get_student_by_roll(db, roll_number)
             if not student:
@@ -650,6 +707,104 @@ async def upload_attendance(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
+# ── Import Batch Management ──────────────────────────────────────────────────
+
+@app.get("/import-batches")
+def list_import_batches(
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List all named import batches with record counts."""
+    from sqlalchemy import func
+    rows = (
+        db.query(
+            models.AttendanceRecord.batch_label,
+            func.count(models.AttendanceRecord.id).label("record_count"),
+            func.min(models.AttendanceRecord.upload_date).label("first_upload"),
+            func.max(models.AttendanceRecord.upload_date).label("last_upload"),
+        )
+        .filter(models.AttendanceRecord.batch_label.isnot(None))
+        .group_by(models.AttendanceRecord.batch_label)
+        .all()
+    )
+    # Also include unnamed records (grouped by source_file)
+    unnamed = (
+        db.query(
+            models.AttendanceRecord.source_file,
+            func.count(models.AttendanceRecord.id).label("record_count"),
+        )
+        .filter(models.AttendanceRecord.batch_label.is_(None))
+        .group_by(models.AttendanceRecord.source_file)
+        .all()
+    )
+    batches = [
+        {
+            "label": r.batch_label,
+            "record_count": r.record_count,
+            "first_upload": r.first_upload.isoformat() if r.first_upload else None,
+            "last_upload": r.last_upload.isoformat() if r.last_upload else None,
+            "is_named": True,
+        }
+        for r in rows
+    ]
+    for u in unnamed:
+        batches.append({
+            "label": u.source_file or "(unlabelled)",
+            "record_count": u.record_count,
+            "first_upload": None,
+            "last_upload": None,
+            "is_named": False,
+        })
+    return batches
+
+
+@app.delete("/import-batches/{batch_label:path}")
+def delete_import_batch(
+    batch_label: str,
+    user: models.User = Depends(auth.require_role("hod", "coordinator")),
+    db: Session = Depends(get_db)
+):
+    """
+    Delete all attendance records for a named batch label, then recompute
+    eligibility for affected students so the data is cleanly wiped.
+    """
+    records = db.query(models.AttendanceRecord).filter(
+        models.AttendanceRecord.batch_label == batch_label
+    ).all()
+    if not records:
+        raise HTTPException(status_code=404, detail=f"Batch '{batch_label}' not found or has no records.")
+
+    affected_student_ids = {r.student_id for r in records}
+    deleted_count = len(records)
+
+    # Delete records
+    db.query(models.AttendanceRecord).filter(
+        models.AttendanceRecord.batch_label == batch_label
+    ).delete()
+    db.commit()
+
+    # Recompute eligibility for all affected students
+    exams = db.query(models.MstExam).all()
+    for sid in affected_student_ids:
+        for exam in exams:
+            crud.compute_eligibility_for_student(db, sid, exam.id)
+
+    db.add(models.AuditLog(
+        table_name="attendance_records", record_id=0, field_changed="batch_delete",
+        new_value=f"Deleted {deleted_count} records from batch '{batch_label}'",
+        changed_by=user.id,
+        reason=f"User deleted import batch: {batch_label}",
+    ))
+    db.commit()
+
+    return {
+        "deleted": deleted_count,
+        "batch_label": batch_label,
+        "affected_students": len(affected_student_ids),
+        "message": f"Batch '{batch_label}' deleted. Eligibility recomputed for {len(affected_student_ids)} students.",
+    }
+
+
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 @app.get("/dashboard/stats")
@@ -661,7 +816,7 @@ def dashboard_stats(
     if mst_exam_id:
         exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
     else:
-        exam = db.query(models.MstExam).order_by(models.MstExam.id.desc()).first()
+        exam = db.query(models.MstExam).order_by(models.MstExam.id.asc()).first()
 
     exam_label = exam.label if exam else "MST-1"
     resolved_exam_id = exam.id if exam else 1
@@ -678,11 +833,20 @@ def dashboard_stats(
     n_overrides = sum(1 for e in elig_rows if e.override)
 
     per_class: dict[str, dict] = {}
+    for c in classes.values():
+        per_class[c.name] = {
+            "class": c.name,
+            "branch": c.branch or c.name,
+            "students": 0,
+            "eligible": 0,
+            "borderline": 0,
+            "ineligible": 0,
+        }
     for s in students:
         c = classes.get(s.class_id)
         cname = c.name if c else "—"
         bucket = per_class.setdefault(cname, {
-            "class": cname, "students": 0,
+            "class": cname, "branch": cname, "students": 0,
             "eligible": 0, "borderline": 0, "ineligible": 0,
         })
         bucket["students"] += 1
@@ -734,6 +898,10 @@ def dashboard_stats(
                 "at": at,
             })
 
+    duties_q = db.query(models.InvigilationDuty).filter_by(mst_exam_id=resolved_exam_id).all() if exam else []
+    n_duties_assigned = sum(1 for d in duties_q if d.status == "Assigned")
+    n_duties_unfilled = sum(1 for d in duties_q if d.status == "Unfilled")
+
     return {
         "exam_label": exam_label,
         "total_students": total,
@@ -747,6 +915,11 @@ def dashboard_stats(
             "versions": n_versions,
             "periods": len(tt_entries),
             "classes": tt_classes,
+        },
+        "active_duty": {
+            "total": len(duties_q),
+            "assigned": n_duties_assigned,
+            "unfilled": n_duties_unfilled,
         },
         "recent_activity": activity,
     }
@@ -1134,8 +1307,35 @@ def generate_seating(
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
-    # Gate: HTTP 409 if no eligibility records exist for this exam
+    # Check eligibility records; auto-compute from attendance records or carry over if missing
     elig_count = db.query(models.MstEligibility).filter_by(mst_exam_id=exam.id).count()
+    if elig_count == 0:
+        q_studs = db.query(models.Student).filter_by(active=True)
+        if exam.class_id:
+            q_studs = q_studs.filter_by(class_id=exam.class_id)
+        for s in q_studs.all():
+            crud.compute_eligibility_for_student(db, s.id, exam.id)
+        elig_count = db.query(models.MstEligibility).filter_by(mst_exam_id=exam.id).count()
+
+        if elig_count == 0:
+            any_elig = db.query(models.MstEligibility).all()
+            if any_elig:
+                seen = set()
+                for el in any_elig:
+                    if el.student_id not in seen:
+                        seen.add(el.student_id)
+                        db.add(models.MstEligibility(
+                            student_id=el.student_id,
+                            mst_exam_id=exam.id,
+                            overall_pct=el.overall_pct,
+                            lowest_subject_pct=el.lowest_subject_pct,
+                            status=el.status,
+                            override=False,
+                            override_reason=None
+                        ))
+                db.commit()
+                elig_count = db.query(models.MstEligibility).filter_by(mst_exam_id=exam.id).count()
+
     if elig_count == 0:
         raise HTTPException(
             status_code=409,
@@ -2006,30 +2206,43 @@ def get_rollcall(
 
 # ── AI health (provider status for the UI banner) ──────────────────────────────
 
+_ollama_cache = {"last_check": 0.0, "status": False}
+
 @app.get("/ai/health")
 async def ai_health(user: models.User = Depends(auth.get_current_user)):
     """Returns which AI providers are configured so the UI can show a status."""
-    import os
+    import os, time
     providers = []
     if os.environ.get("GROQ_API_KEY"):
-        providers.append({"name": "groq", "configured": True})
+        providers.append({"name": "groq", "configured": True, "label": "Groq Cloud LLM"})
     else:
-        providers.append({"name": "groq", "configured": False, "hint": "Set GROQ_API_KEY in backend/.env"})
+        providers.append({"name": "groq", "configured": False, "hint": "Set GROQ_API_KEY in backend/.env for cloud LLM"})
     if os.environ.get("GEMINI_API_KEY"):
-        providers.append({"name": "gemini", "configured": True})
+        providers.append({"name": "gemini", "configured": True, "label": "Gemini Cloud LLM"})
     else:
-        providers.append({"name": "gemini", "configured": False, "hint": "Set GEMINI_API_KEY in backend/.env"})
-    import httpx
-    ollama_ok = False
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as c:
-            r = await c.get("http://localhost:11434/api/tags")
-            ollama_ok = r.status_code == 200
-    except Exception:
-        pass
-    providers.append({"name": "ollama", "configured": ollama_ok})
-    any_ok = any(p["configured"] for p in providers)
-    return {"ready": any_ok, "providers": providers}
+        providers.append({"name": "gemini", "configured": False, "hint": "Set GEMINI_API_KEY in backend/.env for cloud LLM"})
+
+    now = time.time()
+    ollama_ok = _ollama_cache["status"]
+    if now - _ollama_cache["last_check"] > 60.0:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(0.2, connect=0.1)) as c:
+                r = await c.get("http://127.0.0.1:11434/api/tags")
+                ollama_ok = r.status_code == 200
+        except Exception:
+            ollama_ok = False
+        _ollama_cache["last_check"] = now
+        _ollama_cache["status"] = ollama_ok
+
+    providers.append({"name": "ollama", "configured": ollama_ok, "label": "Local Ollama LLM"})
+    providers.append({"name": "local_engine", "configured": True, "label": "Local SQL Query Engine"})
+    active_name = "local_engine"
+    for p in providers:
+        if p.get("configured") and p["name"] in ("groq", "gemini", "ollama"):
+            active_name = p["name"]
+            break
+    return {"ready": True, "active": active_name, "providers": providers}
 
 
 # ── Timetable Endpoints ───────────────────────────────────────────────────────
@@ -2118,4 +2331,24 @@ def save_timetable_for_class(
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=f"Failed to save timetable: {exc}")
+
+
+# ── System Data Management & Fresh Reset ─────────────────────────────────────
+
+@app.post("/data/reset")
+def reset_system_data(
+    user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Wipes legacy seed and cached demo data (old CI21, dummy students, duplicate exams)
+    and initializes clean distinct classes: CI-1, CI-2, CI-3.
+    Prepares system for fresh user spreadsheet uploads.
+    """
+    try:
+        from reset_data import reset_to_fresh_state
+        res = reset_to_fresh_state(preserve_rooms_and_faculty=True)
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
 

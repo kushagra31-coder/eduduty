@@ -1,4 +1,4 @@
-﻿'use client'
+'use client'
 
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -500,7 +500,7 @@ function SystemTab() {
           <ol className="space-y-2 text-sm text-muted-foreground list-decimal pl-5">
             <li><strong className="text-foreground">Upload Attendance</strong> — import Excel sheets (.xlsx). Each subject sheet data is stored per student.</li>
             <li><strong className="text-foreground">Eligibility</strong> — automatically computed from the latest records. View and HOD-override here.</li>
-            <li><strong className="text-foreground">MST Seat Map</strong> — create exams + rooms, generate seating (B1/B2 interleaved), mark attendance during exam.</li>
+            <li><strong className="text-foreground">Seating Arrangement</strong> — create exams + rooms, generate seating (B1/B2 interleaved), mark attendance during exam.</li>
             <li><strong className="text-foreground">MST Roll Call</strong> — alternative list-based roll-call view, syncs the same attendance records.</li>
             <li><strong className="text-foreground">VT / Follow-up</strong> — auto-calculated after marking. Export as Excel or PDF.</li>
             <li><strong className="text-foreground">Duty Scheduler</strong> — auto-assigns free faculty to rooms based on timetable data.</li>

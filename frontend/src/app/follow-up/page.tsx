@@ -23,6 +23,11 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { useToast } from "@/components/ui/use-toast"
+import {
+  Users, AlertTriangle, CheckCircle2, Clock, Sparkles,
+  RefreshCw, FileSpreadsheet, FileText, ChevronRight,
+  Filter, AlertCircle
+} from "lucide-react"
 
 type FollowUpRecord = {
   id: number
@@ -57,18 +62,54 @@ function pretty(s: string) {
 }
 
 function appearanceBadge(v: boolean | null) {
-  if (v === true) return <Badge className="bg-foreground text-background hover:bg-foreground/85">Present</Badge>
-  if (v === false) return <Badge className="border border-foreground/30 bg-foreground/10 text-foreground hover:bg-foreground/15">Absent</Badge>
-  return <Badge variant="secondary">Missing</Badge>
+  if (v === true) return (
+    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 rounded-md">
+      Present
+    </span>
+  )
+  if (v === false) return (
+    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-rose-700 dark:text-rose-300 bg-rose-500/15 border border-rose-500/30 px-2 py-0.5 rounded-md">
+      Absent
+    </span>
+  )
+  return (
+    <span className="inline-flex items-center text-[10px] font-medium text-muted-foreground bg-muted/60 border border-border/70 px-1.5 py-0.5 rounded-md">
+      Missing
+    </span>
+  )
 }
 
 function statusBadge(status: string, override: boolean) {
-  if (override) return <Badge className="border-2 border-foreground bg-transparent text-foreground hover:bg-muted">Overridden</Badge>
-  if (status === "compulsory") return <Badge className="bg-foreground text-background hover:bg-foreground/85">Compulsory</Badge>
-  if (status === "under_review") return <Badge className="border border-dashed border-foreground/60 bg-transparent text-foreground hover:bg-muted">Under Review</Badge>
-  if (status === "excused") return <Badge className="border border-foreground/30 bg-foreground/10 text-foreground hover:bg-foreground/15">Excused</Badge>
-  if (status === "completed") return <Badge variant="secondary">Completed</Badge>
-  return <Badge variant="outline">Not Required</Badge>
+  if (override) return (
+    <Badge className="bg-purple-500/20 text-purple-700 dark:text-purple-300 border-purple-500/40 text-[10px] font-bold">
+      Overridden
+    </Badge>
+  )
+  if (status === "compulsory") return (
+    <Badge className="bg-rose-500/20 text-rose-700 dark:text-rose-300 border-rose-500/40 text-[10px] font-bold">
+      Compulsory
+    </Badge>
+  )
+  if (status === "under_review") return (
+    <Badge className="bg-amber-500/20 text-amber-700 dark:text-amber-300 border-amber-500/40 text-[10px] font-semibold">
+      Under Review
+    </Badge>
+  )
+  if (status === "excused") return (
+    <Badge className="bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 border-indigo-500/40 text-[10px] font-semibold">
+      Excused
+    </Badge>
+  )
+  if (status === "completed") return (
+    <Badge className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border-emerald-500/40 text-[10px] font-semibold">
+      Completed
+    </Badge>
+  )
+  return (
+    <Badge variant="outline" className="text-muted-foreground text-[10px] font-medium">
+      Not Required
+    </Badge>
+  )
 }
 
 export default function FollowUpPage() {
@@ -192,43 +233,135 @@ export default function FollowUpPage() {
   }
 
   const byFinal = stats?.by_final_status ?? {}
-  const card = (label: string, value: number | undefined, hint?: string) => (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardDescription>{label}</CardDescription>
-        <CardTitle className="text-3xl font-mono tabular-nums">{value ?? "—"}</CardTitle>
-      </CardHeader>
-      {hint && <CardContent className="pt-0 text-xs text-muted-foreground">{hint}</CardContent>}
-    </Card>
-  )
+
+  const statusFilters = [
+    { key: "all", label: "All Records", count: stats?.total_evaluated ?? 0 },
+    { key: "compulsory", label: "Compulsory", count: byFinal["compulsory"] ?? 0 },
+    { key: "under_review", label: "Under Review", count: byFinal["under_review"] ?? 0 },
+    { key: "not_required", label: "Not Required", count: byFinal["not_required"] ?? 0 },
+    { key: "excused", label: "Excused", count: byFinal["excused"] ?? 0 },
+    { key: "completed", label: "Completed", count: byFinal["completed"] ?? 0 },
+  ]
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      <div className="flex justify-between items-end flex-wrap gap-3">
+      <div className="flex justify-between items-start md:items-end flex-wrap gap-4">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">VT / Follow-up</h1>
-          <p className="text-muted-foreground mt-2">
-            Absent in both MST-1 and MST-2 → compulsory follow-up. Rule: absent-both-mst-v1.
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-3xl font-bold tracking-tight">VT / Follow-up</h1>
+            <Badge variant="outline" className="font-mono text-[11px] font-semibold text-muted-foreground border-border/80">
+              Rule: absent-both-mst-v1
+            </Badge>
+          </div>
+          <p className="text-muted-foreground mt-1.5 text-sm">
+            Automated compliance engine. Students absent in both MST-1 and MST-2 are flagged for compulsory remedial follow-up.
           </p>
         </div>
-        <div className="flex gap-2 flex-wrap">
-          <Button variant="outline" onClick={recalculate} disabled={recalcBusy}>
+        <div className="flex gap-2 flex-wrap items-center">
+          <Button variant="outline" size="sm" onClick={recalculate} disabled={recalcBusy} className="gap-1.5">
+            <RefreshCw className={`w-3.5 h-3.5 ${recalcBusy ? "animate-spin" : ""}`} />
             {recalcBusy ? "Recalculating…" : "Recalculate"}
           </Button>
-          <Button variant="outline" onClick={() => window.open(exportUrl(false), "_blank")}>Export Excel</Button>
-          <Button variant="outline" onClick={() => window.open(exportUrl(true), "_blank")}>Export PDF</Button>
+          <Button variant="outline" size="sm" onClick={() => window.open(exportUrl(false), "_blank")} className="gap-1.5">
+            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+            Export Excel
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => window.open(exportUrl(true), "_blank")} className="gap-1.5">
+            <FileText className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
+            Export PDF
+          </Button>
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-7">
-        {card("Evaluated", stats?.total_evaluated)}
-        {card("Compulsory", byFinal["compulsory"], "absent in both MSTs")}
-        {card("Not Required", byFinal["not_required"])}
-        {card("Under Review", byFinal["under_review"], "missing appearance data")}
-        {card("Excused", byFinal["excused"])}
-        {card("Completed", byFinal["completed"])}
-        {card("Missing Records", stats?.missing_records, "students not yet evaluated")}
+      <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
+        <Card className="relative overflow-hidden border shadow-sm">
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between text-muted-foreground">
+              <span className="text-xs font-semibold tracking-wide uppercase">Total Evaluated</span>
+              <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">
+                <Users className="w-4 h-4" />
+              </div>
+            </div>
+            <CardTitle className="text-3xl font-mono font-bold tabular-nums mt-1">
+              {stats?.total_evaluated ?? 0}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0 text-xs text-muted-foreground">
+            Out of <span className="font-semibold text-foreground">{stats?.total_students ?? 0}</span> enrolled students
+          </CardContent>
+        </Card>
+
+        <Card className="relative overflow-hidden border border-rose-200 dark:border-rose-900/50 bg-rose-50/40 dark:bg-rose-950/20 shadow-sm">
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between text-rose-700 dark:text-rose-300">
+              <span className="text-xs font-semibold tracking-wide uppercase">Compulsory Follow-up</span>
+              <div className="p-2 rounded-lg bg-rose-500/15 text-rose-600 dark:text-rose-400">
+                <AlertTriangle className="w-4 h-4" />
+              </div>
+            </div>
+            <CardTitle className="text-3xl font-mono font-bold text-rose-600 dark:text-rose-400 tabular-nums mt-1">
+              {byFinal["compulsory"] ?? 0}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0 text-xs text-rose-700/80 dark:text-rose-300/80">
+            Absent in both MST-1 & MST-2
+          </CardContent>
+        </Card>
+
+        <Card className="relative overflow-hidden border border-amber-200 dark:border-amber-900/50 bg-amber-50/30 dark:bg-amber-950/20 shadow-sm">
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between text-amber-700 dark:text-amber-300">
+              <span className="text-xs font-semibold tracking-wide uppercase">Under Review & Excused</span>
+              <div className="p-2 rounded-lg bg-amber-500/15 text-amber-600 dark:text-amber-400">
+                <Clock className="w-4 h-4" />
+              </div>
+            </div>
+            <CardTitle className="text-3xl font-mono font-bold text-amber-600 dark:text-amber-400 tabular-nums mt-1">
+              {(byFinal["under_review"] ?? 0) + (byFinal["excused"] ?? 0)}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0 text-xs text-amber-700/80 dark:text-amber-300/80">
+            {byFinal["under_review"] ?? 0} pending data · {byFinal["excused"] ?? 0} excused
+          </CardContent>
+        </Card>
+
+        <Card className="relative overflow-hidden border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/30 dark:bg-emerald-950/20 shadow-sm">
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between text-emerald-700 dark:text-emerald-300">
+              <span className="text-xs font-semibold tracking-wide uppercase">Completed & Exempted</span>
+              <div className="p-2 rounded-lg bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 className="w-4 h-4" />
+              </div>
+            </div>
+            <CardTitle className="text-3xl font-mono font-bold text-emerald-600 dark:text-emerald-400 tabular-nums mt-1">
+              {(byFinal["completed"] ?? 0) + (byFinal["not_required"] ?? 0)}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0 text-xs text-emerald-700/80 dark:text-emerald-300/80">
+            {byFinal["completed"] ?? 0} completed · {byFinal["not_required"] ?? 0} exempted
+          </CardContent>
+        </Card>
       </div>
+
+      {(stats?.missing_records ?? 0) > 0 && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-amber-300/60 bg-amber-500/10 p-3.5 text-xs text-amber-900 dark:text-amber-200">
+          <div className="flex items-center gap-2.5">
+            <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+            <span>
+              <strong>{stats?.missing_records} students</strong> have missing or pending MST attendance data. Mark attendance in MST Roll Call or click Recalculate to evaluate.
+            </span>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={recalculate}
+            disabled={recalcBusy}
+            className="h-7 text-xs border-amber-400/60 hover:bg-amber-500/20 text-amber-950 dark:text-amber-100 shrink-0"
+          >
+            {recalcBusy ? "Recalculating…" : "Recalculate Now"}
+          </Button>
+        </div>
+      )}
 
       <Card>
         <CardHeader>
@@ -236,7 +369,37 @@ export default function FollowUpPage() {
           <CardDescription>Calculated by the rule engine; final status needs an authorized override with a typed reason.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex gap-3 flex-wrap">
+          <div className="flex flex-wrap items-center gap-2 pb-2 border-b border-border/40">
+            <span className="text-xs font-semibold text-muted-foreground mr-1 flex items-center gap-1.5">
+              <Filter className="w-3.5 h-3.5" /> Filter by:
+            </span>
+            {statusFilters.map((f) => {
+              const active = finalFilter === f.key
+              return (
+                <button
+                  key={f.key}
+                  type="button"
+                  onClick={() => setFinalFilter(f.key)}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all cursor-pointer ${
+                    active
+                      ? "bg-primary text-primary-foreground shadow-sm"
+                      : "bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  }`}
+                >
+                  <span>{f.label}</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                      active ? "bg-primary-foreground/20 text-primary-foreground" : "bg-background/90 text-foreground"
+                    }`}
+                  >
+                    {f.count}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="flex gap-3 flex-wrap items-center">
             <Select value={classFilter} onValueChange={(v: string | null) => { if (v) setClassFilter(v) }}>
               <SelectTrigger className="w-44"><SelectValue placeholder="Class" /></SelectTrigger>
               <SelectContent>
@@ -244,23 +407,26 @@ export default function FollowUpPage() {
                 {classes.map((c) => <SelectItem key={c.id} value={String(c.id)}>{c.name}</SelectItem>)}
               </SelectContent>
             </Select>
-            <Select value={finalFilter} onValueChange={(v: string | null) => { if (v) setFinalFilter(v) }}>
-              <SelectTrigger className="w-44"><SelectValue placeholder="Final status" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All statuses</SelectItem>
-                <SelectItem value="compulsory">Compulsory</SelectItem>
-                <SelectItem value="not_required">Not required</SelectItem>
-                <SelectItem value="under_review">Under review</SelectItem>
-                <SelectItem value="excused">Excused</SelectItem>
-                <SelectItem value="completed">Completed</SelectItem>
-              </SelectContent>
-            </Select>
             <Input
-              className="w-64"
-              placeholder="Search roll no. or name…"
+              className="w-72"
+              placeholder="Search roll number or name…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
+            {(finalFilter !== "all" || classFilter !== "all" || search.trim() !== "") && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setFinalFilter("all")
+                  setClassFilter("all")
+                  setSearch("")
+                }}
+                className="text-xs text-muted-foreground hover:text-foreground h-9"
+              >
+                Reset filters
+              </Button>
+            )}
           </div>
 
           <div className="rounded-md border">

@@ -1,6 +1,8 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -262,7 +264,50 @@ export function AIChat({ selectedPrompt, onPromptConsumed }: {
                     ? 'bg-destructive/10 text-destructive rounded-tl-sm border border-destructive/20'
                     : 'bg-muted rounded-tl-sm'
                 }`}>
-                  {msg.content}
+                  {(msg.role === 'assistant' && msg.type === 'answer') ? (
+                    <div className="prose prose-sm dark:prose-invert max-w-none text-foreground
+                      prose-headings:font-bold prose-headings:text-foreground prose-headings:mt-3 prose-headings:mb-2
+                      prose-p:my-1.5 prose-p:leading-relaxed prose-ul:my-2 prose-li:my-0.5
+                      prose-code:bg-background/80 prose-code:border prose-code:border-border/60 prose-code:rounded-md prose-code:px-1.5 prose-code:py-0.5 prose-code:text-xs prose-code:font-mono
+                      prose-strong:text-foreground prose-strong:font-bold">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          table: ({ children }) => (
+                            <div className="overflow-x-auto my-3 rounded-lg border border-border/80 shadow-xs bg-card/60">
+                              <table className="w-full text-left text-xs border-collapse">
+                                {children}
+                              </table>
+                            </div>
+                          ),
+                          thead: ({ children }) => (
+                            <thead className="bg-muted/70 text-muted-foreground uppercase tracking-wider font-semibold border-b border-border/70 text-[11px]">
+                              {children}
+                            </thead>
+                          ),
+                          th: ({ children }) => (
+                            <th className="px-3.5 py-2.5 font-semibold text-foreground">
+                              {children}
+                            </th>
+                          ),
+                          td: ({ children }) => (
+                            <td className="px-3.5 py-2 border-b border-border/40 text-foreground/90 font-medium whitespace-nowrap">
+                              {children}
+                            </td>
+                          ),
+                          tr: ({ children }) => (
+                            <tr className="hover:bg-muted/40 transition-colors">
+                              {children}
+                            </tr>
+                          ),
+                        }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
+                    </div>
+                  ) : (
+                    msg.content
+                  )}
                 </div>
               )}
 

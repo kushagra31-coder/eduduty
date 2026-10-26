@@ -57,16 +57,21 @@ export default function RollCallPage() {
   const [filter,   setFilter]   = useState<"all" | "present" | "absent" | "unmarked">("all")
   const [loading,  setLoading]  = useState(false)
   const [saving,   setSaving]   = useState<Record<number, boolean>>({})
+  const [error, setError] = useState<string | null>(null)
   const { toast } = useToast()
 
   // Load exams on mount
   useEffect(() => {
-    apiFetch("/mst/exams").then(setExams).catch(() => {})
+    apiFetch("/mst/exams").then((e: Exam[]) => {
+      setExams(e)
+      if (e.length > 0) setExamId(e[0].id)
+    }).catch(() => {})
   }, [])
 
-  // Load roll-call when exam changes
+  // Load roll-call when exam changes (stable dependency array)
   const loadRollcall = useCallback(async (id: number) => {
     setLoading(true)
+    setError(null)
     try {
       const data: Student[] = await apiFetch(`/mst/attendance/rollcall/${id}`)
       setStudents(data)
@@ -74,13 +79,15 @@ export default function RollCallPage() {
       for (const s of data) m[s.student_id] = (s.status as Mark) ?? null
       setMarks(m)
     } catch (e) {
-      toast({ title: "Failed to load students", description: (e as Error).message, variant: "destructive" })
+      setError((e as Error).message)
     } finally {
       setLoading(false)
     }
-  }, [toast])
+  }, [])
 
-  useEffect(() => { if (examId) loadRollcall(examId) }, [examId, loadRollcall])
+  useEffect(() => {
+    if (examId) loadRollcall(examId)
+  }, [examId, loadRollcall])
 
   // Mark a student
   async function toggle(studentId: number) {
@@ -169,8 +176,8 @@ export default function RollCallPage() {
 
       {/* Exam selector */}
       <div className="flex flex-wrap items-center gap-3">
-        <Select onValueChange={v => setExamId(Number(v))}>
-          <SelectTrigger id="rollcall-exam-select" className="w-64">
+        <Select value={examId ? String(examId) : ""} onValueChange={v => setExamId(Number(v))}>
+          <SelectTrigger id="rollcall-exam-select" className="w-72">
             <SelectValue placeholder="Pick an exam…" />
           </SelectTrigger>
           <SelectContent>
@@ -190,9 +197,9 @@ export default function RollCallPage() {
       </div>
 
       {!examId && (
-        <div className="flex flex-col items-center justify-center h-64 gap-2 text-muted-foreground">
-          <AlertCircle className="h-10 w-10" />
-          <p>Select an exam to start marking attendance</p>
+        <div className="flex flex-col items-center justify-center min-h-[300px] gap-3 text-muted-foreground border rounded-2xl bg-card/50">
+          <AlertCircle className="h-10 w-10 text-muted-foreground/50" />
+          <p className="text-sm font-medium">Select an exam above to view student list & mark attendance.</p>
         </div>
       )}
 
@@ -249,16 +256,54 @@ export default function RollCallPage() {
             </Button>
           </div>
 
-          {/* Loading */}
-          {loading ? (
+          {/* Error, Loading, Empty, or List */}
+          {error ? (
+            <div className="flex flex-col items-center justify-center min-h-[300px] gap-3 text-center p-6 border rounded-2xl bg-destructive/5 border-destructive/20">
+              <AlertCircle className="h-10 w-10 text-destructive/80" />
+              <div className="max-w-md">
+                <p className="font-semibold text-base text-foreground">Could not load students for this exam</p>
+                <p className="text-sm text-muted-foreground mt-1">{error}</p>
+              </div>
+              <div className="flex gap-3 mt-2">
+                <Button variant="outline" size="sm" onClick={() => examId && loadRollcall(examId)}>
+                  Try Again
+                </Button>
+                <a
+                  href="/attendance/upload"
+                  className="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-9 px-3 text-xs font-medium shadow-sm transition-colors"
+                >
+                  Upload Attendance & Compute
+                </a>
+              </div>
+            </div>
+          ) : loading ? (
             <div className="flex flex-col items-center justify-center min-h-[400px] border rounded-xl bg-muted/5">
               <RefreshCw className="h-6 w-6 animate-spin text-muted-foreground mb-4" />
               <span className="text-muted-foreground text-sm font-medium">Loading students…</span>
             </div>
+          ) : students.length === 0 ? (
+            <div className="flex flex-col items-center justify-center min-h-[360px] gap-3 text-center p-6 border rounded-2xl bg-card/40">
+              <Users className="h-10 w-10 text-muted-foreground/60" />
+              <div className="max-w-md">
+                <p className="font-semibold text-base text-foreground">No students enrolled yet for this exam</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Upload student attendance data from your excel sheets to populate the roll call roster.
+                </p>
+              </div>
+              <a
+                href="/attendance/upload"
+                className="mt-2 inline-flex items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 h-8 px-4 text-xs font-semibold shadow-sm transition-colors"
+              >
+                Upload Attendance Data
+              </a>
+            </div>
           ) : filtered.length === 0 ? (
-            <div className="flex flex-col items-center justify-center min-h-[400px] gap-3 text-muted-foreground border rounded-xl bg-muted/5">
-              <AlertCircle className="h-10 w-10 opacity-50" />
-              <p className="text-sm font-medium">No students match — try a different filter or search.</p>
+            <div className="flex flex-col items-center justify-center min-h-[300px] gap-2 text-muted-foreground border rounded-2xl bg-card/40">
+              <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
+              <p className="text-sm font-medium">No students match filter &ldquo;{filter}&rdquo; or search &ldquo;{search}&rdquo;</p>
+              <Button variant="ghost" size="sm" onClick={() => { setSearch(""); setFilter("all"); }}>
+                Reset Filters
+              </Button>
             </div>
           ) : (
             /* Roll call list */

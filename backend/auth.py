@@ -112,16 +112,16 @@ def get_current_user(
     curr_env = os.getenv("ENV", "local").strip().lower()
     auth_off = os.getenv("AUTH_DISABLED", "false").strip().lower() in ("true", "1", "yes")
 
-    if auth_off and curr_env == "local":
-        dev_user = db.query(models.User).filter_by(email="dev@eduduty.local").first()
-        if not dev_user:
-            dev_user = models.User(name="Dev Coordinator", role="coordinator", email="dev@eduduty.local")
-            db.add(dev_user)
-            db.commit()
-            db.refresh(dev_user)
-        return dev_user
-
     if not credentials or not credentials.credentials:
+        if auth_off and curr_env == "local":
+            dev_user = db.query(models.User).filter_by(email="dev@eduduty.local").first()
+            if not dev_user:
+                dev_user = models.User(name="Dev Coordinator", role="coordinator", email="dev@eduduty.local")
+                db.add(dev_user)
+                db.commit()
+                db.refresh(dev_user)
+            return dev_user
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication token required",

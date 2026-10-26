@@ -45,3 +45,6 @@ uvicorn==0.53.0
 sqlglot>=30.0.0
 websockets==15.0.1
 yarl==1.25.1
+openpyxl>=3.1.5
+pytest>=8.4.0
+pytest-asyncio>=0.23.0

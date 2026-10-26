@@ -1,5 +1,14 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure environment variables are loaded immediately
+env_file = Path(__file__).resolve().parent / ".env"
+if env_file.exists():
+    load_dotenv(env_file)
+else:
+    load_dotenv()
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
@@ -10,26 +19,17 @@ DB_PATH = Path(__file__).resolve().parent / "eduduty.db"
 def _resolve_database_url() -> str:
     """Pick a working database.
 
-    1. DATABASE_URL env var wins if set.
-    2. Otherwise try local PostgreSQL (Supabase-local default port 54322).
-    3. Fall back to a local SQLite file so the app boots with zero setup.
+    1. DATABASE_URL env var wins if set (converting relative sqlite to absolute DB_PATH).
+    2. Fall back to local SQLite file for zero setup and instant performance.
     """
     env_url = os.getenv("DATABASE_URL")
     if env_url:
+        if env_url.startswith("sqlite:///") and (env_url.endswith("./eduduty.db") or env_url.endswith("eduduty.db")):
+            return f"sqlite:///{DB_PATH.as_posix()}"
         return env_url
 
-    pg_url = "postgresql+psycopg://postgres:postgres@localhost:54322/postgres"
-    try:
-        import psycopg
-        conn = psycopg.connect(
-            "host=localhost port=54322 user=postgres password=postgres "
-            "dbname=postgres connect_timeout=2"
-        )
-        conn.close()
-        return pg_url
-    except Exception as exc:
-        print(f"database: PostgreSQL not reachable ({exc})", flush=True)
-        return f"sqlite:///{DB_PATH.as_posix()}"
+    # Default to sqlite file directly to avoid multi-second connection timeouts
+    return f"sqlite:///{DB_PATH.as_posix()}"
 
 
 SQLALCHEMY_DATABASE_URL = _resolve_database_url()

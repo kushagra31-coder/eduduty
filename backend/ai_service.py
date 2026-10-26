@@ -547,24 +547,25 @@ async def handle_ai_message(message: str, db: Session) -> dict:
     if any(k in msg_lower for k in write_keywords):
         try:
             raw_json = await _llm_chat(WRITE_SYSTEM_PROMPT, message)
-            # Strip any accidental markdown fences
             raw_json = re.sub(r"```[a-z]*\n?", "", raw_json).strip()
             op_json  = json.loads(raw_json)
 
             if op_json.get("operation") == "unsupported":
                 return {"type": "answer", "content": "I'm not sure how to make that change safely. Could you rephrase or use the UI?"}
 
-            # Validate it has required fields before proposing
             if op_json.get("operation") not in ALLOWED_WRITE_OPS:
                 raise ValueError("Operation not in allow-list.")
 
-            # Return the proposal — the frontend will show a confirm modal
             return {"type": "write_proposal", "content": op_json}
 
+        except (ConnectionError, RuntimeError):
+            # Fallback local write intent parser when LLM is offline
+            fb_op = _fallback_write_intent(message, db)
+            if fb_op:
+                return {"type": "write_proposal", "content": fb_op}
+            return {"type": "error", "content": "AI write parser offline. Please specify the operation clearly, e.g., 'Override roll 0827CI241101 for MST-1 with reason Medical ground'."}
         except (json.JSONDecodeError, ValueError) as e:
             return {"type": "error", "content": f"Could not parse write intent: {e}"}
-        except (ConnectionError, RuntimeError) as e:
-            return {"type": "error", "content": str(e)}
 
     # ── Read / Q&A path ───────────────────────────────────────────────────────
     try:
@@ -589,6 +590,197 @@ async def handle_ai_message(message: str, db: Session) -> dict:
         )
         return {"type": "answer", "content": formatted}
 
-    except Exception as e:
-        return {"type": "error", "content": f"Query failed: {e}"}
+    except Exception:
+        # LLM unreachable or failed — answer using intelligent local SQL engine
+        return _heuristic_answer(message, db)
+
+
+def _fallback_write_intent(message: str, db: Session) -> dict | None:
+    """Extract structured write intent from plain English when LLM is offline."""
+    msg = message.strip()
+    msg_lower = msg.lower()
+
+    # 1. Override eligibility: "override roll 0827CI241101 for MST-1"
+    if "override" in msg_lower:
+        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", msg)
+        exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
+        exam_label = exam_match.group(1).upper().replace(" ", "-") if exam_match else "MST-1"
+        if roll_match:
+            roll = roll_match.group(1)
+            reason_match = re.search(r"reason[:\s]+(.+)", msg, re.IGNORECASE)
+            reason = reason_match.group(1).strip() if reason_match else "Authorized coordinator approval via AI Assistant"
+            return {
+                "operation": "override_eligibility",
+                "roll_number": roll,
+                "mst_label": exam_label,
+                "reason": reason,
+            }
+
+    # 2. Mark attendance: "mark roll 0827CI241101 present for MST-1"
+    if "mark" in msg_lower:
+        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", msg)
+        exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
+        exam_label = exam_match.group(1).upper().replace(" ", "-") if exam_match else "MST-1"
+        status = "Present" if "present" in msg_lower else "Absent" if "absent" in msg_lower else "Present"
+        if roll_match:
+            return {
+                "operation": "mark_attempt_status",
+                "roll_number": roll_match.group(1),
+                "mst_label": exam_label,
+                "status": status,
+            }
+
+    # 3. Assign duty: "assign [Faculty] to room 101 for MST-1"
+    if "assign" in msg_lower and "room" in msg_lower:
+        room_match = re.search(r"room\s*([0-9A-Za-z-]+)", msg, re.IGNORECASE)
+        exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
+        exam_label = exam_match.group(1).upper().replace(" ", "-") if exam_match else "MST-1"
+        faculty_name = None
+        for f in db.query(models.Faculty).all():
+            if f.name.lower() in msg_lower:
+                faculty_name = f.name
+                break
+        if room_match and faculty_name:
+            return {
+                "operation": "assign_duty",
+                "faculty_name": faculty_name,
+                "mst_label": exam_label,
+                "room_number": room_match.group(1),
+            }
+
+    return None
+
+
+def _heuristic_answer(message: str, db: Session) -> dict:
+    """Accurately answers queries directly from the SQLite views when external LLMs are offline."""
+    msg = message.lower().strip()
+
+    with get_readonly_connection() as conn:
+        # Check for roll number lookup
+        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{4,})\b", message)
+        if roll_match:
+            roll = roll_match.group(1)
+            row = conn.execute(
+                text("SELECT * FROM ai_attendance_summary WHERE roll_number LIKE :r"),
+                {"r": f"%{roll}%"}
+            ).fetchone()
+            if row:
+                m = dict(row._mapping)
+                elig_row = conn.execute(
+                    text("SELECT status, override FROM mst_eligibility me JOIN students s ON s.id = me.student_id WHERE s.roll_number LIKE :r"),
+                    {"r": f"%{roll}%"}
+                ).fetchone()
+                status = elig_row[0] if elig_row else "Unknown"
+                override = " (Overridden)" if elig_row and elig_row[1] else ""
+                content = (
+                    f"### Student Record: {m.get('student_name')} (`{m.get('roll_number')}`)\n\n"
+                    f"- **Class**: {m.get('class_name')}\n"
+                    f"- **Overall Attendance**: `{m.get('overall_pct', 0):.1f}%`\n"
+                    f"- **Lowest Subject Attendance**: `{m.get('lowest_subject_pct', 0):.1f}%`\n"
+                    f"- **MST Eligibility Status**: **{status}**{override}\n"
+                )
+                return {"type": "answer", "content": content}
+
+        # Check for borderline queries
+        if "borderline" in msg:
+            rows = conn.execute(
+                text("SELECT roll_number, student_name, class_name, overall_pct FROM ai_attendance_summary WHERE overall_pct >= 45 AND overall_pct < 50 ORDER BY overall_pct ASC LIMIT 15")
+            ).fetchall()
+            if not rows:
+                # Also check eligibility table for borderline status
+                rows = conn.execute(
+                    text("SELECT s.roll_number, s.name as student_name, c.name as class_name, me.overall_pct FROM mst_eligibility me JOIN students s ON s.id = me.student_id JOIN classes c ON c.id = s.class_id WHERE me.status = 'Borderline' LIMIT 15")
+                ).fetchall()
+
+            if rows:
+                table_lines = ["| Roll Number | Student Name | Class | Attendance |", "| :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | **{m['overall_pct']:.1f}%** |")
+                content = (
+                    f"### Borderline Students (45% - 49.9% Attendance)\n\n"
+                    f"Found **{len(rows)}** borderline candidates requiring departmental review:\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+            return {"type": "answer", "content": "No borderline students found with attendance between 45% and 50%."}
+
+        # Check for VT candidates / remedial queries
+        if any(w in msg for w in ["vt", "remedial", "follow-up", "follow up", "candidate"]):
+            rows = conn.execute(
+                text("SELECT roll_number, student_name, class_name, final_status, override_reason FROM v_vt_follow_up_status LIMIT 15")
+            ).fetchall()
+            if rows:
+                compulsory = sum(1 for r in rows if dict(r._mapping).get("final_status") == "compulsory")
+                under_review = sum(1 for r in rows if dict(r._mapping).get("final_status") == "under_review")
+                excused = sum(1 for r in rows if dict(r._mapping).get("final_status") == "excused")
+                table_lines = ["| Roll Number | Student Name | Class | VT Status | Reason / Notes |", "| :--- | :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | **{m['final_status']}** | {m.get('override_reason') or 'Rule evaluation'} |")
+                content = (
+                    f"### Vocational Training (VT) / Follow-up Status Overview\n\n"
+                    f"- **Compulsory Remedial**: `{compulsory}`\n"
+                    f"- **Under Review**: `{under_review}`\n"
+                    f"- **Excused / Approved**: `{excused}`\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+            return {"type": "answer", "content": "No students are currently flagged as compulsory for VT follow-up."}
+
+        # Check for Duty roster queries
+        if any(w in msg for w in ["duty", "duties", "invigilat", "roster", "schedule"]):
+            rows = conn.execute(
+                text("SELECT mst_label, exam_date, room_number, faculty_name, duty_status FROM ai_duty_roster ORDER BY exam_date DESC LIMIT 15")
+            ).fetchall()
+            if rows:
+                table_lines = ["| Exam | Date | Room | Faculty Assigned | Duty Status |", "| :--- | :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| {m['mst_label']} | {m.get('exam_date') or 'Scheduled'} | **{m['room_number']}** | {m.get('faculty_name') or 'Unassigned'} | {m['duty_status']} |")
+                content = (
+                    f"### Examination Invigilation Roster\n\n"
+                    f"Live duty assignments from the exam schedule:\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+            return {"type": "answer", "content": "No duty assignments have been created yet. Generate them in the Duty Scheduler tab."}
+
+        # Check for Eligibility count / general stats
+        rows = conn.execute(
+            text("SELECT class_name, mst_label, eligible_count, ineligible_count, missing_count FROM ai_eligibility_summary")
+        ).fetchall()
+        if rows:
+            total_eligible = sum(dict(r._mapping).get("eligible_count", 0) for r in rows)
+            total_ineligible = sum(dict(r._mapping).get("ineligible_count", 0) for r in rows)
+            table_lines = ["| Class | Exam | Eligible | Ineligible | Missing Records |", "| :--- | :--- | :--- | :--- | :--- |"]
+            for r in rows:
+                m = dict(r._mapping)
+                table_lines.append(f"| {m['class_name']} | {m['mst_label']} | **{m['eligible_count']}** | {m['ineligible_count']} | {m['missing_count']} |")
+            content = (
+                f"### MST Eligibility Overview\n\n"
+                f"- **Total Eligible Students**: `{total_eligible}`\n"
+                f"- **Total Ineligible Students**: `{total_ineligible}`\n\n" +
+                "\n".join(table_lines)
+            )
+            return {"type": "answer", "content": content}
+
+        # Default fallback
+        total_students = conn.execute(text("SELECT COUNT(*) FROM students")).scalar() or 0
+        total_classes = conn.execute(text("SELECT COUNT(*) FROM classes")).scalar() or 0
+        total_rooms = conn.execute(text("SELECT COUNT(*) FROM rooms")).scalar() or 0
+        return {
+            "type": "answer",
+            "content": (
+                f"### MST Operations Portal Assistant\n\n"
+                f"System status: **{total_students} students**, **{total_classes} classes**, and **{total_rooms} examination rooms** loaded.\n\n"
+                f"You can ask me to:\n"
+                f"- Check eligibility: *'How many students are eligible for MST-1?'*\n"
+                f"- List borderline students: *'List borderline students in CI-2'*\n"
+                f"- Check VT candidates: *'Who are the VT candidates after MST-2?'*\n"
+                f"- Inspect a student: *'Attendance for roll 0827CI241101'*\n"
+                f"- Show invigilation duties: *'Show current duty roster'*"
+            )
+        }
+
 

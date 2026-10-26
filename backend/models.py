@@ -50,6 +50,7 @@ class AttendanceRecord(Base):
     attendance_pct = Column(Numeric(5, 2))
     upload_date = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     source_file = Column(String(255))
+    batch_label = Column(String(100))   # e.g. "CI-1 MST-1", "CI-2 Sem5" — user-assigned label
     approved = Column(Boolean, default=False, nullable=False)
 
     @property

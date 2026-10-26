@@ -11,7 +11,7 @@ import { Button } from '@/components/ui/button';
 const NAV_LINKS = [
   { href: "/dashboard",          label: "Dashboard",          icon: Home },
   { href: "/attendance/upload",  label: "Upload Attendance",  icon: Upload },
-  { href: "/attendance/tracker", label: "MST Seat Map",       icon: Armchair },
+  { href: "/attendance/tracker", label: "Seating Arrangement", icon: Armchair },
   { href: "/mst-rollcall",       label: "MST Roll Call",      icon: ClipboardCheck },
   { href: "/eligibility",        label: "Eligibility",        icon: CheckSquare },
   { href: "/follow-up",          label: "VT / Follow-up",     icon: ClipboardList },
