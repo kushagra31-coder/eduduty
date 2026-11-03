@@ -13,3 +13,7 @@ vens/
 .env.*
 !.env.example
 *.env
+
+# SQLite WAL and lock files
+*.db-wal
+*.db-shm

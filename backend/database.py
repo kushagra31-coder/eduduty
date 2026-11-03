@@ -41,6 +41,21 @@ if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=connect_args)
+
+# SQLite performance tuning applied once per new connection
+if SQLALCHEMY_DATABASE_URL.startswith('sqlite'):
+    from sqlalchemy import event as _sa_event
+
+    @_sa_event.listens_for(engine, 'connect')
+    def _set_sqlite_pragmas(dbapi_conn, _record):
+        cur = dbapi_conn.cursor()
+        cur.execute('PRAGMA journal_mode=WAL;')
+        cur.execute('PRAGMA cache_size=-65536;')
+        cur.execute('PRAGMA synchronous=NORMAL;')
+        cur.execute('PRAGMA temp_store=MEMORY;')
+        cur.execute('PRAGMA mmap_size=268435456;')
+        cur.close()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

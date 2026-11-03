@@ -8,19 +8,14 @@ from sqlalchemy import text
 def seed_portal_data():
     db = SessionLocal()
     try:
-        # 1. Seed examination rooms (Rooms 340-349, 353)
+        # 1. Seed examination rooms (Rooms 335, 336, 346, 347, 348, 349, capacity 80)
         desired_rooms = [
-            ("340", 60),
-            ("341", 60),
-            ("342", 60),
-            ("343", 80),
-            ("344", 60),
-            ("345", 60),
-            ("346", 60),
-            ("347", 60),
-            ("348", 60),
-            ("349", 60),
-            ("353", 60),
+            ("335", 80),
+            ("336", 80),
+            ("346", 80),
+            ("347", 80),
+            ("348", 80),
+            ("349", 80),
         ]
         desired_room_numbers = {room_no for room_no, _ in desired_rooms}
         
@@ -81,10 +76,10 @@ def seed_portal_data():
                         db.add(new_el)
             db.commit()
 
-        # 4. Generate initial seating for MST-1 in Room 343 and Room 101 so seating map is immediately viewable
-        r343 = db.query(models.Room).filter_by(room_number="343").first()
+        # 4. Generate initial seating for MST-1 in Room 335 if needed
+        r335 = db.query(models.Room).filter_by(room_number="335").first()
         seats_count = db.query(models.Seat).filter_by(mst_exam_id=1).count()
-        if seats_count == 0 and r343:
+        if seats_count == 0 and r335:
             # Generate seats for exam 1
             students = db.query(models.Student).filter_by(class_id=1, active=True).order_by(models.Student.roll_number).all()
             for idx in range(0, len(students), 2):
@@ -93,7 +88,7 @@ def seed_portal_data():
                 seat_no = f"S{idx//2 + 1:02d}"
                 seat = models.Seat(
                     mst_exam_id=1,
-                    room_id=r343.id,
+                    room_id=r335.id,
                     seat_number=seat_no,
                     left_student=s_left.id if s_left else None,
                     right_student=s_right.id if s_right else None,

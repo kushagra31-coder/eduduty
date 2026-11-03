@@ -504,23 +504,38 @@ async def handle_ai_message(message: str, db: Session) -> dict:
       { "type": "answer"|"write_proposal"|"pdf_link"|"error",
         "content": str | dict }
     """
-    msg_lower = message.lower()
+    msg_lower = message.lower().strip()
 
     # ── PDF intent detection ──────────────────────────────────────────────────
-    if any(k in msg_lower for k in ["pdf", "download", "print"]):
+    if any(k in msg_lower for k in ["pdf", "download", "print", "report card"]):
         # 1. Look for roll number candidate and verify against DB
-        roll_matches = re.findall(r"\b[A-Za-z0-9_-]{4,}\b", message)
-        for cand in roll_matches:
-            student = db.query(models.Student).filter(models.Student.roll_number.ilike(cand)).first()
-            if student:
-                return {
-                    "type": "pdf_link",
-                    "content": f"/pdf/student/{student.roll_number}",
-                    "message": f"Here is the PDF report link for {student.name} ({student.roll_number}).",
-                }
+        roll_tokens = re.findall(r"\b[A-Za-z0-9_-]{3,}\b", message)
+        stop_words = {
+            "pdf", "download", "print", "report", "card", "student", "roll", "for",
+            "the", "get", "give", "show", "view", "link", "exam", "room", "mst",
+            "what", "which", "where", "please", "can", "you", "generate"
+        }
+        candidates = [t for t in roll_tokens if t.lower() not in stop_words]
+
+        matched_student = None
+        for cand in candidates:
+            # Exact match
+            matched_student = db.query(models.Student).filter(models.Student.roll_number.ilike(cand)).first()
+            if not matched_student:
+                # Partial match (e.g. '241001' matching '0827CI241001' or '231006')
+                matched_student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{cand}%")).first()
+            if matched_student:
+                break
+
+        if matched_student:
+            return {
+                "type": "pdf_link",
+                "content": f"/pdf/student/{matched_student.roll_number}",
+                "message": f"Here is the PDF attendance & eligibility report for **{matched_student.name}** (`{matched_student.roll_number}`).",
+            }
 
         # 2. Look for exam + room for seating chart PDF
-        if "seating" in msg_lower or ("exam" in msg_lower and "room" in msg_lower):
+        if "seating" in msg_lower or ("room" in msg_lower and ("exam" in msg_lower or "mst" in msg_lower or "chart" in msg_lower)):
             rooms = db.query(models.Room).all()
             matched_room = None
             for r in rooms:
@@ -539,15 +554,49 @@ async def handle_ai_message(message: str, db: Session) -> dict:
                 return {
                     "type": "pdf_link",
                     "content": f"/pdf/seating/{matched_exam.id}/{matched_room.id}",
-                    "message": f"Here is the seating chart PDF link for {matched_exam.label} in {matched_room.room_number}.",
+                    "message": f"Here is the seating chart PDF link for **{matched_exam.label}** in **Room {matched_room.room_number}**.",
+                }
+            elif matched_exam and not matched_room:
+                return {
+                    "type": "answer",
+                    "content": (
+                        f"### 📄 Seating Chart PDF Request\n\n"
+                        f"Please specify an exam room for **{matched_exam.label}**.\n\n"
+                        f"Active classrooms: **335, 336, 346, 347, 348, 349**\n\n"
+                        f"*Example: 'Seating PDF for {matched_exam.label} in Room 335'*"
+                    )
                 }
 
-        # If entity could not be resolved, fall through to normal query path.
-        # Do not return a hardcoded /pdf/seating/1/1 shortcut.
+        # 3. If roll candidate was provided but not found in DB
+        if candidates or "roll" in msg_lower:
+            cand_str = candidates[0] if candidates else "specified"
+            return {
+                "type": "answer",
+                "content": (
+                    f"### 🔍 Student Record Not Found\n\n"
+                    f"Could not find any student matching roll number **'{cand_str}'** in the database.\n\n"
+                    f"Active student roll numbers in the portal follow the format:\n"
+                    f"- **Year 2 (CI-1)**: `0827CI241001` to `0827CI241071` (e.g., *'PDF for roll 241001'*)\n"
+                    f"- **Year 3**: `0827CI231006`\n\n"
+                    f"Please check the roll number and try again."
+                )
+            }
+
+        # 4. Generic PDF request without specific student or room
+        return {
+            "type": "answer",
+            "content": (
+                f"### 📄 PDF Document Export\n\n"
+                f"EduDuty can generate two types of PDF documents:\n\n"
+                f"1. **Student Attendance & Eligibility Report**:\n"
+                f"   - *'PDF for roll 241001'* or *'PDF for 0827CI241001'*\n"
+                f"2. **Room Seating Chart**:\n"
+                f"   - *'Seating PDF for MST-1 in Room 335'*\n\n"
+                f"Configured classrooms: **335, 336, 346, 347, 348, 349**."
+            )
+        }
 
     # ── Missing Class Attendance Guard ────────────────────────────────────────
-    # If user explicitly asked for attendance, eligibility, or borderline data of a class
-    # that has NO student attendance uploaded yet, inform them directly and helpfully!
     classes_with_students = [
         r[0] for r in db.execute(
             text("SELECT DISTINCT c.name FROM students s JOIN classes c ON c.id = s.class_id WHERE s.active = 1")
@@ -565,7 +614,7 @@ async def handle_ai_message(message: str, db: Session) -> dict:
             target_class = cname
             break
 
-    if target_class and target_class not in classes_with_students and not any(w in msg_lower for w in ["timetable", "schedule"]):
+    if target_class and target_class not in classes_with_students and not any(w in msg_lower for w in ["timetable", "schedule", "room", "venue"]):
         classes_list_str = ", ".join(f"**{c}**" for c in classes_with_students) if classes_with_students else "None"
         return {
             "type": "answer",
@@ -599,7 +648,7 @@ async def handle_ai_message(message: str, db: Session) -> dict:
             fb_op = _fallback_write_intent(message, db)
             if fb_op:
                 return {"type": "write_proposal", "content": fb_op}
-            return {"type": "error", "content": "AI write parser offline. Please specify the operation clearly, e.g., 'Override roll 0827CI241101 for MST-1 with reason Medical ground'."}
+            return {"type": "error", "content": "AI write parser offline. Please specify the operation clearly, e.g., 'Override roll 0827CI241001 for MST-1 with reason Medical ground'."}
         except (json.JSONDecodeError, ValueError) as e:
             return {"type": "error", "content": f"Could not parse write intent: {e}"}
 
@@ -636,7 +685,7 @@ def _fallback_write_intent(message: str, db: Session) -> dict | None:
     msg = message.strip()
     msg_lower = msg.lower()
 
-    # 1. Override eligibility: "override roll 0827CI241101 for MST-1"
+    # 1. Override eligibility: "override roll 0827CI241001 for MST-1"
     if "override" in msg_lower:
         roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", msg)
         exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
@@ -652,7 +701,7 @@ def _fallback_write_intent(message: str, db: Session) -> dict | None:
                 "reason": reason,
             }
 
-    # 2. Mark attendance: "mark roll 0827CI241101 present for MST-1"
+    # 2. Mark attendance: "mark roll 0827CI241001 present for MST-1"
     if "mark" in msg_lower:
         roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", msg)
         exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
@@ -666,7 +715,7 @@ def _fallback_write_intent(message: str, db: Session) -> dict | None:
                 "status": status,
             }
 
-    # 3. Assign duty: "assign [Faculty] to room 101 for MST-1"
+    # 3. Assign duty: "assign [Faculty] to room 335 for MST-1"
     if "assign" in msg_lower and "room" in msg_lower:
         room_match = re.search(r"room\s*([0-9A-Za-z-]+)", msg, re.IGNORECASE)
         exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
@@ -731,7 +780,7 @@ def _heuristic_answer(message: str, db: Session) -> dict:
                 target_class = "CI-1"
 
         # Missing class attendance guard
-        if target_class and target_class not in classes_with_data and not any(w in msg for w in ["timetable", "schedule"]):
+        if target_class and target_class not in classes_with_data and not any(w in msg for w in ["timetable", "schedule", "room", "venue", "class"]):
             classes_list_str = ", ".join(f"**{c}**" for c in classes_with_data) if classes_with_data else "None"
             yr_str = f" ({target_year}rd Year)" if target_year == 3 else f" ({target_year}nd Year)" if target_year else ""
             return {
@@ -745,9 +794,98 @@ def _heuristic_answer(message: str, db: Session) -> dict:
                 )
             }
 
-        # Check for roll number lookup
-        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{4,})\b", message)
-        if roll_match:
+        # ── Handler 1: Classrooms / Exam Venues / Capacity / Desks ──────────
+        if any(w in msg for w in ["room", "rooms", "classroom", "classrooms", "hall", "halls", "venue", "venues", "capacity", "desk", "desks", "bench", "benches"]):
+            rooms = conn.execute(text("SELECT room_number, capacity FROM rooms ORDER BY room_number")).fetchall()
+            table_lines = ["| Classroom | Capacity | Desk Layout & Seating |", "| :--- | :--- | :--- |"]
+            total_cap = 0
+            for r in rooms:
+                rn = r[0]
+                cap = r[1]
+                total_cap += cap
+                desks = cap // 2
+                table_lines.append(f"| **Room {rn}** | {cap} students | {desks} desks · 2 students per desk (Left / Right) |")
+            return {
+                "type": "answer",
+                "content": (
+                    f"### Configured Examination Classrooms & Seating Capacity\n\n"
+                    f"The portal is strictly configured with the **6 actual lecture classrooms**:\n\n" +
+                    "\n".join(table_lines) +
+                    f"\n\n- **Total Seating Capacity**: **{total_cap} students** ({len(rooms)} classrooms × 80 seats)\n"
+                    f"- **Desk Arrangement**: Two students per desk (B1 roll on left, B2 roll on right) to prevent neighboring roll copying.\n"
+                    f"- **Obsolete Venues**: All non-lecture rooms (e.g., labs 340–345, 350, 353) have been removed from the exam pool."
+                )
+            }
+
+        # ── Handler 2: Duty Scheduler Operation & Rules ───────────────────────
+        if any(w in msg for w in ["how duty work", "how does duty", "how invigilation work", "explain duty", "duty operate", "duty scheduler work", "how to assign duty"]):
+            return {
+                "type": "answer",
+                "content": (
+                    "### How the Faculty Invigilation Scheduler Operates\n\n"
+                    "The Faculty Duty Scheduler prevents timetable clashes and balances invigilation loads:\n\n"
+                    "1. **Mandatory Exam Constraints**: Every scheduled exam requires a **Scheduled Date** and **Time Slot** (e.g. `09:30-12:30` or `10:30-12:10`).\n"
+                    "2. **Timetable Cross-Referencing**: When you schedule an exam, the engine cross-references each professor's weekly teaching timetable during that exact time window.\n"
+                    "3. **Faculty Status Categorization**:\n"
+                    "   - 🟢 **Free / Available**: Faculty with no scheduled classes in that slot (eligible for invigilation).\n"
+                    "   - 🔴 **Teaching / Busy**: Faculty actively teaching Year 2 or Year 3 classes (cannot be assigned to prevent class disruption).\n"
+                    "   - ⚪ **Exempt**: HODs and senior leadership exempt from regular invigilation duties.\n"
+                    "4. **Automated Proposal**: Clicking **Generate Proposal** automatically assigns free faculty to exam rooms while ensuring equal duty counts across the semester."
+                )
+            }
+
+        # ── Handler 3: VT / Remedial Training Rules ───────────────────────────
+        if any(w in msg for w in ["vt rule", "what is vt", "explain vt", "when is vt", "remedial rule", "vocational training rule"]):
+            return {
+                "type": "answer",
+                "content": (
+                    "### Vocational Training (VT) / Remedial Exam Policy\n\n"
+                    "The VT rule engine operates under strict department guidelines:\n\n"
+                    "1. **Compulsory VT Rule**: A student is flagged for **Compulsory VT** *only* if they are **Absent in both MST-1 and MST-2**.\n"
+                    "2. **Clearing Criteria**: If a student appeared and gave either MST-1 or MST-2, they have fulfilled the exam requirement and are **Not Required** for VT.\n"
+                    "3. **Exemptions & Overrides**: Authorized medical leaves or official departmental excuses can be marked as **Excused** with coordinator sign-off.\n"
+                    "4. **Roll-Call Dependent**: VT status updates automatically in real-time as invigilators submit MST attendance on the **[Roll Call](/mst-rollcall)** page."
+                )
+            }
+
+        # ── Handler 4: Free Faculty / Teaching Clashes / Exemptions ───────────
+        if any(w in msg for w in ["free faculty", "free teacher", "free teachers", "teachers are free", "faculty are free", "available faculty", "who is free", "duty free", "free prof", "teaching clash", "exempt", "who is teaching", "teachers free", "faculty free"]) or ("free" in msg and any(k in msg for k in ["teacher", "faculty", "prof", "staff", "who"])):
+            fac_rows = conn.execute(text("SELECT id, name, abbreviation, exempt_from_duty, exempt_reason FROM faculty ORDER BY name")).fetchall()
+            exempt_list = [f"{r[1]} ({r[2]})" for r in fac_rows if r[3]]
+
+            clash_rows = conn.execute(
+                text("""
+                    SELECT ft.day_of_week, ft.period_start, ft.period_end, ft.subject_code,
+                           c.name AS class_name, ft.year, f.name AS faculty_name, f.abbreviation
+                    FROM faculty_timetable ft
+                    JOIN faculty f ON f.id = ft.faculty_id
+                    JOIN classes c ON c.id = ft.class_id
+                    ORDER BY ft.day_of_week, ft.period_start
+                    LIMIT 15
+                """)
+            ).fetchall()
+
+            table_lines = ["| Faculty | Class & Year | Day | Time Slot | Subject |", "| :--- | :--- | :--- | :--- | :--- |"]
+            for r in clash_rows:
+                m = dict(r._mapping)
+                table_lines.append(f"| **{m['faculty_name']}** ({m.get('abbreviation') or ''}) | {m['class_name']} (Yr {m['year']}) | {m['day_of_week']} | {m['period_start']}-{m['period_end']} | {m['subject_code']} |")
+
+            return {
+                "type": "answer",
+                "content": (
+                    f"### Faculty Availability & Clash Overview\n\n"
+                    f"- **Total Faculty Members**: **{len(fac_rows)}**\n"
+                    f"- **Exempt Leadership** (Not assigned exam duties): {', '.join(f'**{e}**' for e in exempt_list)}\n\n"
+                    f"**Teaching Clashes Monitored by System**:\n"
+                    f"EduDuty cross-references active lecture periods to prevent assigning busy faculty during exam slots:\n\n" +
+                    "\n".join(table_lines) +
+                    f"\n\n*View and filter real-time availability on the **[Timetable](/timetable)** and **[Duty Scheduler](/duties)** pages.*"
+                )
+            }
+
+        # ── Handler 5: Specific Student Roll Number or Name Lookup ────────────
+        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", message)
+        if roll_match and not any(k in msg for k in ["mst-1", "mst-2", "mst1", "mst2", "room", "class"]):
             roll = roll_match.group(1)
             row = conn.execute(
                 text("SELECT * FROM ai_attendance_summary WHERE roll_number LIKE :r"),
@@ -755,48 +893,34 @@ def _heuristic_answer(message: str, db: Session) -> dict:
             ).fetchone()
             if row:
                 m = dict(row._mapping)
-                elig_row = conn.execute(
-                    text("SELECT status, override FROM mst_eligibility me JOIN students s ON s.id = me.student_id WHERE s.roll_number LIKE :r"),
-                    {"r": f"%{roll}%"}
-                ).fetchone()
-                status = elig_row[0] if elig_row else "Unknown"
-                override = " (Overridden)" if elig_row and elig_row[1] else ""
+                elig_rows = conn.execute(
+                    text("SELECT me.mst_exam_id, me.status, me.override, me.override_reason, e.label FROM mst_eligibility me JOIN students s ON s.id = me.student_id LEFT JOIN mst_exams e ON e.id = me.mst_exam_id WHERE s.roll_number = :r"),
+                    {"r": m['roll_number']}
+                ).fetchall()
+                elig_status_str = ", ".join(f"{r[4] or 'Exam'}: **{r[1]}**" + (" (Overridden)" if r[2] else "") for r in elig_rows) if elig_rows else "Evaluated"
                 yr_val = m.get('class_year', 2)
-                content = (
-                    f"### Student Record: {m.get('student_name')} (`{m.get('roll_number')}`)\n\n"
-                    f"- **Class & Year**: {m.get('class_name')} · Year {yr_val}\n"
-                    f"- **Overall Attendance**: `{m.get('overall_pct', 0):.1f}%`\n"
-                    f"- **Lowest Subject Attendance**: `{m.get('lowest_subject_pct', 0):.1f}%`\n"
-                    f"- **MST Eligibility Status**: **{status}**{override}\n"
-                )
-                return {"type": "answer", "content": content}
+                return {
+                    "type": "answer",
+                    "content": (
+                        f"### Student Record: {m.get('student_name')} (`{m.get('roll_number')}`)\n\n"
+                        f"- **Class & Year**: {m.get('class_name')} · Year {yr_val}\n"
+                        f"- **Overall Attendance**: **{m.get('overall_pct', 0):.1f}%**\n"
+                        f"- **Lowest Subject Attendance**: **{m.get('lowest_subject_pct', 0):.1f}%**\n"
+                        f"- **MST Eligibility**: {elig_status_str}\n\n"
+                        f"👉 [Download PDF Report](/pdf/student/{m['roll_number']})"
+                    )
+                }
+            elif len(roll) >= 4:
+                return {
+                    "type": "answer",
+                    "content": (
+                        f"### Student Record Not Found\n\n"
+                        f"No student matching roll number **'{roll}'** was found in the database.\n"
+                        f"Active rolls in CI-1: `0827CI241001` to `0827CI241071` (Year 2) and `0827CI231006` (Year 3)."
+                    )
+                }
 
-        # Check for teaching / timetable clashes during exams
-        if any(w in msg for w in ["teaching", "clash", "free faculty", "available faculty", "duty free"]):
-            rows = conn.execute(
-                text("""
-                    SELECT ft.day_of_week, ft.period_start, ft.period_end, ft.subject_code, ft.room,
-                           c.name AS class_name, ft.year, f.name AS faculty_name
-                    FROM faculty_timetable ft
-                    JOIN faculty f ON f.id = ft.faculty_id
-                    JOIN classes c ON c.id = ft.class_id
-                    ORDER BY ft.day_of_week, ft.period_start
-                    LIMIT 20
-                """)
-            ).fetchall()
-            if rows:
-                table_lines = ["| Faculty | Class & Year | Day | Time Slot | Subject | Room |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
-                for r in rows:
-                    m = dict(r._mapping)
-                    table_lines.append(f"| **{m['faculty_name']}** | {m['class_name']} (Yr {m['year']}) | {m['day_of_week']} | {m['period_start']}-{m['period_end']} | {m['subject_code']} | {m.get('room') or '—'} |")
-                content = (
-                    f"### Faculty Teaching Schedule & Exam Clash Matrix\n\n"
-                    f"The duty scheduler automatically cross-references these teaching periods to prevent booking faculty who are actively teaching other classes during exam hours:\n\n" +
-                    "\n".join(table_lines)
-                )
-                return {"type": "answer", "content": content}
-
-        # Check for borderline queries
+        # ── Handler 6: Borderline Attendance Queries ──────────────────────────
         if "borderline" in msg or "border line" in msg:
             conds = ["overall_pct >= 45", "overall_pct < 50"]
             params = {}
@@ -839,7 +963,7 @@ def _heuristic_answer(message: str, db: Session) -> dict:
             desc = " " + " ".join(desc_parts) if desc_parts else ""
             return {"type": "answer", "content": f"No borderline students found with attendance between 45% and 50%{desc}."}
 
-        # Check for VT candidates / remedial queries
+        # ── Handler 7: VT Candidates / Remedial Follow-up ─────────────────────
         if any(w in msg for w in ["vt", "remedial", "follow-up", "follow up", "candidate"]):
             conds = []
             params = {}
@@ -898,14 +1022,14 @@ def _heuristic_answer(message: str, db: Session) -> dict:
                 f"- **Rule Engine**: Students absent in **both MST-1 and MST-2** are flagged for compulsory remedial VT.\n"
                 f"- **Total Students Evaluated**: `{total_evaluated}`\n"
                 f"- **Compulsory Follow-Up** (Absent in both MST-1 & MST-2): `{compulsory}`\n"
-                f"- **Completed & Exempted** (Cleared MST): `{not_required + completed}`\n"
-                f"- **Under Review** (Pending roll-call data): `{under_review}`\n"
-                f"- **Excused / Approved** (Authorized overrides): `{excused}`"
+                f"- **Cleared & Exempted**: `{not_required + completed}`\n"
+                f"- **Under Review**: `{under_review}`\n"
+                f"- **Excused / Approved**: `{excused}`"
                 f"{table_section}"
             )
             return {"type": "answer", "content": content}
 
-        # Check for Duty roster queries
+        # ── Handler 8: Duty Roster Queries ────────────────────────────────────
         if any(w in msg for w in ["duty", "duties", "invigilat", "roster"]):
             rows = conn.execute(
                 text("SELECT mst_label, exam_date, room_number, faculty_name, duty_status FROM ai_duty_roster ORDER BY exam_date DESC LIMIT 15")
@@ -923,66 +1047,73 @@ def _heuristic_answer(message: str, db: Session) -> dict:
                 return {"type": "answer", "content": content}
             return {"type": "answer", "content": "No duty assignments have been created yet. Generate them in the Duty Scheduler tab."}
 
-        # Check for Eligibility count / general stats
-        conds = []
-        params = {}
-        if target_class:
-            conds.append("class_name = :cls")
-            params["cls"] = target_class
-        if target_year:
-            conds.append("class_year = :yr")
-            params["yr"] = target_year
-        if target_exam:
-            conds.append("mst_label = :exam")
-            params["exam"] = target_exam
+        # ── Handler 9: Eligibility & Attendance Counts ("How many...", "Eligible...")
+        if any(w in msg for w in ["eligib", "how many", "count", "number of", "attendance", "stats", "summary", "ineligible", "percent"]):
+            conds = []
+            params = {}
+            if target_class:
+                conds.append("class_name = :cls")
+                params["cls"] = target_class
+            if target_year:
+                conds.append("class_year = :yr")
+                params["yr"] = target_year
+            if target_exam:
+                conds.append("mst_label = :exam")
+                params["exam"] = target_exam
 
-        where_str = (" WHERE " + " AND ".join(conds)) if conds else ""
-        rows = conn.execute(
-            text(f"SELECT class_name, class_year, mst_label, eligible_count, ineligible_count, missing_count FROM ai_eligibility_summary{where_str} ORDER BY class_year, class_name, mst_label"),
-            params
-        ).fetchall()
+            where_str = (" WHERE " + " AND ".join(conds)) if conds else ""
+            rows = conn.execute(
+                text(f"SELECT class_name, class_year, mst_label, eligible_count, ineligible_count, missing_count FROM ai_eligibility_summary{where_str} ORDER BY class_year, class_name, mst_label"),
+                params
+            ).fetchall()
 
-        if rows:
-            total_eligible = sum(dict(r._mapping).get("eligible_count", 0) for r in rows)
-            total_ineligible = sum(dict(r._mapping).get("ineligible_count", 0) for r in rows)
-            total_missing = sum(dict(r._mapping).get("missing_count", 0) for r in rows)
-            table_lines = ["| Class | Year | Exam | Eligible (>=45%) | Ineligible (<45%) | Pending Attendance |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
-            for r in rows:
-                m = dict(r._mapping)
-                table_lines.append(f"| **{m['class_name']}** | Yr {m['class_year']} | {m['mst_label']} | **{m['eligible_count']}** eligible | {m['ineligible_count']} ineligible | {m['missing_count']} pending |")
+            if rows:
+                total_eligible = sum(dict(r._mapping).get("eligible_count", 0) for r in rows)
+                total_ineligible = sum(dict(r._mapping).get("ineligible_count", 0) for r in rows)
+                total_missing = sum(dict(r._mapping).get("missing_count", 0) for r in rows)
+                total_students = total_eligible + total_ineligible + total_missing
 
-            title_parts = []
-            if target_class: title_parts.append(target_class)
-            if target_year: title_parts.append(f"Year {target_year}")
-            if target_exam: title_parts.append(target_exam)
-            title_suffix = f" ({', '.join(title_parts)})" if title_parts else ""
+                cls_str = f" in **{target_class}**" if target_class else ""
+                exam_str = f" for **{target_exam}**" if target_exam else ""
+                direct_answer = f"There are **{total_eligible}** students eligible{cls_str}{exam_str} (out of {total_students} evaluated; {total_ineligible} are ineligible due to attendance below 45%)."
 
-            content = (
-                f"### Examination Eligibility Summary{title_suffix}\n\n"
-                f"- **Total Eligible Records**: `{total_eligible}`\n"
-                f"- **Total Ineligible Records**: `{total_ineligible}`\n"
-                f"- **Pending Attendance Records**: `{total_missing}`\n\n" +
-                "\n".join(table_lines)
-            )
-            return {"type": "answer", "content": content}
+                table_lines = ["| Class | Year | Exam | Eligible (>=45%) | Ineligible (<45%) | Pending Attendance |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| **{m['class_name']}** | Yr {m['class_year']} | {m['mst_label']} | **{m['eligible_count']}** eligible | {m['ineligible_count']} ineligible | {m['missing_count']} pending |")
 
-        # Default fallback overview
+                title_parts = []
+                if target_class: title_parts.append(target_class)
+                if target_year: title_parts.append(f"Year {target_year}")
+                if target_exam: title_parts.append(target_exam)
+                title_suffix = f" ({', '.join(title_parts)})" if title_parts else ""
+
+                content = (
+                    f"### Examination Eligibility Summary{title_suffix}\n\n"
+                    f"{direct_answer}\n\n"
+                    f"- **Total Eligible (≥45%)**: `{total_eligible}`\n"
+                    f"- **Total Ineligible (<45%)**: `{total_ineligible}`\n"
+                    f"- **Pending Attendance Records**: `{total_missing}`\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+
+        # ── Handler 10: General Intelligent Fallback ──────────────────────────
         total_students = conn.execute(text("SELECT COUNT(*) FROM students")).scalar() or 0
         total_classes = conn.execute(text("SELECT COUNT(*) FROM classes")).scalar() or 0
         total_rooms = conn.execute(text("SELECT COUNT(*) FROM rooms")).scalar() or 0
         return {
             "type": "answer",
             "content": (
-                f"### MST Operations Portal Assistant\n\n"
-                f"System status: **{total_students} students**, **{total_classes} classes (2nd & 3rd Year)**, and **{total_rooms} examination rooms** loaded.\n\n"
-                f"You can ask me to:\n"
-                f"- Check eligibility: *'How many students are eligible for MST-1 in CI-1?'*\n"
-                f"- Compare MSTs: *'Show eligibility comparison for MST-1 and MST-2'* \n"
-                f"- List borderline students: *'List borderline students in 2nd year'* \n"
-                f"- Check VT candidates: *'Who are the VT candidates after MST-2 in CI-1?'*\n"
-                f"- Check teaching clashes: *'Show teachers who are teaching other classes during exam'* \n"
-                f"- Inspect a student: *'Attendance for roll 0827CI241001'*"
+                f"### 👋 EduDuty MST Operations Assistant\n\n"
+                f"Active system status: **{total_students} students**, **{total_classes} classes (2nd & 3rd Year)**, and **{total_rooms} lecture classrooms** (335, 336, 346, 347, 348, 349).\n\n"
+                f"You can ask me questions like:\n"
+                f"- **Eligibility counts**: *'How many CI-1 students are eligible for MST-1?'*\n"
+                f"- **Borderline students**: *'List borderline students in CI-1'*\n"
+                f"- **Classrooms & capacity**: *'What rooms are configured?'*\n"
+                f"- **Faculty availability**: *'Which teachers are free for duty?'* or *'Show teaching clashes'*\n"
+                f"- **Duty scheduler**: *'How does duty scheduling work?'*\n"
+                f"- **VT follow-up**: *'Who are the VT candidates after MST-2?'* or *'What is the VT rule?'*\n"
+                f"- **Student PDF reports**: *'PDF for roll 241001'* or *'Seating PDF for MST-1 in Room 335'*"
             )
         }
-
-

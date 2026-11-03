@@ -49,11 +49,12 @@ export default function AIPage() {
           <div className="flex flex-wrap gap-2 text-xs">
             {[
               'How many CI-1 students are eligible for MST-1?',
-              'List borderline students in CI-2',
+              'List borderline students in CI-1',
+              'What classrooms are configured for MST?',
+              'How does duty scheduling work?',
               'Who are the VT candidates after MST-2?',
-              'Override roll 2301 for MST-1, medical leave',
-              'Mark roll 1042 as Absent for MST-2',
-              'PDF for roll 2301',
+              'PDF for roll 241001',
+              'Override roll 241001 for MST-1, medical leave',
             ].map(prompt => (
               <button
                 key={prompt}

@@ -35,8 +35,16 @@ type Mark = "Present" | "Absent" | null
 async function apiFetch(path: string, init?: RequestInit) {
   const res = await fetch(`${API}${path}`, init)
   if (!res.ok) {
-    const err = await res.json().catch(() => ({})) as { detail?: string }
-    throw new Error(err.detail ?? `HTTP ${res.status}`)
+    const err = await res.json().catch(() => ({})) as { detail?: any; message?: string }
+    let msg = `HTTP ${res.status}`
+    if (typeof err.detail === 'string') {
+      msg = err.detail
+    } else if (Array.isArray(err.detail)) {
+      msg = err.detail.map((e: any) => e.msg || JSON.stringify(e)).join(', ')
+    } else if (err.message) {
+      msg = err.message
+    }
+    throw new Error(msg)
   }
   return res.json()
 }
@@ -151,12 +159,19 @@ export default function RollCallPage() {
     if (!examId) return
     setSubmitting(true)
     try {
+      // Only include marked students ('Present' | 'Absent')
+      const cleanRecords: Record<number, string> = {}
+      for (const [sid, status] of Object.entries(marks)) {
+        if (status === 'Present' || status === 'Absent') {
+          cleanRecords[Number(sid)] = status
+        }
+      }
       const res = await apiFetch("/mst/attendance/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mst_exam_id: examId,
-          records: marks,
+          records: cleanRecords,
         }),
       })
       toast({

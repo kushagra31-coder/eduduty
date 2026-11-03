@@ -65,19 +65,14 @@ def reset_to_fresh_state(preserve_rooms_and_faculty: bool = True):
                 f.name = "Prof. " + f.name.strip()
         db.commit()
 
-        # 4. Ensure standard clean rooms exist without duplicates (Rooms 340-349, 353)
+        # 4. Ensure standard clean rooms exist without duplicates (Rooms 335, 336, 346, 347, 348, 349)
         standard_rooms = [
-            {"room_number": "340", "capacity": 60},
-            {"room_number": "341", "capacity": 60},
-            {"room_number": "342", "capacity": 60},
-            {"room_number": "343", "capacity": 80},
-            {"room_number": "344", "capacity": 60},
-            {"room_number": "345", "capacity": 60},
-            {"room_number": "346", "capacity": 60},
-            {"room_number": "347", "capacity": 60},
-            {"room_number": "348", "capacity": 60},
-            {"room_number": "349", "capacity": 60},
-            {"room_number": "353", "capacity": 60},
+            {"room_number": "335", "capacity": 80},
+            {"room_number": "336", "capacity": 80},
+            {"room_number": "346", "capacity": 80},
+            {"room_number": "347", "capacity": 80},
+            {"room_number": "348", "capacity": 80},
+            {"room_number": "349", "capacity": 80},
         ]
         standard_room_numbers = {r["room_number"] for r in standard_rooms}
 

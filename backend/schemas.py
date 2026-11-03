@@ -235,7 +235,7 @@ class AttendanceMarkBulkOut(BaseModel):
 class AttendanceSubmitIn(BaseModel):
     mst_exam_id: int
     # Optional dictionary mapping student_id -> "Present" | "Absent"
-    records: Optional[dict[int, str]] = None
+    records: Optional[dict[int, Optional[str]]] = None
 
 class AttendanceSubmitOut(BaseModel):
     success: bool

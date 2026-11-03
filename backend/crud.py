@@ -120,6 +120,8 @@ def compute_eligibility_for_student(db: Session, student_id: int, mst_exam_id: i
         db.add(el_record)
         
     db.commit()
+    db.refresh(el_record)
+    return el_record
 
 
 # ── Timetable ──────────────────────────────────────────────────────────────────

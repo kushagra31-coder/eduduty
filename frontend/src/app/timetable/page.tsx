@@ -711,14 +711,36 @@ function FreeBusyGridTab({ refreshKey }: { refreshKey: number }) {
 
   useEffect(() => { load() }, [refreshKey])
 
+  const highlightIds = useMemo(() => {
+    if (!grid || filterStatus === "all") return new Set<number>()
+    const ids = new Set<number>()
+    for (const exam of grid.exams)
+      for (const cell of exam.faculty)
+        if (cell.status === filterStatus) ids.add(cell.faculty_id)
+    return ids
+  }, [grid, filterStatus])
+
   const filteredFaculty = useMemo(() => {
     if (!grid) return []
     const q = search.toLowerCase()
-    return grid.faculty.filter(f =>
+    let list = grid.faculty.filter(f =>
       f.name.toLowerCase().includes(q) ||
       (f.abbreviation ?? "").toLowerCase().includes(q)
     )
-  }, [grid, search])
+    if (filterStatus !== "all") {
+      list = list.filter(f => highlightIds.has(f.id))
+    } else {
+      // When viewing 'All', sort Free faculty to the top for convenience
+      list = [...list].sort((a, b) => {
+        const aFree = grid.exams.some(e => e.faculty.find(c => c.faculty_id === a.id)?.status === "free")
+        const bFree = grid.exams.some(e => e.faculty.find(c => c.faculty_id === b.id)?.status === "free")
+        if (aFree && !bFree) return -1
+        if (!aFree && bFree) return 1
+        return a.name.localeCompare(b.name)
+      })
+    }
+    return list
+  }, [grid, search, filterStatus, highlightIds])
 
   const examSummary = useMemo(() => {
     if (!grid) return {}
@@ -730,15 +752,6 @@ function FreeBusyGridTab({ refreshKey }: { refreshKey: number }) {
     }
     return out
   }, [grid])
-
-  const highlightIds = useMemo(() => {
-    if (!grid || filterStatus === "all") return new Set<number>()
-    const ids = new Set<number>()
-    for (const exam of grid.exams)
-      for (const cell of exam.faculty)
-        if (cell.status === filterStatus) ids.add(cell.faculty_id)
-    return ids
-  }, [grid, filterStatus])
 
   if (loading) return (
     <div className="flex items-center justify-center h-64 gap-3 text-muted-foreground">

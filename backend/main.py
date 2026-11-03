@@ -132,6 +132,13 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     auth.validate_auth_startup()
+    # Pre-warm the SQLite connection so the first real request is fast
+    try:
+        with engine.connect() as _warm:
+            _warm.execute(models.text("SELECT 1"))
+        print("DB warm-up complete.", flush=True)
+    except Exception as _e:
+        print(f"DB warm-up skipped: {_e}", flush=True)
 
 @app.get("/")
 def read_root(user: models.User = Depends(auth.get_current_user)):
@@ -1004,8 +1011,7 @@ def get_student_pdf(
 ):
     """Generate and stream a formal student record PDF."""
     try:
-        html      = pdf_service.build_student_record_html(roll_number, db)
-        pdf_bytes = pdf_service.render_pdf(html)
+        pdf_bytes = pdf_service.build_student_pdf(roll_number, db)
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
@@ -1025,8 +1031,7 @@ def get_seating_pdf(
 ):
     """Generate and stream a seating chart + signature sheet PDF."""
     try:
-        html      = pdf_service.build_seating_chart_html(mst_exam_id, room_id, db)
-        pdf_bytes = pdf_service.render_pdf(html)
+        pdf_bytes = pdf_service.build_seating_pdf(mst_exam_id, room_id, db)
         exam  = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
         room  = db.query(models.Room).filter_by(id=room_id).first()
         fname = f"seating_{exam.label if exam else mst_exam_id}_room{room.room_number if room else room_id}.pdf"
@@ -1288,8 +1293,26 @@ def create_mst_exam(
     user: models.User = Depends(auth.require_role("hod", "coordinator")),
     db: Session = Depends(get_db)
 ):
-    exam = models.MstExam(label=req.label, exam_date=req.exam_date,
-                          time_slot=req.time_slot, class_id=req.class_id)
+    if not req.label or not req.label.strip():
+        raise HTTPException(status_code=400, detail="Exam label (e.g. MST-1 or MST-2) is required.")
+    if not req.exam_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Exam Date is a mandatory constraint so the Faculty Duty Scheduler can accurately detect timetable clashes."
+        )
+    if not req.time_slot or not req.time_slot.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Time Slot (e.g. 10:30-12:10 or 09:30-12:30) is a mandatory constraint for clash detection."
+        )
+    if not req.class_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Class selection is a mandatory constraint. Please select a specific class (CI-1, CI-2, CY)."
+        )
+
+    exam = models.MstExam(label=req.label.strip(), exam_date=req.exam_date,
+                          time_slot=req.time_slot.strip(), class_id=req.class_id)
     db.add(exam)
     db.commit()
     db.refresh(exam)
@@ -1994,8 +2017,7 @@ def export_follow_up_pdf(
     db: Session = Depends(get_db)
 ):
     rows = _compulsory_follow_up_rows(db, class_id)
-    html = pdf_service.build_follow_up_list_html(rows)
-    pdf_bytes = pdf_service.render_pdf(html)
+    pdf_bytes = pdf_service.build_follow_up_pdf(rows)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -2127,24 +2149,15 @@ def faculty_status_for_exam(
     day = exam.exam_date.strftime("%a").upper() if exam.exam_date else None
     if day:
         day = _DAY_ALIASES.get(day, day)  # match stored MON/TUE/WED/THUR/FRI values
-    start, end = "09:00", "12:00"
+    start, end = "10:30", "12:10"
     if exam.time_slot and "-" in exam.time_slot:
         parts = [p.strip() for p in exam.time_slot.split("-", 1)]
         if len(parts) == 2 and all(parts):
             start, end = parts
 
-    if day:
-        base = crud.check_faculty_availability(db, day, start, end)
-    else:
-        base = [
-            schemas.FacultyAvailabilityResult(
-                faculty_id=f.id, faculty_name=f.name,
-                status="Exempt" if f.exempt_from_duty else "Available",
-                reason=(f.exempt_reason or "No exam date set") if f.exempt_from_duty
-                else "No exam date set",
-            )
-            for f in db.query(models.Faculty).all()
-        ]
+    # Evaluate clash against exam date or default standard slot (e.g. MON)
+    eval_day = day or "MON"
+    base = crud.check_faculty_availability(db, eval_day, start, end)
 
     duties = db.query(models.InvigilationDuty).filter_by(mst_exam_id=exam.id).all()
     rooms = {r.id: r.room_number for r in db.query(models.Room).all()}

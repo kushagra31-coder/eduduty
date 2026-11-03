@@ -44,7 +44,7 @@ type FacultyStatus = {
   reason: string
 }
 type Duty = { id: number; room_id: number; room_number: string; faculty_id: number | null; faculty_name: string | null; status: string }
-type ClassInfo = { id: number; name: string; branch: string }
+type ClassInfo = { id: number; name: string; branch: string; year?: number; section?: string }
 
 type Mark = "Present" | "Absent" | null
 
@@ -312,23 +312,38 @@ export default function SeatingTrackerPage() {
 
   // Create new exam
   async function createExam() {
-    if (!newExam.label.trim()) return
+    if (!newExam.label.trim()) {
+      toast({ title: "Exam Label Required", description: "Please enter an exam label (e.g. MST-1 or MST-2).", variant: "destructive" })
+      return
+    }
+    if (!newExam.exam_date) {
+      toast({ title: "Exam Date Required", description: "Exam Date is a mandatory constraint for faculty duty clash detection.", variant: "destructive" })
+      return
+    }
+    if (!newExam.time_slot.trim()) {
+      toast({ title: "Time Slot Required", description: "Time Slot is mandatory so the system can verify teaching timetable conflicts.", variant: "destructive" })
+      return
+    }
+    if (!newExam.class_id) {
+      toast({ title: "Class Required", description: "Please select which class (e.g. CI-1, CI-2, CY) sits this exam.", variant: "destructive" })
+      return
+    }
     setBusy(true)
     try {
       const created = await api("/mst/exams", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          label: newExam.label,
-          exam_date: newExam.exam_date || null,
-          time_slot: newExam.time_slot || null,
-          class_id: newExam.class_id ? Number(newExam.class_id) : null,
+          label: newExam.label.trim(),
+          exam_date: newExam.exam_date,
+          time_slot: newExam.time_slot.trim(),
+          class_id: Number(newExam.class_id),
         }),
       })
       const e = await api("/mst/exams")
       setExams(e)
       setExamId(created.id)
-      toast({ title: "Exam Created", description: `${created.label} is ready for seating allocation.` })
+      toast({ title: "Exam Scheduled", description: `${created.label} (${newExam.exam_date} ${newExam.time_slot}) is configured with duty clash constraints.` })
       setShowSetupModal(false)
     } catch (err) {
       toast({ title: "Couldn't create exam", description: (err as Error).message, variant: "destructive" })
@@ -782,6 +797,8 @@ export default function SeatingTrackerPage() {
             {displayedRooms.map((room) => {
               const duty = dutyByRoom[room.room_id]
               const availableFaculty = faculty.filter((f) => f.status === "Available")
+              const busyFaculty = faculty.filter((f) => f.status === "Teaching")
+              const exemptFaculty = faculty.filter((f) => f.status === "Exempt")
 
               // Extract Batch 1 and Batch 2 students for this room in ascending order
               const b1Students = room.seats
@@ -864,14 +881,49 @@ export default function SeatingTrackerPage() {
                               <SelectTrigger className="w-[160px] h-8 text-xs">
                                 <SelectValue placeholder="Assign Invigilator" />
                               </SelectTrigger>
-                              <SelectContent>
-                                {availableFaculty.map((f) => (
-                                  <SelectItem key={f.faculty_id} value={String(f.faculty_id)} className="text-xs">
-                                    {f.abbreviation ? `${f.abbreviation} — ` : ""}{f.faculty_name}
-                                  </SelectItem>
-                                ))}
-                                {availableFaculty.length === 0 && (
-                                  <div className="p-2 text-xs text-muted-foreground">No available faculty for this slot</div>
+                              <SelectContent className="max-h-[300px]">
+                                {availableFaculty.length > 0 && (
+                                  <>
+                                    <div className="px-2 py-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider bg-emerald-500/10 rounded-xs mb-1">
+                                      Free / Available ({availableFaculty.length})
+                                    </div>
+                                    {availableFaculty.map((f) => (
+                                      <SelectItem key={f.faculty_id} value={String(f.faculty_id)} className="text-xs">
+                                        <span className="text-emerald-500 font-bold mr-1.5">●</span>
+                                        {f.abbreviation ? `${f.abbreviation} — ` : ""}{f.faculty_name}
+                                      </SelectItem>
+                                    ))}
+                                  </>
+                                )}
+                                {busyFaculty.length > 0 && (
+                                  <>
+                                    <div className="px-2 py-1 text-[10px] font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider bg-red-500/10 rounded-xs mt-2 mb-1">
+                                      Teaching / Busy ({busyFaculty.length})
+                                    </div>
+                                    {busyFaculty.map((f) => (
+                                      <SelectItem key={f.faculty_id} value={String(f.faculty_id)} disabled className="text-xs opacity-50 cursor-not-allowed">
+                                        <span className="text-red-500 font-bold mr-1.5">✕</span>
+                                        {f.abbreviation ? `${f.abbreviation} — ` : ""}{f.faculty_name}
+                                        <span className="text-[10px] text-muted-foreground ml-1">({f.reason})</span>
+                                      </SelectItem>
+                                    ))}
+                                  </>
+                                )}
+                                {exemptFaculty.length > 0 && (
+                                  <>
+                                    <div className="px-2 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider bg-muted rounded-xs mt-2 mb-1">
+                                      Exempt ({exemptFaculty.length})
+                                    </div>
+                                    {exemptFaculty.map((f) => (
+                                      <SelectItem key={f.faculty_id} value={String(f.faculty_id)} disabled className="text-xs opacity-50 cursor-not-allowed">
+                                        <span className="text-muted-foreground mr-1.5">○</span>
+                                        {f.abbreviation ? `${f.abbreviation} — ` : ""}{f.faculty_name}
+                                      </SelectItem>
+                                    ))}
+                                  </>
+                                )}
+                                {faculty.length === 0 && (
+                                  <div className="p-2 text-xs text-muted-foreground">No faculty found</div>
                                 )}
                               </SelectContent>
                             </Select>
@@ -1243,11 +1295,16 @@ export default function SeatingTrackerPage() {
             </div>
 
             {/* Add Exam Section */}
-            <div className="space-y-3">
-              <Label className="text-xs font-semibold">Schedule New Exam</Label>
+            <div className="space-y-3 pt-2 border-t">
+              <div>
+                <Label className="text-xs font-semibold flex items-center justify-between">
+                  <span>Schedule New Exam</span>
+                  <span className="text-[10px] text-amber-500 font-normal">All fields mandatory for duty clash engine</span>
+                </Label>
+              </div>
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div>
-                  <Label className="text-[11px] text-muted-foreground">Label</Label>
+                  <Label className="text-[11px] text-muted-foreground">Exam Label <span className="text-red-500">*</span></Label>
                   <Input
                     placeholder="MST-1 / MST-2"
                     value={newExam.label}
@@ -1256,7 +1313,22 @@ export default function SeatingTrackerPage() {
                   />
                 </div>
                 <div>
-                  <Label className="text-[11px] text-muted-foreground">Date</Label>
+                  <Label className="text-[11px] text-muted-foreground">Class <span className="text-red-500">*</span></Label>
+                  <Select value={newExam.class_id} onValueChange={(v) => setNewExam({ ...newExam, class_id: v ?? "" })}>
+                    <SelectTrigger className="h-8 text-xs mt-1">
+                      <SelectValue placeholder="Select class" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {classes.map((c) => (
+                        <SelectItem key={c.id} value={String(c.id)} className="text-xs">
+                          {c.name} {c.year ? `(Year ${c.year})` : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label className="text-[11px] text-muted-foreground">Exam Date <span className="text-red-500">*</span></Label>
                   <Input
                     type="date"
                     value={newExam.exam_date}
@@ -1265,31 +1337,37 @@ export default function SeatingTrackerPage() {
                   />
                 </div>
                 <div>
-                  <Label className="text-[11px] text-muted-foreground">Time Slot</Label>
+                  <Label className="text-[11px] text-muted-foreground">Time Slot <span className="text-red-500">*</span></Label>
                   <Input
-                    placeholder="09:30-12:30"
+                    placeholder="10:30-12:10"
                     value={newExam.time_slot}
                     onChange={(e) => setNewExam({ ...newExam, time_slot: e.target.value })}
                     className="h-8 text-xs mt-1"
                   />
-                </div>
-                <div>
-                  <Label className="text-[11px] text-muted-foreground">Class</Label>
-                  <Select value={newExam.class_id} onValueChange={(v) => setNewExam({ ...newExam, class_id: v ?? "" })}>
-                    <SelectTrigger className="h-8 text-xs mt-1">
-                      <SelectValue placeholder="Pick class" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {classes.map((c) => (
-                        <SelectItem key={c.id} value={String(c.id)} className="text-xs">
-                          {c.name} · {c.branch}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                  <div className="flex gap-1 mt-1">
+                    <button
+                      type="button"
+                      onClick={() => setNewExam({ ...newExam, time_slot: "10:30-12:10" })}
+                      className="text-[9px] px-1 py-0.5 rounded bg-muted hover:bg-muted/80 text-muted-foreground"
+                    >
+                      10:30-12:10
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewExam({ ...newExam, time_slot: "09:30-12:30" })}
+                      className="text-[9px] px-1 py-0.5 rounded bg-muted hover:bg-muted/80 text-muted-foreground"
+                    >
+                      09:30-12:30
+                    </button>
+                  </div>
                 </div>
               </div>
-              <Button size="sm" onClick={createExam} disabled={busy} className="w-full text-xs h-8 mt-2">
+              <Button
+                size="sm"
+                onClick={createExam}
+                disabled={busy || !newExam.label.trim() || !newExam.exam_date || !newExam.time_slot.trim() || !newExam.class_id}
+                className="w-full text-xs h-8 mt-2"
+              >
                 Create MST Exam Slot
               </Button>
             </div>
