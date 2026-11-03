@@ -44,46 +44,6 @@ type Stats = {
   recent_activity: ActivityItem[]
 }
 
-type MstExam = {
-  id: number
-  label: string
-  exam_date: string | null
-  time_slot: string | null
-  class_id: number | null
-}
-
-type FollowUpStats = {
-  total_evaluated: number
-  total_students: number
-  missing_records: number
-  by_final_status: Record<string, number>
-  by_calculated_status: Record<string, number>
-}
-
-type DutyItem = {
-  id: number
-  room_id: number
-  room_number: string
-  faculty_id: number | null
-  faculty_name: string | null
-  status: string
-  exam_label?: string
-  exam_date?: string | null
-  time_slot?: string | null
-}
-
-type TimetableSlot = {
-  id: number
-  faculty_id: number
-  day_of_week: string
-  period_start: string
-  period_end: string
-  subject_code: string | null
-  subject_name: string | null
-  room: string | null
-  batch: string | null
-}
-
 function timeAgo(iso: string | null): string {
   if (!iso) return ""
   const secs = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000))
@@ -119,7 +79,6 @@ function StatCard({
 }
 
 export default function Dashboard() {
-  const { user, role, facultyId } = useAuth()
   const [stats, setStats] = useState<Stats | null>(null)
   const [error, setError] = useState(false)
   const [resetting, setResetting] = useState(false)

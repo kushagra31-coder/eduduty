@@ -526,16 +526,16 @@ def _import_subject_workbook(db: Session, xls, filename: str, class_id: Optional
         for exam in target_exams:
             crud.compute_eligibility_for_student(db, sid, exam.id)
 
-    imported = [s for s in sheets_summary if s["status"] == "imported"]
     db.add(models.AuditLog(
         table_name="attendance_records", record_id=0, field_changed="import",
-        new_value=f"{total_records} rows across {len(imported)} subjects",
+        new_value=f"{total_records} rows across "
+                  f"{sum(1 for s in sheets_summary if s['status'] == 'imported')} subjects",
         reason=filename,
     ))
     db.commit()
 
+    imported = [s for s in sheets_summary if s["status"] == "imported"]
     if not imported:
-        db.rollback()
         raise HTTPException(
             status_code=400,
             detail="No subject attendance sheets found. Expected sheets with "
@@ -558,60 +558,14 @@ async def upload_attendance(
     user: models.User = Depends(auth.require_role("hod", "coordinator", "faculty")),
     db: Session = Depends(get_db)
 ):
-    # 1. Pre-check Content-Length header if provided by client
-    content_length = request.headers.get("content-length")
-    if content_length and content_length.isdigit():
-        if int(content_length) > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=413, detail="File size exceeds maximum permitted limit of 10 MiB.")
+    if not file.filename.endswith(('.xls', '.xlsx')):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an Excel file.")
 
-    # 2. File extension check (.xls, .xlsx)
-    filename = (file.filename or "").strip()
-    if not filename.lower().endswith(('.xls', '.xlsx')):
-        raise HTTPException(status_code=400, detail="Invalid file extension. Please upload an Excel file (.xls or .xlsx).")
-
-    # 3. Bounded chunked streaming read (guarantees size enforcement even with missing/spoofed Content-Length)
-    CHUNK_SIZE = 64 * 1024
-    contents = bytearray()
-    while True:
-        chunk = await file.read(CHUNK_SIZE)
-        if not chunk:
-            break
-        contents.extend(chunk)
-        if len(contents) > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=413, detail="File size exceeds maximum permitted limit of 10 MiB.")
-
-    # 4. Empty file check
-    if len(contents) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    # 5. Magic Bytes Container Validation & ZIP Archive Safety Check
-    is_xlsx = contents.startswith(b"PK\x03\x04") or contents.startswith(b"PK\x05\x06")
-    is_xls = contents.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
-    if not (is_xlsx or is_xls):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or corrupt Excel file format: magic header signature does not match XLS or XLSX."
-        )
-
-    if is_xlsx:
-        try:
-            with zipfile.ZipFile(io.BytesIO(bytes(contents))) as zf:
-                infolist = zf.infolist()
-                if len(infolist) > 100:
-                    raise HTTPException(status_code=400, detail="Excel ZIP archive exceeds maximum permitted entry limit (100 entries).")
-                uncompressed_size = sum(z.file_size for z in infolist)
-                if uncompressed_size > 50 * 1024 * 1024:
-                    raise HTTPException(status_code=400, detail="Excel ZIP archive exceeds maximum permitted uncompressed size limit (50 MiB).")
-                if len(contents) > 0 and (uncompressed_size / len(contents)) > 100.0 and uncompressed_size > 1 * 1024 * 1024:
-                    raise HTTPException(status_code=400, detail="Excel ZIP archive decompression ratio exceeds safety limits.")
-        except zipfile.BadZipFile:
-            raise HTTPException(status_code=400, detail="Invalid or corrupt Excel ZIP archive.")
-
-    # 6. Parser Execution & Structure Boundary Enforcement
+    contents = await file.read()
     try:
-        xls = pd.ExcelFile(io.BytesIO(bytes(contents)))
+        xls = pd.ExcelFile(io.BytesIO(contents))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not parse Excel file: corrupt spreadsheet structure or invalid formatting.")
+        raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
 
     target_class_id = class_id
     if target_class_id is None:
@@ -669,29 +623,9 @@ async def upload_attendance(
     if not target_class:
         raise HTTPException(status_code=404, detail=f"Class with id {target_class_id} not found")
 
-    # Atomic transaction execution with explicit rollback on error
     try:
-        # Probe for subject workbook sheets
-        try:
-            probe = []
-            for sh in xls.sheet_names:
-                df_sheet = xls.parse(sh, header=None)
-                if len(df_sheet) > 10000 or len(df_sheet.columns) > 100:
-                    raise HTTPException(status_code=400, detail=f"Sheet '{sh}' exceeds maximum permitted dimensions (10,000 rows x 100 columns).")
-                probe.append(_parse_subject_sheet(df_sheet))
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
-
-        if any(p for p in probe):
-            return _import_subject_workbook(db, xls, filename)
-
-        # Single-sheet fallback processing
         df = xls.parse(xls.sheet_names[0])
-        if len(df) > 10000 or len(df.columns) > 100:
-            raise HTTPException(status_code=400, detail="Excel sheet exceeds maximum permitted dimensions (10,000 rows x 100 columns).")
-
+        # Normalize column names for lookup (case/space/underscore-insensitive)
         colmap = {str(c).strip().lower().replace("_", " ").replace("-", " "): c for c in df.columns}
         def col(*names):
             for n in names:
@@ -703,7 +637,6 @@ async def upload_attendance(
         c_total = col("total classes", "classes conducted", "total", "conducted", "held", "lectures held", "total lectures", "total class")
         c_att = col("attended", "classes attended", "attended classes", "present", "lectures attended", "total attended")
         c_batch = [colmap[k] for k in ("batch", "batch number", "batch no") if k in colmap]
-
         def row_batch(row):
             for cb in c_batch:
                 raw = str(row.get(cb, "")).strip().upper()
@@ -766,13 +699,13 @@ async def upload_attendance(
             for ex in target_exams:
                 crud.compute_eligibility_for_student(db, student.id, ex.id)
             imported_count += 1
-
+        # Record the import so the dashboard activity feed can show it
         db.add(models.AuditLog(
             table_name="attendance_records",
             record_id=0,
             field_changed="import",
             new_value=f"{imported_count} rows",
-            reason=filename,
+            reason=file.filename,
         ))
         db.commit()
         return {
@@ -782,7 +715,6 @@ async def upload_attendance(
             "class_conflicts": class_conflicts
         }
     except Exception as e:
-        db.rollback()
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 # ── Import Batch Management ──────────────────────────────────────────────────
@@ -1043,68 +975,11 @@ async def ai_query(
 ):
     """
     Route a natural language message to read / write-proposal / pdf path.
-    Enforces Layer 2 resource-level scope authorization for non-administrative users.
     Returns { type, content }
     """
-    # Resource-level scope enforcement for FACULTY role
-    if current_user.role == FACULTY:
-        if not current_user.faculty_id:
-            raise HTTPException(
-                status_code=403,
-                detail={"error": {"code": "FORBIDDEN", "message": "Access denied: User is not linked to an active faculty record."}}
-            )
-        fac_record = db.query(models.Faculty).filter_by(id=current_user.faculty_id).first()
-        if not fac_record:
-            raise HTTPException(
-                status_code=403,
-                detail={"error": {"code": "FORBIDDEN", "message": "Access denied: User is not linked to an active faculty record."}}
-            )
-        # Resolve permitted class names for this faculty member (Policy 1: Active FacultyTimetable entries only)
-        assigned_class_ids = set()
-        tt_query = db.query(models.FacultyTimetable.class_id).outerjoin(
-            models.TimetableVersion, models.FacultyTimetable.timetable_version_id == models.TimetableVersion.id
-        ).filter(
-            models.FacultyTimetable.faculty_id == current_user.faculty_id,
-            (models.FacultyTimetable.timetable_version_id == None) | (models.TimetableVersion.active == True)
-        )
-        for (cid,) in tt_query.all():
-            if cid:
-                assigned_class_ids.add(cid)
-
-        permitted_classes = set()
-        if assigned_class_ids:
-            classes = db.query(models.Class.name).filter(models.Class.id.in_(assigned_class_ids)).all()
-            permitted_classes = {c[0] for c in classes}
-
-        # Inspect message for class references (e.g. 'CI-1', 'CS-81', 'Cyber-3')
-        all_db_classes = db.query(models.Class).all()
-        for c_obj in all_db_classes:
-            if re.search(rf"\b{re.escape(c_obj.name)}\b", req.message, re.IGNORECASE):
-                if c_obj.name not in permitted_classes:
-                    raise HTTPException(
-                        status_code=403,
-                        detail={
-                            "error": {
-                                "code": "FORBIDDEN",
-                                "message": f"Access denied: Class '{c_obj.name}' is outside your assigned academic scope.",
-                            }
-                        }
-                    )
-
-    scope_classes = permitted_classes if current_user.role == FACULTY else None
-
     try:
-        result = await ai_service.handle_ai_message(
-            req.message,
-            db=db,
-            read_db=read_db,
-            scope_class_names=scope_classes,
-            user_faculty_name=None,  # Policy 2: Faculty can view institution-wide duty roster
-            current_user=current_user,
-        )
+        result = await ai_service.handle_ai_message(req.message, db)
         return result
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1122,8 +997,6 @@ def ai_confirm_write(
         return {"success": True, "changed": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException as e:
-        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1137,13 +1010,6 @@ def get_student_pdf(
     db: Session = Depends(get_db)
 ):
     """Generate and stream a formal student record PDF."""
-    student = db.query(models.Student).filter_by(roll_number=roll_number).first()
-    if not student:
-        raise HTTPException(status_code=404, detail=f"Student with roll number {roll_number} not found.")
-    
-    # Resource-level authorization: enforce academic scope check for faculty/operational roles
-    verify_faculty_student_access(db, current_user, student.id)
-
     try:
         pdf_bytes = pdf_service.build_student_pdf(roll_number, db)
         return Response(
@@ -1164,9 +1030,6 @@ def get_seating_pdf(
     db: Session = Depends(get_db)
 ):
     """Generate and stream a seating chart + signature sheet PDF."""
-    # Resource-level authorization: check invigilator room assignment scope
-    verify_invigilator_room_assignment(db, current_user, mst_exam_id=mst_exam_id, room_id=room_id)
-
     try:
         pdf_bytes = pdf_service.build_seating_pdf(mst_exam_id, room_id, db)
         exam  = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
@@ -1189,20 +1052,11 @@ def get_student_html(
     db: Session = Depends(get_db)
 ):
     """Debug: returns raw HTML preview without WeasyPrint installed."""
-    student = db.query(models.Student).filter_by(roll_number=roll_number).first()
-    if not student:
-        raise HTTPException(status_code=404, detail=f"Student with roll number {roll_number} not found.")
-    
-    # Resource-level authorization: enforce academic scope check for faculty/operational roles
-    verify_faculty_student_access(db, current_user, student.id)
-
     try:
         html = pdf_service.build_student_record_html(roll_number, db)
         return Response(content=html, media_type="text/html")
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-
-
 
 
 # ── Timetable ──────────────────────────────────────────────────────────────────
@@ -1211,26 +1065,17 @@ from fastapi import APIRouter
 timetable_router = APIRouter(prefix="/timetable", tags=["timetable"])
 
 @timetable_router.post("/version", response_model=schemas.TimetableVersionOut)
-def create_timetable_version(
-    v: schemas.TimetableVersionCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_permission("faculty.manage"))
-):
+def create_timetable_version(v: schemas.TimetableVersionCreate, db: Session = Depends(get_db)):
     return crud.create_timetable_version(db, v)
 
 @timetable_router.post("/entry", response_model=schemas.TimetableEntryOut)
-def create_timetable_entry(
-    e: schemas.TimetableEntryCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_permission("faculty.manage"))
-):
+def create_timetable_entry(e: schemas.TimetableEntryCreate, db: Session = Depends(get_db)):
     return crud.create_timetable_entry(db, e)
 
 @timetable_router.post("/entries/bulk")
 def create_timetable_entries_bulk(
     entries: list[schemas.TimetableEntryCreate],
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_permission("faculty.manage"))
 ):
     crud.bulk_create_timetable_entries(db, entries)
     return {"created": len(entries)}
@@ -1240,7 +1085,6 @@ def get_class_timetable(
     class_id: int,
     semester: str = None,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_permission("faculty.read"))
 ):
     return crud.get_timetable_for_class(db, class_id, semester)
 
@@ -1248,7 +1092,6 @@ def get_class_timetable(
 def faculty_availability(
     check: schemas.FacultyAvailabilityCheck,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_permission("faculty.read"))
 ):
     return crud.check_faculty_availability(
         db, check.day_of_week, check.period_start, check.period_end
@@ -1988,7 +1831,6 @@ def _follow_up_row_out(row, student, class_name):
         "updated_at": row.updated_at,
     }
 
-
 @app.get("/follow-up")
 def list_follow_up(
     class_id: int = None,
@@ -1998,7 +1840,6 @@ def list_follow_up(
     search: str = None,
     user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_permission("vt.read"))
 ):
     q = (
         db.query(models.FollowUpStatus, models.Student, models.Class.name)
@@ -2432,7 +2273,7 @@ def get_rollcall(
     """
     Returns all eligible/seatable students for an exam with their current
     attendance status so the teacher can do a fast roll-call.
-    Enforces invigilator room assignment authorization.
+    Works even when no seating plan has been generated.
     """
     exam = db.query(models.MstExam).filter_by(id=mst_exam_id).first()
     if not exam:
@@ -2455,13 +2296,6 @@ def get_rollcall(
     q = db.query(models.Student).filter_by(active=True)
     if exam.class_id:
         q = q.filter_by(class_id=exam.class_id)
-
-    if room_id:
-        seats = db.query(models.Seat).filter_by(mst_exam_id=mst_exam_id, room_id=room_id).all()
-        student_ids = {s.left_student for s in seats} | {s.right_student for s in seats}
-        student_ids.discard(None)
-        q = q.filter(models.Student.id.in_(student_ids))
-
     students = q.order_by(models.Student.roll_number).all()
 
     rule = db.query(models.SystemRule).filter_by(key="seat_min_pct").first()

@@ -8,7 +8,6 @@ import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { UploadCloud, CheckCircle, AlertTriangle, Trash2, Database, RefreshCw, Tag } from "lucide-react"
 import { useToast } from "@/components/ui/use-toast"
-import { apiFetch, getApiErrorMessage } from "@/lib/api"
 
 interface ClassItem {
   id: number
@@ -146,9 +145,7 @@ export default function AttendanceUpload() {
         return
       }
 
-      const data = await res.json()
       setUploadResult(data)
-
       const skipped = (data.sheets ?? []).filter((s: { status: string }) => s.status !== 'imported')
       toast({
         title: `Upload Successful — Batch: ${batchLabel}`,

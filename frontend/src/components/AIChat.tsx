@@ -16,7 +16,6 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Send, Bot, User, Loader2, FileText, AlertTriangle, ExternalLink } from 'lucide-react'
 import { useToast } from '@/components/ui/use-toast'
-import { apiFetch, getApiErrorMessage } from '@/lib/api'
 
 type MessageRole = 'user' | 'assistant' | 'error'
 
@@ -135,24 +134,23 @@ export function AIChat({ selectedPrompt, onPromptConsumed }: {
     setLoading(true)
 
     try {
-      const res = await apiFetch('/ai/query', {
+      const res = await fetch('/api/ai/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
       })
+      const data = await res.json().catch(() => null)
 
       if (!res.ok) {
-        const errorMsg = await getApiErrorMessage(res, 'The AI backend returned an error.')
+        // HTTP error from the backend — surface its detail, don't pretend it's a network failure.
         setMessages(prev => [...prev, {
           id: (Date.now() + 1).toString(),
           role: 'error',
           type: 'error',
-          content: `Request failed (HTTP ${res.status}): ${errorMsg}`,
+          content: `Request failed (HTTP ${res.status}): ${data?.detail ?? 'the AI backend returned an error.'}`,
         }])
         return
       }
-
-      const data = await res.json().catch(() => null)
 
       if (data.type === 'write_proposal') {
         const msgId = (Date.now() + 1).toString()
@@ -214,16 +212,15 @@ export function AIChat({ selectedPrompt, onPromptConsumed }: {
     setConfirmDialogOpen(false)
     setLoading(true)
     try {
-      const res = await apiFetch('/ai/confirm-write', {
+      const res = await fetch('/api/ai/confirm-write', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ op_json: pendingOp.opJson }),
       })
-      if (!res.ok) {
-        const msg = await getApiErrorMessage(res, `Server returned status ${res.status}`)
-        throw new Error(msg)
-      }
       const data = await res.json().catch(() => null)
+      if (!res.ok) {
+        throw new Error(data?.detail ?? `Server returned status ${res.status}`)
+      }
       if (data.success) {
         toast({ title: 'Change applied', description: `${data.changed?.changed ?? 'Operation'} completed successfully.` })
         setMessages(prev => [...prev, {

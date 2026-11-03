@@ -707,7 +707,6 @@ function FreeBusyGridTab({ refreshKey }: { refreshKey: number }) {
     } finally {
       setLoading(false)
     }
-
   }
 
   useEffect(() => { load() }, [refreshKey])

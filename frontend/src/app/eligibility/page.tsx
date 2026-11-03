@@ -19,9 +19,6 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useToast } from "@/components/ui/use-toast"
-import { apiFetch } from "@/lib/api"
-
-type Exam = { id: number; label: string }
 
 type Exam = { id: number; label: string; exam_date?: string | null }
 
@@ -98,7 +95,7 @@ export default function EligibilityPage() {
     }
 
     try {
-      const res = await apiFetch(`/eligibility/override/${selectedRecord.id}`, {
+      const res = await fetch(`/api/eligibility/override/${selectedRecord.id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -18,7 +18,8 @@ import {
   ServerOff, Plus, GraduationCap, Sparkles, Search, Printer,
   Building2, ChevronRight, Check
 } from "lucide-react"
-import { apiFetch, getApiErrorMessage } from "@/lib/api"
+
+const API = "/api"
 
 type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null; class_name?: string | null; year?: number | null; display_name?: string | null }
 type Room = { id: number; room_number: string; capacity: number | null }
@@ -48,14 +49,13 @@ type ClassInfo = { id: number; name: string; branch: string; year?: number; sect
 type Mark = "Present" | "Absent" | null
 
 async function api(path: string, init?: RequestInit) {
-  const res = await apiFetch(path, init)
+  const res = await fetch(`${API}${path}`, init)
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}))
     throw new Error((detail as { detail?: string }).detail || `Request failed (${res.status})`)
   }
   return res.json()
 }
-
 
 function nextMark(m: Mark): Mark {
   return m === "Present" ? "Absent" : "Present"

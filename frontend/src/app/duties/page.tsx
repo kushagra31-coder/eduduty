@@ -164,7 +164,7 @@ export default function DutiesPage() {
     setBusy(true)
     setProposalResult(null)
     try {
-      const res = await apiFetch("/mst/duties/auto-schedule", {
+      const res = await fetch("/api/mst/duties/auto-schedule", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mst_exam_ids: selectedExams }),
