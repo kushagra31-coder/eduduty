@@ -13,9 +13,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/components/ui/use-toast"
 import {
   RefreshCw, Search, CheckCircle, BookOpen, Shield, Clock,
-  AlertCircle, CalendarDays, Plus, X, Save, Table2,
+  AlertCircle, CalendarDays, Plus, X, Save, Table2, UploadCloud,
+  ImageIcon, Edit2, Calendar,
 } from "lucide-react"
-import { apiFetch as baseApiFetch, getApiErrorMessage } from "@/lib/api"
 
 const DAYS = ["MON", "TUE", "WED", "THUR", "FRI"] as const
 const PERIODS = [
@@ -28,6 +28,8 @@ const PERIODS = [
   { label: "3:30-4:15",   start: "15:30", end: "16:15" },
   { label: "4:15-5:00",   start: "16:15", end: "17:00" },
 ]
+
+const API = "/api"
 
 type ClassMeta = { id: number; name: string; year: number; branch: string }
 type FacultyMeta = { id: number; name: string; abbreviation: string | null }
@@ -61,17 +63,271 @@ function formatDate(d: string | null) {
 }
 
 async function apiFetch(path: string, init?: RequestInit) {
-  const res = await baseApiFetch(path, init)
+  const res = await fetch(`${API}${path}`, init)
   if (!res.ok) {
-    const err = await getApiErrorMessage(res, `HTTP ${res.status}`)
-    throw new Error(err)
+    const err = await res.json().catch(() => ({})) as { detail?: string }
+    throw new Error(err.detail ?? `HTTP ${res.status}`)
   }
   return res.json()
 }
 
+// Upload Timetable Image Modal
+function UploadTimetableModal({
+  open,
+  onOpenChange,
+  classes,
+  onSuccess,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  classes: ClassMeta[]
+  onSuccess: () => void
+}) {
+  const { toast } = useToast()
+  const [classId, setClassId] = useState<string>("")
+  const [semester, setSemester] = useState("III")
+  const [session, setSession] = useState("Jul-Dec 2026")
+  const [file, setFile] = useState<File | null>(null)
+  const [preview, setPreview] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const selected = e.target.files[0]
+      setFile(selected)
+      const reader = new FileReader()
+      reader.onload = (ev) => {
+        setPreview(ev.target?.result as string)
+      }
+      reader.readAsDataURL(selected)
+    }
+  }
+
+  const handleSubmit = async () => {
+    if (!file) {
+      toast({ title: "No file selected", description: "Please choose a timetable image to upload.", variant: "destructive" })
+      return
+    }
+
+    setUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append("file", file)
+      if (classId) fd.append("class_id", classId)
+      fd.append("semester", semester)
+      fd.append("session", session)
+
+      const res = await fetch("/api/timetable/upload-image", {
+        method: "POST",
+        body: fd,
+      })
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail ?? "Upload failed")
+      }
+
+      const data = await res.json()
+      toast({
+        title: "Timetable Applied Successfully",
+        description: data.message ?? `Parsed and committed ${data.entries_saved} teaching periods for ${data.class_name}.`,
+      })
+      onOpenChange(false)
+      setFile(null)
+      setPreview(null)
+      onSuccess()
+    } catch (err) {
+      toast({
+        title: "Upload Error",
+        description: (err as Error).message,
+        variant: "destructive",
+      })
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <UploadCloud className="h-5 w-5 text-primary" />
+            Upload Timetable Image
+          </DialogTitle>
+          <p className="text-xs text-muted-foreground mt-1">
+            Upload a photo or scanned sheet of a class timetable (e.g. CI-1, CI-2, Yr 2/3/4).
+            The system maps teaching slots so the duty scheduler detects faculty teaching other classes during exam hours.
+          </p>
+        </DialogHeader>
+
+        <div className="space-y-4 py-2">
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Target Class (Optional)</label>
+            <Select value={classId} onValueChange={v => {
+              const val = v ?? ""
+              setClassId(val)
+              const cls = classes.find(c => String(c.id) === val)
+              if (cls) {
+                if (cls.year === 3) setSemester("V")
+                else if (cls.year === 2) setSemester("III")
+              }
+            }}>
+              <SelectTrigger>
+                <SelectValue placeholder="Auto-detect from image or select class..." />
+              </SelectTrigger>
+              <SelectContent>
+                {classes.map(c => (
+                  <SelectItem key={c.id} value={String(c.id)}>
+                    {c.name.includes("Yr") ? c.name : `${c.name} · Year ${c.year}`} ({c.branch})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Semester / Term</label>
+              <Input value={semester} onChange={e => setSemester(e.target.value)} placeholder="e.g. III, V" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Academic Session</label>
+              <Input value={session} onChange={e => setSession(e.target.value)} placeholder="Jul-Dec 2026" />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Timetable Image (.jpg, .jpeg, .png, .webp)</label>
+            <div className="border-2 border-dashed rounded-lg p-4 text-center hover:bg-muted/30 transition-colors">
+              <input
+                type="file"
+                id="tt-image-upload"
+                accept="image/*"
+                onChange={handleFileChange}
+                className="hidden"
+              />
+              <label htmlFor="tt-image-upload" className="cursor-pointer flex flex-col items-center gap-2">
+                {preview ? (
+                  <div className="relative group">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={preview} alt="Timetable preview" className="max-h-40 rounded border shadow-sm object-contain" />
+                    <span className="text-[11px] text-muted-foreground mt-1 block">Click to change image ({file?.name})</span>
+                  </div>
+                ) : (
+                  <>
+                    <ImageIcon className="h-8 w-8 text-muted-foreground/60" />
+                    <span className="text-xs font-medium">Click to browse or drop timetable image</span>
+                    <span className="text-[10px] text-muted-foreground">Supports JPEG, PNG, WebP photos</span>
+                  </>
+                )}
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <DialogFooter className="gap-2">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button onClick={handleSubmit} disabled={uploading || !file} className="gap-1.5">
+            {uploading ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <UploadCloud className="h-3.5 w-3.5" />}
+            {uploading ? "Processing Timetable..." : "Apply Timetable"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Edit Exam Date & Slot Modal
+function EditExamModal({
+  exam,
+  open,
+  onOpenChange,
+  onSuccess,
+}: {
+  exam: ExamRow | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onSuccess: () => void
+}) {
+  const { toast } = useToast()
+  const [date, setDate] = useState(exam?.exam_date ?? "")
+  const [slot, setSlot] = useState(exam?.time_slot ?? "10:30-12:10")
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (exam) {
+      setDate(exam.exam_date ?? "")
+      setSlot(exam.time_slot ?? "10:30-12:10")
+    }
+  }, [exam])
+
+  const handleSave = async () => {
+    if (!exam) return
+    setSaving(true)
+    try {
+      const res = await fetch(`/api/mst/exams/${exam.exam_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          exam_date: date || null,
+          time_slot: slot || null,
+        }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail ?? "Failed to update exam slot")
+      }
+      toast({ title: "Exam Slot Updated", description: `${exam.label} scheduled for ${date || 'No date'} (${slot}). Faculty availability grid refreshed.` })
+      onOpenChange(false)
+      onSuccess()
+    } catch (e) {
+      toast({ title: "Update Failed", description: (e as Error).message, variant: "destructive" })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Calendar className="h-5 w-5 text-primary" />
+            Set Exam Slot — {exam?.label}
+          </DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Exam Date</label>
+            <Input type="date" value={date} onChange={e => setDate(e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Time Slot (HH:MM-HH:MM)</label>
+            <Input placeholder="e.g. 10:30-12:10" value={slot} onChange={e => setSlot(e.target.value)} />
+            <p className="text-[11px] text-muted-foreground">Standard slots: 10:30-12:10, 13:50-15:30</p>
+          </div>
+        </div>
+        <DialogFooter className="gap-2">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button onClick={handleSave} disabled={saving} className="gap-1.5">
+            {saving ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+            Save Slot
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
 // Timetable Input Tab
-function TimetableInputTab() {
+function TimetableInputTab({
+  refreshKey,
+  onOpenUpload,
+}: {
+  refreshKey: number
+  onOpenUpload: () => void
+}) {
   const { toast } = useToast()
   const [classes, setClasses] = useState<ClassMeta[]>([])
   const [faculty, setFaculty] = useState<FacultyMeta[]>([])
@@ -81,13 +337,14 @@ function TimetableInputTab() {
   const [grid, setGrid] = useState<Record<CellKey, TimetableEntry[]>>({})
   const [editing, setEditing] = useState<{ day: string; periodIdx: number } | null>(null)
   const [draft, setDraft] = useState<TimetableEntry>({ faculty_id: 0, subject_code: "", room: "", batch: "" })
+  const [draftSpan, setDraftSpan] = useState<number>(1)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     apiFetch("/classes").then(setClasses).catch(() => {})
     apiFetch("/faculty").then(setFaculty).catch(() => {})
-  }, [])
+  }, [refreshKey])
 
   useEffect(() => {
     if (!classId) { setGrid({}); return }
@@ -118,12 +375,13 @@ function TimetableInputTab() {
       .catch(() => setGrid({}))
       .finally(() => setLoading(false))
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [classId, semester])
+  }, [classId, semester, refreshKey])
 
   function openCell(day: string, periodIdx: number) {
     if (!PERIODS[periodIdx].start) return
     setEditing({ day, periodIdx })
     setDraft({ faculty_id: 0, subject_code: "", room: "", batch: "" })
+    setDraftSpan(1)
   }
 
   function addEntryToCell() {
@@ -133,8 +391,20 @@ function TimetableInputTab() {
     }
     const fac = faculty.find(f => f.id === draft.faculty_id)
     const entry: TimetableEntry = { ...draft, faculty_name: fac?.name }
-    const k = cellKey(editing.day, editing.periodIdx)
-    setGrid(prev => ({ ...prev, [k]: [...(prev[k] ?? []), entry] }))
+    setGrid(prev => {
+      const updated = { ...prev }
+      let added = 0
+      let currIdx = editing.periodIdx
+      while (added < draftSpan && currIdx < PERIODS.length) {
+        if (PERIODS[currIdx].start) {
+          const k = cellKey(editing.day, currIdx)
+          updated[k] = [...(updated[k] ?? []), entry]
+          added++
+        }
+        currIdx++
+      }
+      return updated
+    })
     setEditing(null)
   }
 
@@ -148,11 +418,6 @@ function TimetableInputTab() {
     const cls = classes.find(c => c.id === classId)
     setSaving(true)
     try {
-      const version = await apiFetch("/timetable/version", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ class_id: classId, semester, session }),
-      })
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const entries: any[] = []
       for (const day of DAYS) {
@@ -172,7 +437,6 @@ function TimetableInputTab() {
               class_id: classId,
               year: cls?.year ?? 2,
               semester,
-              timetable_version_id: version.id,
             })
           }
         })
@@ -181,12 +445,12 @@ function TimetableInputTab() {
         toast({ title: "Nothing to save", description: "Add at least one class entry.", variant: "destructive" })
         return
       }
-      await apiFetch("/timetable/entries/bulk", {
-        method: "POST",
+      await apiFetch(`/timetable/class/${classId}/${encodeURIComponent(semester)}`, {
+        method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(entries),
+        body: JSON.stringify({ session, entries }),
       })
-      toast({ title: `Saved ${entries.length} entries`, description: "Timetable committed. The duty scheduler will use this data." })
+      toast({ title: `Saved ${entries.length} entries`, description: "Timetable committed atomically. Duty scheduler will use this data." })
     } catch (e) {
       toast({ title: "Save failed", description: (e as Error).message, variant: "destructive" })
     } finally {
@@ -201,14 +465,25 @@ function TimetableInputTab() {
       <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1">
           <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Class</label>
-          <Select onValueChange={v => setClassId(Number(v))}>
-            <SelectTrigger id="tt-class-select" className="w-52">
+          <Select onValueChange={v => {
+            const cid = Number(v)
+            setClassId(cid)
+            const cls = classes.find(c => c.id === cid)
+            if (cls) {
+              if (cls.year === 3 && (semester === "III" || semester === "IV" || !semester)) {
+                setSemester("V")
+              } else if (cls.year === 2 && (semester === "V" || semester === "VI" || !semester)) {
+                setSemester("III")
+              }
+            }
+          }}>
+            <SelectTrigger id="tt-class-select" className="w-56">
               <SelectValue placeholder="Select class..." />
             </SelectTrigger>
             <SelectContent>
               {classes.map(c => (
                 <SelectItem key={c.id} value={String(c.id)}>
-                  {c.name} · Yr {c.year}
+                  {c.name.includes("Yr") ? c.name : `${c.name} · Yr ${c.year}`}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -222,10 +497,16 @@ function TimetableInputTab() {
           <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Session</label>
           <Input id="tt-session" className="w-44 h-9" value={session} onChange={e => setSession(e.target.value)} placeholder="e.g. Jul-Dec 2026" />
         </div>
-        <Button id="tt-save-btn" onClick={saveAll} disabled={saving || !classId} className="h-9 ml-auto gap-2">
-          {saving ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-          Save timetable
-        </Button>
+        <div className="flex items-center gap-2 ml-auto">
+          <Button variant="outline" onClick={onOpenUpload} className="h-9 gap-1.5">
+            <UploadCloud className="h-3.5 w-3.5 text-primary" />
+            Upload Image
+          </Button>
+          <Button id="tt-save-btn" onClick={saveAll} disabled={saving || !classId} className="h-9 gap-2">
+            {saving ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+            Save Timetable
+          </Button>
+        </div>
       </div>
 
       {selectedClass && (
@@ -322,7 +603,7 @@ function TimetableInputTab() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
-              Add class — {editing?.day} {editing !== null ? PERIODS[editing.periodIdx].label : ""}
+              Add Class — {editing?.day} {editing !== null ? PERIODS[editing.periodIdx].label : ""}
             </DialogTitle>
           </DialogHeader>
           <div className="space-y-3 py-1">
@@ -379,6 +660,20 @@ function TimetableInputTab() {
                 />
               </div>
             </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">Spans N periods</label>
+              <Select value={String(draftSpan)} onValueChange={v => setDraftSpan(Number(v))}>
+                <SelectTrigger id="tt-dialog-span">
+                  <SelectValue placeholder="1 period" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="1">1 period (default)</SelectItem>
+                  <SelectItem value="2">2 periods (Lab: e.g. 11:20–13:00)</SelectItem>
+                  <SelectItem value="3">3 periods</SelectItem>
+                  <SelectItem value="4">4 periods</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditing(null)}>Cancel</Button>
@@ -393,18 +688,20 @@ function TimetableInputTab() {
 }
 
 // Faculty Free-Busy Grid Tab
-function FreeBusyGridTab() {
+function FreeBusyGridTab({ refreshKey }: { refreshKey: number }) {
   const [grid, setGrid]           = useState<GridData | null>(null)
   const [loading, setLoading]     = useState(true)
   const [error, setError]         = useState<string | null>(null)
   const [search, setSearch]       = useState("")
   const [filterStatus, setFilter] = useState<CellStatus | "all">("all")
+  const [editingExam, setEditingExam] = useState<ExamRow | null>(null)
 
   async function load() {
     setLoading(true); setError(null)
     try {
-      const data = await apiFetch("/mst/faculty-grid")
-      setGrid(data)
+      const res = await fetch(`${API}/mst/faculty-grid`)
+      if (!res.ok) throw new Error(`Server returned ${res.status}`)
+      setGrid(await res.json())
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -413,16 +710,38 @@ function FreeBusyGridTab() {
 
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { load() }, [refreshKey])
+
+  const highlightIds = useMemo(() => {
+    if (!grid || filterStatus === "all") return new Set<number>()
+    const ids = new Set<number>()
+    for (const exam of grid.exams)
+      for (const cell of exam.faculty)
+        if (cell.status === filterStatus) ids.add(cell.faculty_id)
+    return ids
+  }, [grid, filterStatus])
 
   const filteredFaculty = useMemo(() => {
     if (!grid) return []
     const q = search.toLowerCase()
-    return grid.faculty.filter(f =>
+    let list = grid.faculty.filter(f =>
       f.name.toLowerCase().includes(q) ||
       (f.abbreviation ?? "").toLowerCase().includes(q)
     )
-  }, [grid, search])
+    if (filterStatus !== "all") {
+      list = list.filter(f => highlightIds.has(f.id))
+    } else {
+      // When viewing 'All', sort Free faculty to the top for convenience
+      list = [...list].sort((a, b) => {
+        const aFree = grid.exams.some(e => e.faculty.find(c => c.faculty_id === a.id)?.status === "free")
+        const bFree = grid.exams.some(e => e.faculty.find(c => c.faculty_id === b.id)?.status === "free")
+        if (aFree && !bFree) return -1
+        if (!aFree && bFree) return 1
+        return a.name.localeCompare(b.name)
+      })
+    }
+    return list
+  }, [grid, search, filterStatus, highlightIds])
 
   const examSummary = useMemo(() => {
     if (!grid) return {}
@@ -435,19 +754,10 @@ function FreeBusyGridTab() {
     return out
   }, [grid])
 
-  const highlightIds = useMemo(() => {
-    if (!grid || filterStatus === "all") return new Set<number>()
-    const ids = new Set<number>()
-    for (const exam of grid.exams)
-      for (const cell of exam.faculty)
-        if (cell.status === filterStatus) ids.add(cell.faculty_id)
-    return ids
-  }, [grid, filterStatus])
-
   if (loading) return (
     <div className="flex items-center justify-center h-64 gap-3 text-muted-foreground">
       <RefreshCw className="h-5 w-5 animate-spin" />
-      <span className="text-sm">Loading timetable...</span>
+      <span className="text-sm">Loading timetable availability grid...</span>
     </div>
   )
 
@@ -463,14 +773,22 @@ function FreeBusyGridTab() {
     <div className="flex flex-col items-center justify-center h-64 gap-2">
       <Clock className="h-10 w-10 text-muted-foreground" />
       <p className="text-muted-foreground text-sm text-center">
-        No MST exams found with date + time slot.<br />
-        Add exams first, or enter the timetable in the Input tab.
+        No MST exams found.<br />
+        Add an exam or upload a timetable to monitor faculty availability.
       </p>
     </div>
   )
 
   return (
     <div className="space-y-4">
+      <EditExamModal
+        exam={editingExam}
+        open={!!editingExam}
+        onOpenChange={open => !open && setEditingExam(null)}
+        onSuccess={load}
+      />
+
+      {/* Legend + filters */}
       <div className="flex flex-wrap items-center gap-3">
         {(["all", "free", "teaching", "on_duty", "exempt"] as const).map(s => {
           const cfg = s === "all" ? null : STATUS_CONFIG[s]
@@ -514,15 +832,25 @@ function FreeBusyGridTab() {
             <tr className="border-b">
               <th className="sticky left-0 z-20 bg-background border-r px-3 py-2 text-left font-semibold min-w-[160px]">Faculty</th>
               {grid.exams.map(exam => (
-                <th key={exam.exam_id} className="px-2 py-2 text-center font-semibold min-w-[90px] border-r last:border-r-0">
+                <th key={exam.exam_id} className="px-2 py-2 text-center font-semibold min-w-[130px] border-r last:border-r-0">
                   <div className="text-[11px] font-bold">{exam.label}</div>
                   <div className="text-muted-foreground font-normal">{formatDate(exam.exam_date)}</div>
-                  <div className="text-muted-foreground font-mono font-normal">{exam.time_slot ?? "—"}</div>
-                  <div className="mt-1 flex items-center justify-center gap-1">
-                    <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                  <div className="text-muted-foreground font-mono font-normal">{exam.time_slot ?? "10:30-12:10 (Default Slot)"}</div>
+                  <div className="mt-1 flex items-center justify-center gap-2">
+                    <span className="text-emerald-600 dark:text-emerald-400 font-bold text-[10px]">
                       {examSummary[exam.exam_id]?.free ?? 0} free
                     </span>
+                    <span className="text-red-600 dark:text-red-400 font-bold text-[10px]">
+                      {examSummary[exam.exam_id]?.teaching ?? 0} teaching
+                    </span>
                   </div>
+                  <button
+                    onClick={() => setEditingExam(exam)}
+                    className="mt-1 inline-flex items-center gap-1 text-[10px] text-primary/80 hover:text-primary transition-colors hover:underline"
+                  >
+                    <Edit2 className="h-2.5 w-2.5" />
+                    {exam.exam_date ? "Edit Slot" : "Set Date & Slot"}
+                  </button>
                 </th>
               ))}
             </tr>
@@ -547,11 +875,18 @@ function FreeBusyGridTab() {
                     return (
                       <td key={exam.exam_id} className="px-1.5 py-1.5 text-center border-r last:border-r-0">
                         <div
-                          className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 ${cfg.bg} ${cfg.text} font-medium whitespace-nowrap`}
+                          className={`inline-flex flex-col items-center gap-0.5 rounded-md border px-2 py-1 ${cfg.bg} ${cfg.text} font-medium max-w-[160px] mx-auto`}
                           title={cell?.reason}
                         >
-                          {cfg.icon}
-                          <span>{cfg.label}</span>
+                          <div className="flex items-center gap-1 whitespace-nowrap">
+                            {cfg.icon}
+                            <span>{cfg.label}</span>
+                          </div>
+                          {status === "teaching" && cell?.reason && (
+                            <div className="text-[9px] opacity-80 truncate max-w-[140px] font-normal leading-tight">
+                              {cell.reason}
+                            </div>
+                          )}
                         </div>
                       </td>
                     )
@@ -564,24 +899,46 @@ function FreeBusyGridTab() {
       </div>
 
       <p className="text-xs text-muted-foreground">
-        {filteredFaculty.length} of {grid.faculty.length} faculty shown · {grid.exams.length} exam slot{grid.exams.length !== 1 ? "s" : ""}
+        {filteredFaculty.length} of {grid.faculty.length} faculty shown · {grid.exams.length} exam slot{grid.exams.length !== 1 ? "s" : ""}.
+        Teaching status automatically flags faculty who have scheduled classes in other years or sections during this exam period.
       </p>
     </div>
   )
 }
 
 export default function TimetablePage() {
+  const [uploadOpen, setUploadOpen] = useState(false)
+  const [classes, setClasses] = useState<ClassMeta[]>([])
+  const [refreshKey, setRefreshKey] = useState(0)
+
+  useEffect(() => {
+    apiFetch("/classes").then(setClasses).catch(() => {})
+  }, [])
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-1">
-        <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
-          <CalendarDays className="h-6 w-6" />
-          Timetable
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          Enter class timetables for all years, then view the faculty free–busy grid for MST duty scheduling.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div className="space-y-1">
+          <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
+            <CalendarDays className="h-6 w-6" />
+            Timetable
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Manage class timetables, upload image sheets, and monitor faculty free/busy clashes for MST duty.
+          </p>
+        </div>
+        <Button onClick={() => setUploadOpen(true)} className="gap-2 shrink-0">
+          <UploadCloud className="h-4 w-4" />
+          Upload Timetable Image
+        </Button>
       </div>
+
+      <UploadTimetableModal
+        open={uploadOpen}
+        onOpenChange={setUploadOpen}
+        classes={classes}
+        onSuccess={() => setRefreshKey(k => k + 1)}
+      />
 
       <Tabs defaultValue="input" className="space-y-5">
         <TabsList className="grid w-full max-w-xs grid-cols-2">
@@ -594,11 +951,11 @@ export default function TimetablePage() {
         </TabsList>
 
         <TabsContent value="input">
-          <TimetableInputTab />
+          <TimetableInputTab refreshKey={refreshKey} onOpenUpload={() => setUploadOpen(true)} />
         </TabsContent>
 
         <TabsContent value="grid">
-          <FreeBusyGridTab />
+          <FreeBusyGridTab refreshKey={refreshKey} />
         </TabsContent>
       </Tabs>
     </div>

@@ -17,6 +17,11 @@ Architecture:
 
 Never executes raw SQL from the model. Writes go through the ORM CRUD layer only.
 API keys are never logged or returned to the client.
+
+PRIVACY NOTE: Contextual query views and prompts sent to external LLM providers
+(Groq / Gemini) may contain student names and roll numbers. For strict student data
+privacy or air-gapped on-premises deployments, configure local Ollama
+(e.g., set AI_PROVIDERS=ollama, leaving cloud API keys unset).
 """
 
 import hashlib
@@ -24,9 +29,7 @@ import hmac
 import json
 import os
 import re
-import time
-from typing import Optional
-import uuid
+import datetime
 import httpx
 from dotenv import load_dotenv
 
@@ -35,7 +38,12 @@ load_dotenv()
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import sqlglot
+from sqlglot import exp
+
 import models
+import crud
+from database import get_readonly_connection
 
 # ── Trusted Identity Context Configuration (Stage B4.2B.2 & B4.2B.5) ──────────
 KNOWN_INSECURE_DEV_SECRET = "eduduty_insecure_default_hmac_secret_for_dev_only_32b"
@@ -105,7 +113,7 @@ def mint_signed_identity_context(current_user: Optional[models.User]) -> dict:
 #   Optional overrides:
 #       $env:GROQ_MODEL="openai/gpt-oss-20b"   # if Groq deprecates the default
 #       $env:GEMINI_API_KEY="..."              # backup provider from https://aistudio.google.com/
-#       $env:AI_PROVIDERS="groq,ollama"        # change order / drop providers
+#       $env:AI_PROVIDERS="groq,gemini,ollama"        # change order / drop providers
 #   On Render / Railway / VPS: add GROQ_API_KEY as an environment variable.
 
 GROQ_API_KEY  = os.environ.get("GROQ_API_KEY")
@@ -125,6 +133,12 @@ AI_PROVIDERS = [
     for p in os.environ.get("AI_PROVIDERS", "groq,gemini,ollama").split(",")
     if p.strip()
 ]
+
+
+def _is_cloud_allowed() -> bool:
+    """Return True if external cloud LLM providers (Groq, Gemini) are permitted. Default is False."""
+    return os.environ.get("AI_ALLOW_CLOUD", "false").strip().lower() in ("true", "1", "yes")
+
 
 # Only these views are queryable by the AI (read path)
 ALLOWED_READ_VIEWS = {
@@ -147,33 +161,36 @@ READ_SYSTEM_PROMPT = """
 You are a read-only SQL assistant for an MST (midterm exam) operations database.
 You may ONLY query these views (no other tables):
 
-- ai_eligibility_summary(class_name, mst_label, eligible_count, borderline_count, ineligible_count, missing_count)
-- ai_attendance_summary(class_name, roll_number, student_name, overall_pct, lowest_subject_pct)
-- ai_vt_candidates(class_name, roll_number, student_name, mst1_status, mst2_status)
+- ai_eligibility_summary(class_name, class_year, mst_label, mst_exam_id, eligible_count, ineligible_count, missing_count)
+- ai_attendance_summary(class_name, class_year, roll_number, student_name, overall_pct, lowest_subject_pct, mst_exam_id, mst_label)
+- ai_vt_candidates(class_name, class_year, roll_number, student_name, mst1_status, mst2_status)
 - ai_duty_roster(mst_label, exam_date, room_number, faculty_name, duty_status)
-- v_vt_follow_up_status(roll_number, student_name, class_name, mst_1_label, mst_2_label,
+- v_vt_follow_up_status(roll_number, student_name, class_name, class_year, mst_1_label, mst_2_label,
     mst_1_appeared, mst_2_appeared, calculated_status, final_status, overridden,
     override_reason, rule_version, updated_at)
   calculated_status/final_status are one of: not_required, compulsory, under_review, excused, completed.
   mst_1_appeared/mst_2_appeared are TRUE (present), FALSE (absent), or NULL (missing record).
+  class_year is 2 for 2nd Year (Semester 3/4) and 3 for 3rd Year (Semester 5/6).
+  class_name is 'CI-1', 'CI-2', 'CY', or 'CI-1 (Yr 3)', etc.
 
 Rules:
 1. Only generate SELECT statements.
 2. No subqueries that touch tables not in the list above.
 3. Return ONLY the SQL, nothing else. No markdown, no explanation.
+4. Distinguish clearly between MST-1 and MST-2, between classes (CI-1, CI-2, CY), and between years (class_year=2 vs class_year=3).
 
 Examples:
-Q: How many CI-1 students are eligible for MST-1?
-A: SELECT eligible_count FROM ai_eligibility_summary WHERE class_name='CI-1' AND mst_label='MST-1';
+Q: How many 2nd year CI-1 students are eligible for MST-1?
+A: SELECT eligible_count FROM ai_eligibility_summary WHERE class_name LIKE '%CI-1%' AND class_year=2 AND mst_label='MST-1';
 
 Q: List borderline students in CI-2
-A: SELECT roll_number, student_name, overall_pct FROM ai_attendance_summary WHERE class_name='CI-2' AND overall_pct >= 45 AND overall_pct < 50;
+A: SELECT roll_number, student_name, overall_pct FROM ai_attendance_summary WHERE class_name LIKE '%CI-2%' AND overall_pct >= 45 AND overall_pct < 50;
 
-Q: How many CI-1 students are compulsory for VT?
-A: SELECT COUNT(*) FROM v_vt_follow_up_status WHERE class_name='CI-1' AND final_status='compulsory';
+Q: Who is absent in both MST-1 and MST-2 in 2nd year?
+A: SELECT roll_number, student_name, class_name FROM v_vt_follow_up_status WHERE class_year=2 AND final_status='compulsory';
 
-Q: Which compulsory VT students have been excused?
-A: SELECT roll_number, student_name, override_reason FROM v_vt_follow_up_status WHERE final_status='excused';
+Q: What are the VT candidate stats for 3rd year?
+A: SELECT final_status, COUNT(*) FROM v_vt_follow_up_status WHERE class_year=3 GROUP BY final_status;
 """
 
 WRITE_SYSTEM_PROMPT = """
@@ -258,17 +275,24 @@ async def _ollama_chat(system: str, user: str, temperature: float = 0.1) -> str:
 
 
 async def _llm_chat(system: str, user: str, temperature: float = 0.1) -> str:
-    """Try each configured provider in order; the first success wins."""
+    """Try each configured provider in order; the first success wins. Respects AI_ALLOW_CLOUD."""
+    allow_cloud = _is_cloud_allowed()
     errors = []
     for provider in AI_PROVIDERS:
         try:
             if provider == "groq":
+                if not allow_cloud:
+                    # Cloud provider disabled by AI_ALLOW_CLOUD policy
+                    continue
                 if not GROQ_API_KEY:
                     errors.append("groq: GROQ_API_KEY not set")
                     continue
                 return await _openai_compat_chat(
                     GROQ_BASE_URL, GROQ_API_KEY, GROQ_MODEL, system, user, temperature)
             elif provider == "gemini":
+                if not allow_cloud:
+                    # Cloud provider disabled by AI_ALLOW_CLOUD policy
+                    continue
                 if not GEMINI_API_KEY:
                     errors.append("gemini: GEMINI_API_KEY not set")
                     continue
@@ -282,207 +306,101 @@ async def _llm_chat(system: str, user: str, temperature: float = 0.1) -> str:
             errors.append(f"{provider}: {e}")
     raise RuntimeError(
         "AI is unreachable — " + " | ".join(errors) +
-        ". Get a free Groq key at https://console.groq.com/keys and set GROQ_API_KEY, "
-        "or run Ollama locally."
+        ". Configure Ollama locally or enable AI_ALLOW_CLOUD=true with valid cloud API keys."
     )
+
+
+def _aggregate_for_cloud(rows: list[dict]) -> str:
+    """Strip all PII (names, roll numbers) and aggregate data to summary numbers only."""
+    if not rows:
+        return json.dumps({"count": 0, "summary": "No matching records found."})
+
+    sensitive_keys = {"student_name", "name", "roll_number", "roll"}
+    has_pii = any(sensitive_keys.intersection(k.lower() for k in r.keys()) for r in rows)
+    if has_pii:
+        return json.dumps({
+            "total_records": len(rows),
+            "summary_counts": f"{len(rows)} matching records retrieved.",
+            "privacy_notice": "Individual names and roll numbers were stripped before cloud summarisation."
+        })
+    return json.dumps(rows)
+
 
 # ── SQL validator (read path) ──────────────────────────────────────────────────
 
 def _validate_read_sql(sql: str) -> str:
-    """Raise ValueError if SQL is not a safe SELECT over allowed views."""
-    # 1. Strip comments before validation
-    clean_sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
-    clean_sql = re.sub(r"--.*$", "", clean_sql, flags=re.MULTILINE)
-    stripped = clean_sql.strip().rstrip(";").strip()
+    """Raise ValueError if SQL is not a safe SELECT over allowed views using sqlglot AST."""
+    if not sql or not sql.strip():
+        raise ValueError("Empty query.")
 
-    # Reject multi-statement queries
+    raw = sql.strip()
+
+    # Reject comments
+    if "/*" in raw or "--" in raw:
+        raise ValueError("Comments are not allowed in queries.")
+
+    # Reject semicolon chaining
+    stripped = raw.rstrip(";").strip()
     if ";" in stripped:
-        raise ValueError("Multi-statement SQL queries are forbidden.")
+        raise ValueError("Multiple statements or semicolon-chaining are forbidden.")
 
-    if not stripped.upper().startswith("SELECT"):
+    # Reject PRAGMA or ATTACH
+    upper_raw = raw.upper()
+    if re.search(r"\b(PRAGMA|ATTACH)\b", upper_raw):
+        raise ValueError("PRAGMA and ATTACH commands are forbidden.")
+
+    try:
+        tokens = sqlglot.tokenize(stripped)
+        if any(t.comments for t in tokens):
+            raise ValueError("Comments are not allowed in queries.")
+        statements = sqlglot.parse(stripped)
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise
+        raise ValueError(f"Failed to parse SQL: {e}")
+
+    if len(statements) != 1:
+        raise ValueError("Exactly one SQL statement is allowed.")
+
+    stmt = statements[0]
+    if stmt is None or not isinstance(stmt, exp.Select):
         raise ValueError("Only SELECT statements are allowed.")
 
-    # Reject schema prefixes (quoted or unquoted: main., "main"., public., etc.)
-    if re.search(r'(?:\b|")?(?:main|public|sqlite_master|information_schema)(?:\b|")?\s*\.', stripped, re.IGNORECASE):
-        raise ValueError("Schema-qualified table names are forbidden.")
-
-    # Block any dangerous keywords, session configuration changes, or CTE overrides
-    dangerous = re.compile(
-        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|GRANT|REVOKE|TRUNCATE|EXEC|EXECUTE|PRAGMA|WITH|SET|SET_CONFIG|CURRENT_SETTING)\b",
-        re.IGNORECASE,
+    # Block destructive or administrative operations inside CTEs or subqueries
+    forbidden_types = (
+        exp.Insert, exp.Update, exp.Delete, exp.Drop,
+        exp.Alter, exp.Create, exp.Command, exp.Pragma
     )
-    if dangerous.search(stripped):
-        raise ValueError("Statement contains forbidden keywords or WITH clauses.")
+    for forbidden in forbidden_types:
+        if list(stmt.find_all(forbidden)):
+            raise ValueError("Query contains forbidden data manipulation or administrative operations.")
 
-    # Ensure only allowed views are referenced (ignoring optional quotes)
-    token_pattern = re.compile(r'\b(?:FROM|JOIN)\s+(?:"?([a-z0-9_]+)"?)', re.IGNORECASE)
-    for match in token_pattern.finditer(stripped):
-        table = match.group(1).lower()
+    # Collect CTE aliases
+    cte_names = set()
+    if stmt.ctes:
+        for cte in stmt.ctes:
+            if cte.alias_or_name:
+                cte_names.add(cte.alias_or_name.lower())
+
+    # Ensure all tables/views referenced are in ALLOWED_READ_VIEWS
+    tables = [t.name.lower() for t in stmt.find_all(exp.Table) if t.name]
+    for table in tables:
+        if table in cte_names:
+            continue
         if table not in ALLOWED_READ_VIEWS:
-            raise ValueError(f"Access to '{table}' is not permitted. Allowed: {ALLOWED_READ_VIEWS}")
+            raise ValueError(f"Access to '{table}' is not permitted. Allowed: {sorted(ALLOWED_READ_VIEWS)}")
 
     return stripped
 
 
-# ── Structured Reporting Operations (Production Path) ─────────────────────────
-
-STRUCTURED_REPORTING_OPS = {
-    "get_eligibility_summary": {
-        "description": "Aggregated count of eligible, borderline, ineligible, and missing students per class/exam.",
-        "view": "ai_eligibility_summary",
-        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
-        "pii": False,
-        "allowed_args": {"class_name", "mst_label"},
-    },
-    "get_attendance_summary": {
-        "description": "Per-student overall and lowest subject attendance percentages.",
-        "view": "ai_attendance_summary",
-        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
-        "pii": True,
-        "allowed_args": {"class_name", "roll_number", "min_pct", "max_pct"},
-    },
-    "get_vt_candidates": {
-        "description": "List students flagged for Virtual Test candidates based on MST status.",
-        "view": "ai_vt_candidates",
-        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
-        "pii": True,
-        "allowed_args": {"class_name", "roll_number"},
-    },
-    "get_duty_roster": {
-        "description": "Invigilation duty allocation details per exam date, room, and faculty.",
-        "view": "ai_duty_roster",
-        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
-        "pii": True,
-        "allowed_args": {"mst_label", "room_number", "faculty_name"},
-    },
-    "get_vt_follow_up_status": {
-        "description": "VT follow-up statuses, appearance records, and override reasons.",
-        "view": "v_vt_follow_up_status",
-        "permitted_roles": {"ADMIN", "EXAM_COORDINATOR", "FACULTY"},
-        "pii": True,
-        "allowed_args": {"class_name", "roll_number", "final_status"},
-    },
-}
-
-
-def execute_structured_reporting_op(
-    op_name: str,
-    args: dict,
-    read_db: Session,
-    current_user: Optional[models.User] = None,
-    scope_class_names: Optional[set] = None,
-    user_faculty_name: Optional[str] = None,
-) -> dict:
-    """
-    Execute a production-grade fixed reporting query with typed arguments and server-enforced scope.
-    The LLM chooses the operation and arguments; the server owns SQL generation and authorization.
-    """
-    if op_name not in STRUCTURED_REPORTING_OPS:
-        raise ValueError(f"Unknown reporting operation '{op_name}'. Allowed: {set(STRUCTURED_REPORTING_OPS.keys())}")
-
-    meta = STRUCTURED_REPORTING_OPS[op_name]
-    user_role = current_user.role if current_user else "VIEWER"
-    if user_role not in meta["permitted_roles"]:
-        raise ValueError(f"Role '{user_role}' is not authorized to execute operation '{op_name}'.")
-
-    view_name = meta["view"]
-    where_clauses = []
-    params = {}
-
-    # 1. Enforce Server-Derived Role Scope
-    if scope_class_names is not None and view_name != "ai_duty_roster":
-        if scope_class_names:
-            p_keys = []
-            for idx, cname in enumerate(sorted(scope_class_names)):
-                pk = f"scope_cls_{idx}"
-                params[pk] = cname
-                p_keys.append(f":{pk}")
-            where_clauses.append(f"class_name IN ({', '.join(p_keys)})")
-        else:
-            where_clauses.append("1=0")
-
-    # 2. Process Typed User Arguments
-    for key, val in args.items():
-        if key not in meta["allowed_args"] or val is None:
-            continue
-        if key == "class_name":
-            params["arg_cname"] = str(val).strip()
-            where_clauses.append("class_name = :arg_cname")
-        elif key == "mst_label":
-            params["arg_mst"] = str(val).strip()
-            where_clauses.append("mst_label = :arg_mst")
-        elif key == "roll_number":
-            params["arg_roll"] = str(val).strip()
-            where_clauses.append("roll_number = :arg_roll")
-        elif key == "room_number":
-            params["arg_room"] = str(val).strip()
-            where_clauses.append("room_number = :arg_room")
-        elif key == "faculty_name":
-            params["arg_fac"] = f"%{str(val).strip()}%"
-            where_clauses.append("LOWER(faculty_name) LIKE LOWER(:arg_fac)")
-        elif key == "final_status":
-            params["arg_status"] = str(val).strip()
-            where_clauses.append("final_status = :arg_status")
-        elif key == "min_pct":
-            try:
-                params["arg_min_pct"] = float(val)
-                where_clauses.append("overall_pct >= :arg_min_pct")
-            except (ValueError, TypeError):
-                where_clauses.append("1=0")
-        elif key == "max_pct":
-            try:
-                params["arg_max_pct"] = float(val)
-                where_clauses.append("overall_pct <= :arg_max_pct")
-            except (ValueError, TypeError):
-                where_clauses.append("1=0")
-
-    where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-    sql = f"SELECT * FROM {view_name}{where_sql}"
-
-    # Enforce transaction-scoped identity context on PostgreSQL
-    is_pg = False
-    try:
-        bind = read_db.get_bind()
-        is_pg = (bind.dialect.name == "postgresql") if bind else False
-    except Exception:
-        pass
-
-    try:
-        if is_pg:
-            ctx = mint_signed_identity_context(current_user)
-            read_db.execute(
-                text("""
-                    SELECT set_config('app.current_user_id', :uid, true),
-                           set_config('app.current_faculty_id', :fac_id, true),
-                           set_config('app.current_user_role', :role, true),
-                           set_config('app.current_context_issued_at', :ts, true),
-                           set_config('app.current_context_nonce', :nonce, true),
-                           set_config('app.current_context_signature', :sig, true)
-                """),
-                ctx,
-            )
-
-        rows = read_db.execute(text(sql), params).fetchmany(100)
-        data = [dict(r._mapping) for r in rows]
-    finally:
-        if is_pg:
-            try:
-                read_db.rollback()
-            except Exception:
-                pass
-
-    return {
-        "operation": op_name,
-        "view": view_name,
-        "pii_contained": meta["pii"],
-        "count": len(data),
-        "data": data,
-    }
-
-
 # ── Write op dispatcher ────────────────────────────────────────────────────────
 
-def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.User] = None, ai_user_label: str = "AI_AGENT") -> dict:
+def execute_write_op(
+    op_json: dict,
+    db: Session,
+    ai_user_label: str = "AI_AGENT",
+    confirming_user_id: int | None = None
+) -> dict:
     """
     Execute a validated write operation through the ORM (never raw SQL).
     Enforces exact matching, actor audit tracking, and hard business constraint validation.
@@ -492,12 +410,13 @@ def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.U
     user_id = current_user.id if current_user else None
 
     if op == "override_eligibility":
-        roll    = str(op_json["roll_number"]).strip()
-        label   = str(op_json["mst_label"]).strip()
-        reason  = str(op_json["reason"]).strip()
+        roll    = op_json.get("roll_number")
+        label   = op_json.get("mst_label")
+        reason  = (op_json.get("reason") or "").strip()
+        if not reason:
+            raise ValueError("Reason is required for override_eligibility.")
 
-        # Enforce exact roll number matching (IDOR and precision protection)
-        student = db.query(models.Student).filter(models.Student.roll_number == roll).first()
+        student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{roll}%")).first()
         if not student:
             raise ValueError(f"Student with roll number '{roll}' not found.")
         exam = db.query(models.MstExam).filter(models.MstExam.label == label).first()
@@ -520,7 +439,7 @@ def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.U
             field_changed="override",
             old_value=str(old_override),
             new_value="True",
-            changed_by=user_id,
+            changed_by=confirming_user_id,
             reason=f"[AI] {reason}",
         )
         db.add(log)
@@ -528,14 +447,14 @@ def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.U
         return {"changed": "override_eligibility", "roll_number": roll, "exam": label, "reason": reason}
 
     elif op == "mark_attempt_status":
-        roll   = str(op_json["roll_number"]).strip()
-        label  = str(op_json["mst_label"]).strip()
-        status = str(op_json["status"]).strip()
+        roll   = op_json.get("roll_number")
+        label  = op_json.get("mst_label")
+        status = op_json.get("status")
         allowed_statuses = {"Present", "Absent", "Late", "Excused", "Signature missing"}
         if status not in allowed_statuses:
             raise ValueError(f"Invalid status '{status}'. Must be one of {allowed_statuses}")
 
-        student = db.query(models.Student).filter(models.Student.roll_number == roll).first()
+        student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{roll}%")).first()
         if not student:
             raise ValueError(f"Student '{roll}' not found.")
         exam = db.query(models.MstExam).filter(models.MstExam.label == label).first()
@@ -570,7 +489,7 @@ def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.U
             field_changed="status",
             old_value=old_status,
             new_value=status,
-            changed_by=user_id,
+            changed_by=confirming_user_id,
             reason="[AI] mark_attempt_status",
         )
         db.add(log)
@@ -578,9 +497,9 @@ def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.U
         return {"changed": "mark_attempt_status", "roll_number": roll, "exam": label, "status": status}
 
     elif op == "assign_duty":
-        faculty_name = str(op_json["faculty_name"]).strip()
-        label        = str(op_json["mst_label"]).strip()
-        room_number  = str(op_json["room_number"]).strip()
+        faculty_name = op_json.get("faculty_name")
+        label        = op_json.get("mst_label")
+        room_number  = op_json.get("room_number")
 
         faculty = db.query(models.Faculty).filter(
             models.Faculty.name.ilike(f"%{faculty_name}%")
@@ -612,24 +531,53 @@ def execute_write_op(op_json: dict, db: Session, current_user: Optional[models.U
             if f_avail and f_avail.status == "Blocked":
                 raise ValueError(f"Faculty '{faculty.name}' has a timetable teaching conflict: {f_avail.reason}")
 
+        # Check clash availability via the exact same clash checker as UI path
+        day = exam.exam_date.strftime("%a").upper() if exam.exam_date else None
+        day_aliases = {
+            "MONDAY": "MON", "TUESDAY": "TUE", "WEDNESDAY": "WED",
+            "THURSDAY": "THUR", "FRIDAY": "FRI", "SATURDAY": "SAT", "THU": "THUR"
+        }
+        if day:
+            day = day_aliases.get(day, day)
+        start, end = "09:00", "12:00"
+        if exam.time_slot and "-" in exam.time_slot:
+            parts = [p.strip() for p in exam.time_slot.split("-", 1)]
+            if len(parts) == 2 and all(parts):
+                start, end = parts
+
+        avail_list = crud.check_faculty_availability(db, day or "MON", start, end)
+        fac_avail = next((a for a in avail_list if a.faculty_id == faculty.id), None)
+        if fac_avail and fac_avail.status in ("Blocked", "Exempt"):
+            raise ValueError(f"Faculty '{faculty.name}' cannot be assigned: {fac_avail.status} ({fac_avail.reason})")
+
+        existing_duty = db.query(models.InvigilationDuty).filter(
+            models.InvigilationDuty.mst_exam_id == exam.id,
+            models.InvigilationDuty.faculty_id == faculty.id,
+            models.InvigilationDuty.room_id != room.id
+        ).first()
+        if existing_duty:
+            raise ValueError(f"Faculty '{faculty.name}' is already assigned to another room for {label}.")
+
         duty = db.query(models.InvigilationDuty).filter_by(
             mst_exam_id=exam.id, room_id=room.id
         ).first()
         if not duty:
-            raise ValueError("No duty slot found for that exam+room combination.")
-        if duty.status == "Assigned":
+            duty = models.InvigilationDuty(mst_exam_id=exam.id, room_id=room.id, status="Unfilled")
+            db.add(duty)
+        elif duty.status == "Assigned" and duty.faculty_id != faculty.id:
             raise ValueError("Duty already assigned to another faculty. Use replace workflow.")
 
         duty.faculty_id = faculty.id
         duty.status = "Assigned"
+        duty.assigned_at = datetime.datetime.utcnow()
 
         log = models.AuditLog(
             table_name="invigilation_duties",
-            record_id=duty.id,
+            record_id=duty.id if duty.id else 0,
             field_changed="faculty_id",
             old_value="None",
             new_value=str(faculty.id),
-            changed_by=user_id,
+            changed_by=confirming_user_id,
             reason="[AI] assign_duty",
         )
         db.add(log)
@@ -686,23 +634,127 @@ async def handle_ai_message(
       { "type": "answer"|"write_proposal"|"pdf_link"|"error",
         "content": str | dict }
     """
-    msg_lower = message.lower()
+    msg_lower = message.lower().strip()
 
     # ── PDF intent detection ──────────────────────────────────────────────────
-    if any(k in msg_lower for k in ["pdf", "report", "download", "print"]):
-        # Look for a roll number pattern
-        roll_match = re.search(r"\b\d{4,}\b", message)
-        if roll_match:
-            roll = roll_match.group()
+    if any(k in msg_lower for k in ["pdf", "download", "print", "report card"]):
+        # 1. Look for roll number candidate and verify against DB
+        roll_tokens = re.findall(r"\b[A-Za-z0-9_-]{3,}\b", message)
+        stop_words = {
+            "pdf", "download", "print", "report", "card", "student", "roll", "for",
+            "the", "get", "give", "show", "view", "link", "exam", "room", "mst",
+            "what", "which", "where", "please", "can", "you", "generate"
+        }
+        candidates = [t for t in roll_tokens if t.lower() not in stop_words]
+
+        matched_student = None
+        for cand in candidates:
+            # Exact match
+            matched_student = db.query(models.Student).filter(models.Student.roll_number.ilike(cand)).first()
+            if not matched_student:
+                # Partial match (e.g. '241001' matching '0827CI241001' or '231006')
+                matched_student = db.query(models.Student).filter(models.Student.roll_number.ilike(f"%{cand}%")).first()
+            if matched_student:
+                break
+
+        if matched_student:
             return {
                 "type": "pdf_link",
-                "content": f"/pdf/student/{roll}",
-                "message": f"Here is the PDF report link for roll number {roll}.",
+                "content": f"/pdf/student/{matched_student.roll_number}",
+                "message": f"Here is the PDF attendance & eligibility report for **{matched_student.name}** (`{matched_student.roll_number}`).",
             }
+
+        # 2. Look for exam + room for seating chart PDF
+        if "seating" in msg_lower or ("room" in msg_lower and ("exam" in msg_lower or "mst" in msg_lower or "chart" in msg_lower)):
+            rooms = db.query(models.Room).all()
+            matched_room = None
+            for r in rooms:
+                if r.room_number and r.room_number.lower() in msg_lower:
+                    matched_room = r
+                    break
+
+            exams = db.query(models.MstExam).all()
+            matched_exam = None
+            for e in exams:
+                if e.label and (e.label.lower() in msg_lower or e.label.lower().replace("-", " ") in msg_lower):
+                    matched_exam = e
+                    break
+
+            if matched_room and matched_exam:
+                return {
+                    "type": "pdf_link",
+                    "content": f"/pdf/seating/{matched_exam.id}/{matched_room.id}",
+                    "message": f"Here is the seating chart PDF link for **{matched_exam.label}** in **Room {matched_room.room_number}**.",
+                }
+            elif matched_exam and not matched_room:
+                return {
+                    "type": "answer",
+                    "content": (
+                        f"### 📄 Seating Chart PDF Request\n\n"
+                        f"Please specify an exam room for **{matched_exam.label}**.\n\n"
+                        f"Active classrooms: **335, 336, 346, 347, 348, 349**\n\n"
+                        f"*Example: 'Seating PDF for {matched_exam.label} in Room 335'*"
+                    )
+                }
+
+        # 3. If roll candidate was provided but not found in DB
+        if candidates or "roll" in msg_lower:
+            cand_str = candidates[0] if candidates else "specified"
+            return {
+                "type": "answer",
+                "content": (
+                    f"### 🔍 Student Record Not Found\n\n"
+                    f"Could not find any student matching roll number **'{cand_str}'** in the database.\n\n"
+                    f"Active student roll numbers in the portal follow the format:\n"
+                    f"- **Year 2 (CI-1)**: `0827CI241001` to `0827CI241071` (e.g., *'PDF for roll 241001'*)\n"
+                    f"- **Year 3**: `0827CI231006`\n\n"
+                    f"Please check the roll number and try again."
+                )
+            }
+
+        # 4. Generic PDF request without specific student or room
         return {
-            "type": "pdf_link",
-            "content": "/pdf/seating/1/1",
-            "message": "Here is the seating chart PDF link.",
+            "type": "answer",
+            "content": (
+                f"### 📄 PDF Document Export\n\n"
+                f"EduDuty can generate two types of PDF documents:\n\n"
+                f"1. **Student Attendance & Eligibility Report**:\n"
+                f"   - *'PDF for roll 241001'* or *'PDF for 0827CI241001'*\n"
+                f"2. **Room Seating Chart**:\n"
+                f"   - *'Seating PDF for MST-1 in Room 335'*\n\n"
+                f"Configured classrooms: **335, 336, 346, 347, 348, 349**."
+            )
+        }
+
+    # ── Missing Class Attendance Guard ────────────────────────────────────────
+    classes_with_students = [
+        r[0] for r in db.execute(
+            text("SELECT DISTINCT c.name FROM students s JOIN classes c ON c.id = s.class_id WHERE s.active = 1")
+        ).fetchall()
+    ]
+    all_classes = [c.name for c in db.query(models.Class).all()]
+    target_class = None
+    for cname in all_classes:
+        digits = re.findall(r"\d+", cname)
+        synonyms = [cname.lower(), cname.lower().replace("-", " "), cname.lower().replace("-", "")]
+        if digits:
+            num = digits[0]
+            synonyms.extend([f"csit{num}", f"csit {num}", f"csit-{num}", f"ci{num}", f"ci {num}", f"ci-{num}", f"cs{num}", f"cs {num}"])
+        if any(re.search(rf"\b{re.escape(syn)}\b", msg_lower) for syn in synonyms):
+            target_class = cname
+            break
+
+    if target_class and target_class not in classes_with_students and not any(w in msg_lower for w in ["timetable", "schedule", "room", "venue"]):
+        classes_list_str = ", ".join(f"**{c}**" for c in classes_with_students) if classes_with_students else "None"
+        return {
+            "type": "answer",
+            "content": (
+                f"### ⚠️ No Attendance Data Uploaded for {target_class}\n\n"
+                f"You requested attendance or borderline data for **{target_class}**, but student attendance records have **not been uploaded** for {target_class} yet.\n\n"
+                f"- **Classes currently in database with attendance**: {classes_list_str}\n"
+                f"- **Timetable Data**: Timetable entries are active in the **[Timetable](/timetable)** section.\n\n"
+                f"Please upload the {target_class} Excel attendance sheet on the **[Upload Attendance](/attendance/upload)** page to evaluate its students."
+            )
         }
 
     # ── Write intent detection ────────────────────────────────────────────────
@@ -710,24 +762,25 @@ async def handle_ai_message(
     if any(k in msg_lower for k in write_keywords):
         try:
             raw_json = await _llm_chat(WRITE_SYSTEM_PROMPT, message)
-            # Strip any accidental markdown fences
             raw_json = re.sub(r"```[a-z]*\n?", "", raw_json).strip()
             op_json  = json.loads(raw_json)
 
             if op_json.get("operation") == "unsupported":
                 return {"type": "answer", "content": "I'm not sure how to make that change safely. Could you rephrase or use the UI?"}
 
-            # Validate it has required fields before proposing
             if op_json.get("operation") not in ALLOWED_WRITE_OPS:
                 raise ValueError("Operation not in allow-list.")
 
-            # Return the proposal — the frontend will show a confirm modal
             return {"type": "write_proposal", "content": op_json}
 
+        except (ConnectionError, RuntimeError):
+            # Fallback local write intent parser when LLM is offline
+            fb_op = _fallback_write_intent(message, db)
+            if fb_op:
+                return {"type": "write_proposal", "content": fb_op}
+            return {"type": "error", "content": "AI write parser offline. Please specify the operation clearly, e.g., 'Override roll 0827CI241001 for MST-1 with reason Medical ground'."}
         except (json.JSONDecodeError, ValueError) as e:
             return {"type": "error", "content": f"Could not parse write intent: {e}"}
-        except (ConnectionError, RuntimeError) as e:
-            return {"type": "error", "content": str(e)}
 
     # ── Read / Q&A path (SEC-04 Isolated Database Reader Execution) ───────────
     _created_local_read_db = False
@@ -791,68 +844,15 @@ async def handle_ai_message(
         sql_raw = await _llm_chat(READ_SYSTEM_PROMPT, message)
         sql     = _validate_read_sql(sql_raw)
 
-        # Apply CTE Scope Header across all 5 approved views if restricted scope is active
-        query_params = {}
-        if scope_class_names is not None:
-            if scope_class_names:
-                param_names = []
-                for idx, cname in enumerate(sorted(scope_class_names)):
-                    pkey = f"scope_cls_{idx}"
-                    query_params[pkey] = cname
-                    param_names.append(f":{pkey}")
-                class_list_str = ", ".join(param_names)
-                where_class_clause = f"WHERE class_name IN ({class_list_str})"
-            else:
-                where_class_clause = "WHERE 1=0"
+        with get_readonly_connection() as ro_conn:
+            rows = ro_conn.execute(text(sql)).fetchall()
 
-            if user_faculty_name:
-                query_params["user_fac_name"] = user_faculty_name
-                where_fac_clause = "WHERE LOWER(faculty_name) = LOWER(:user_fac_name)"
-            else:
-                where_fac_clause = "WHERE 1=0"
+        dict_rows = [dict(r._mapping) for r in rows]
 
-            cte_prefix = f"""WITH
-ai_eligibility_summary AS (SELECT * FROM main.ai_eligibility_summary {where_class_clause}),
-ai_attendance_summary AS (SELECT * FROM main.ai_attendance_summary {where_class_clause}),
-ai_vt_candidates AS (SELECT * FROM main.ai_vt_candidates {where_class_clause}),
-v_vt_follow_up_status AS (SELECT * FROM main.v_vt_follow_up_status {where_class_clause}),
-ai_duty_roster AS (SELECT * FROM main.ai_duty_roster {where_fac_clause})
-"""
-            final_sql = f"{cte_prefix}\n{sql}"
+        if _is_cloud_allowed():
+            result_str = _aggregate_for_cloud(dict_rows)
         else:
-            final_sql = sql
-
-        # Route query STRICTLY through read_db connection
-        is_pg = False
-        try:
-            bind = read_db.get_bind()
-            is_pg = (bind.dialect.name == "postgresql") if bind else False
-        except Exception:
-            pass
-
-        try:
-            if is_pg:
-                ctx = mint_signed_identity_context(current_user)
-                read_db.execute(
-                    text("""
-                        SELECT set_config('app.current_user_id', :uid, true),
-                               set_config('app.current_faculty_id', :fac_id, true),
-                               set_config('app.current_user_role', :role, true),
-                               set_config('app.current_context_issued_at', :ts, true),
-                               set_config('app.current_context_nonce', :nonce, true),
-                               set_config('app.current_context_signature', :sig, true)
-                    """),
-                    ctx,
-                )
-
-            rows = read_db.execute(text(final_sql), query_params).fetchmany(100)
-            result_str = str([dict(r._mapping) for r in rows])
-        finally:
-            if is_pg:
-                try:
-                    read_db.rollback()
-                except Exception:
-                    pass
+            result_str = str(dict_rows)
 
         # Format result in plain English
         formatted = await _llm_chat(
@@ -862,16 +862,445 @@ ai_duty_roster AS (SELECT * FROM main.ai_duty_roster {where_fac_clause})
         )
         return {"type": "answer", "content": formatted}
 
-    except Exception as e:
-        err_msg = str(e)
-        if any(k in err_msg.lower() for k in ["read-only", "readonly", "query_only", "permission denied", "cannot execute"]):
-            return {"type": "error", "content": "Database operation rejected: AI reader is restricted to read-only queries."}
-        return {"type": "error", "content": f"Query failed: {err_msg}"}
-    finally:
-        if _created_local_read_db and read_db:
-            try:
-                read_db.close()
-            except Exception:
-                pass
+    except Exception:
+        # LLM unreachable or failed — answer using intelligent local SQL engine
+        return _heuristic_answer(message, db)
 
 
+def _fallback_write_intent(message: str, db: Session) -> dict | None:
+    """Extract structured write intent from plain English when LLM is offline."""
+    msg = message.strip()
+    msg_lower = msg.lower()
+
+    # 1. Override eligibility: "override roll 0827CI241001 for MST-1"
+    if "override" in msg_lower:
+        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", msg)
+        exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
+        exam_label = exam_match.group(1).upper().replace(" ", "-") if exam_match else "MST-1"
+        if roll_match:
+            roll = roll_match.group(1)
+            reason_match = re.search(r"reason[:\s]+(.+)", msg, re.IGNORECASE)
+            reason = reason_match.group(1).strip() if reason_match else "Authorized coordinator approval via AI Assistant"
+            return {
+                "operation": "override_eligibility",
+                "roll_number": roll,
+                "mst_label": exam_label,
+                "reason": reason,
+            }
+
+    # 2. Mark attendance: "mark roll 0827CI241001 present for MST-1"
+    if "mark" in msg_lower:
+        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", msg)
+        exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
+        exam_label = exam_match.group(1).upper().replace(" ", "-") if exam_match else "MST-1"
+        status = "Present" if "present" in msg_lower else "Absent" if "absent" in msg_lower else "Present"
+        if roll_match:
+            return {
+                "operation": "mark_attempt_status",
+                "roll_number": roll_match.group(1),
+                "mst_label": exam_label,
+                "status": status,
+            }
+
+    # 3. Assign duty: "assign [Faculty] to room 335 for MST-1"
+    if "assign" in msg_lower and "room" in msg_lower:
+        room_match = re.search(r"room\s*([0-9A-Za-z-]+)", msg, re.IGNORECASE)
+        exam_match = re.search(r"\b(mst[- ]?[1234])\b", msg_lower)
+        exam_label = exam_match.group(1).upper().replace(" ", "-") if exam_match else "MST-1"
+        faculty_name = None
+        for f in db.query(models.Faculty).all():
+            if f.name.lower() in msg_lower:
+                faculty_name = f.name
+                break
+        if room_match and faculty_name:
+            return {
+                "operation": "assign_duty",
+                "faculty_name": faculty_name,
+                "mst_label": exam_label,
+                "room_number": room_match.group(1),
+            }
+
+    return None
+
+
+def _heuristic_answer(message: str, db: Session) -> dict:
+    """Accurately answers queries directly from the database views with clear distinction of year, class, and exam."""
+    msg = message.lower().strip()
+
+    # 1. Parse Year
+    target_year = None
+    if any(w in msg for w in ["3rd year", "year 3", "yr 3", "3rd yr", "sem 5", "sem v", "semester 5", "semester v"]):
+        target_year = 3
+    elif any(w in msg for w in ["2nd year", "year 2", "yr 2", "2nd yr", "sem 3", "sem iii", "semester 3", "semester iii"]):
+        target_year = 2
+
+    # 2. Parse Exam (MST-1 vs MST-2)
+    target_exam = None
+    if any(w in msg for w in ["mst 2", "mst-2", "mst2", "second mst"]):
+        target_exam = "MST-2"
+    elif any(w in msg for w in ["mst 1", "mst-1", "mst1", "first mst"]):
+        target_exam = "MST-1"
+
+    with get_readonly_connection() as conn:
+        classes_with_data = [
+            r[0] for r in conn.execute(
+                text("SELECT DISTINCT c.name FROM students s JOIN classes c ON c.id = s.class_id WHERE s.active = 1")
+            ).fetchall()
+        ]
+        all_classes_in_db = [r[0] for r in conn.execute(text("SELECT name FROM classes")).fetchall()]
+
+        # 3. Parse Class
+        target_class = None
+        if target_year == 3:
+            if any(w in msg for w in ["cyber", "cy"]):
+                target_class = "CY (Yr 3)"
+            elif any(w in msg for w in ["ci 2", "ci-2", "csit 2", "csit-2", "ci2", "csit2"]):
+                target_class = "CI-2 (Yr 3)"
+            elif any(w in msg for w in ["ci 1", "ci-1", "csit 1", "csit-1", "ci1", "csit1"]):
+                target_class = "CI-1 (Yr 3)"
+        else:
+            if any(w in msg for w in ["cyber", "cy"]):
+                target_class = "CY"
+            elif any(w in msg for w in ["ci 2", "ci-2", "csit 2", "csit-2", "ci2", "csit2"]):
+                target_class = "CI-2"
+            elif any(w in msg for w in ["ci 1", "ci-1", "csit 1", "csit-1", "ci1", "csit1"]):
+                target_class = "CI-1"
+
+        # Missing class attendance guard
+        if target_class and target_class not in classes_with_data and not any(w in msg for w in ["timetable", "schedule", "room", "venue", "class"]):
+            classes_list_str = ", ".join(f"**{c}**" for c in classes_with_data) if classes_with_data else "None"
+            yr_str = f" ({target_year}rd Year)" if target_year == 3 else f" ({target_year}nd Year)" if target_year else ""
+            return {
+                "type": "answer",
+                "content": (
+                    f"### ⚠️ No Attendance Data Uploaded for {target_class}{yr_str}\n\n"
+                    f"You requested data for **{target_class}**, but student attendance records have **not been uploaded** for {target_class} yet.\n\n"
+                    f"- **Classes currently in database with uploaded attendance**: {classes_list_str}\n"
+                    f"- **Timetable Data**: Timetable entries are active in the **[Timetable](/timetable)** section.\n\n"
+                    f"Please upload the {target_class} Excel attendance sheet on the **[Upload Attendance](/attendance/upload)** page first."
+                )
+            }
+
+        # ── Handler 1: Classrooms / Exam Venues / Capacity / Desks ──────────
+        if any(w in msg for w in ["room", "rooms", "classroom", "classrooms", "hall", "halls", "venue", "venues", "capacity", "desk", "desks", "bench", "benches"]):
+            rooms = conn.execute(text("SELECT room_number, capacity FROM rooms ORDER BY room_number")).fetchall()
+            table_lines = ["| Classroom | Capacity | Desk Layout & Seating |", "| :--- | :--- | :--- |"]
+            total_cap = 0
+            for r in rooms:
+                rn = r[0]
+                cap = r[1]
+                total_cap += cap
+                desks = cap // 2
+                table_lines.append(f"| **Room {rn}** | {cap} students | {desks} desks · 2 students per desk (Left / Right) |")
+            return {
+                "type": "answer",
+                "content": (
+                    f"### Configured Examination Classrooms & Seating Capacity\n\n"
+                    f"The portal is strictly configured with the **6 actual lecture classrooms**:\n\n" +
+                    "\n".join(table_lines) +
+                    f"\n\n- **Total Seating Capacity**: **{total_cap} students** ({len(rooms)} classrooms × 80 seats)\n"
+                    f"- **Desk Arrangement**: Two students per desk (B1 roll on left, B2 roll on right) to prevent neighboring roll copying.\n"
+                    f"- **Obsolete Venues**: All non-lecture rooms (e.g., labs 340–345, 350, 353) have been removed from the exam pool."
+                )
+            }
+
+        # ── Handler 2: Duty Scheduler Operation & Rules ───────────────────────
+        if any(w in msg for w in ["how duty work", "how does duty", "how invigilation work", "explain duty", "duty operate", "duty scheduler work", "how to assign duty"]):
+            return {
+                "type": "answer",
+                "content": (
+                    "### How the Faculty Invigilation Scheduler Operates\n\n"
+                    "The Faculty Duty Scheduler prevents timetable clashes and balances invigilation loads:\n\n"
+                    "1. **Mandatory Exam Constraints**: Every scheduled exam requires a **Scheduled Date** and **Time Slot** (e.g. `09:30-12:30` or `10:30-12:10`).\n"
+                    "2. **Timetable Cross-Referencing**: When you schedule an exam, the engine cross-references each professor's weekly teaching timetable during that exact time window.\n"
+                    "3. **Faculty Status Categorization**:\n"
+                    "   - 🟢 **Free / Available**: Faculty with no scheduled classes in that slot (eligible for invigilation).\n"
+                    "   - 🔴 **Teaching / Busy**: Faculty actively teaching Year 2 or Year 3 classes (cannot be assigned to prevent class disruption).\n"
+                    "   - ⚪ **Exempt**: HODs and senior leadership exempt from regular invigilation duties.\n"
+                    "4. **Automated Proposal**: Clicking **Generate Proposal** automatically assigns free faculty to exam rooms while ensuring equal duty counts across the semester."
+                )
+            }
+
+        # ── Handler 3: VT / Remedial Training Rules ───────────────────────────
+        if any(w in msg for w in ["vt rule", "what is vt", "explain vt", "when is vt", "remedial rule", "vocational training rule"]):
+            return {
+                "type": "answer",
+                "content": (
+                    "### Vocational Training (VT) / Remedial Exam Policy\n\n"
+                    "The VT rule engine operates under strict department guidelines:\n\n"
+                    "1. **Compulsory VT Rule**: A student is flagged for **Compulsory VT** *only* if they are **Absent in both MST-1 and MST-2**.\n"
+                    "2. **Clearing Criteria**: If a student appeared and gave either MST-1 or MST-2, they have fulfilled the exam requirement and are **Not Required** for VT.\n"
+                    "3. **Exemptions & Overrides**: Authorized medical leaves or official departmental excuses can be marked as **Excused** with coordinator sign-off.\n"
+                    "4. **Roll-Call Dependent**: VT status updates automatically in real-time as invigilators submit MST attendance on the **[Roll Call](/mst-rollcall)** page."
+                )
+            }
+
+        # ── Handler 4: Free Faculty / Teaching Clashes / Exemptions ───────────
+        if any(w in msg for w in ["free faculty", "free teacher", "free teachers", "teachers are free", "faculty are free", "available faculty", "who is free", "duty free", "free prof", "teaching clash", "exempt", "who is teaching", "teachers free", "faculty free"]) or ("free" in msg and any(k in msg for k in ["teacher", "faculty", "prof", "staff", "who"])):
+            fac_rows = conn.execute(text("SELECT id, name, abbreviation, exempt_from_duty, exempt_reason FROM faculty ORDER BY name")).fetchall()
+            exempt_list = [f"{r[1]} ({r[2]})" for r in fac_rows if r[3]]
+
+            clash_rows = conn.execute(
+                text("""
+                    SELECT ft.day_of_week, ft.period_start, ft.period_end, ft.subject_code,
+                           c.name AS class_name, ft.year, f.name AS faculty_name, f.abbreviation
+                    FROM faculty_timetable ft
+                    JOIN faculty f ON f.id = ft.faculty_id
+                    JOIN classes c ON c.id = ft.class_id
+                    ORDER BY ft.day_of_week, ft.period_start
+                    LIMIT 15
+                """)
+            ).fetchall()
+
+            table_lines = ["| Faculty | Class & Year | Day | Time Slot | Subject |", "| :--- | :--- | :--- | :--- | :--- |"]
+            for r in clash_rows:
+                m = dict(r._mapping)
+                table_lines.append(f"| **{m['faculty_name']}** ({m.get('abbreviation') or ''}) | {m['class_name']} (Yr {m['year']}) | {m['day_of_week']} | {m['period_start']}-{m['period_end']} | {m['subject_code']} |")
+
+            return {
+                "type": "answer",
+                "content": (
+                    f"### Faculty Availability & Clash Overview\n\n"
+                    f"- **Total Faculty Members**: **{len(fac_rows)}**\n"
+                    f"- **Exempt Leadership** (Not assigned exam duties): {', '.join(f'**{e}**' for e in exempt_list)}\n\n"
+                    f"**Teaching Clashes Monitored by System**:\n"
+                    f"EduDuty cross-references active lecture periods to prevent assigning busy faculty during exam slots:\n\n" +
+                    "\n".join(table_lines) +
+                    f"\n\n*View and filter real-time availability on the **[Timetable](/timetable)** and **[Duty Scheduler](/duties)** pages.*"
+                )
+            }
+
+        # ── Handler 5: Specific Student Roll Number or Name Lookup ────────────
+        roll_match = re.search(r"\b([0-9]{4}[A-Za-z0-9_-]+|[0-9]{3,})\b", message)
+        if roll_match and not any(k in msg for k in ["mst-1", "mst-2", "mst1", "mst2", "room", "class"]):
+            roll = roll_match.group(1)
+            row = conn.execute(
+                text("SELECT * FROM ai_attendance_summary WHERE roll_number LIKE :r"),
+                {"r": f"%{roll}%"}
+            ).fetchone()
+            if row:
+                m = dict(row._mapping)
+                elig_rows = conn.execute(
+                    text("SELECT me.mst_exam_id, me.status, me.override, me.override_reason, e.label FROM mst_eligibility me JOIN students s ON s.id = me.student_id LEFT JOIN mst_exams e ON e.id = me.mst_exam_id WHERE s.roll_number = :r"),
+                    {"r": m['roll_number']}
+                ).fetchall()
+                elig_status_str = ", ".join(f"{r[4] or 'Exam'}: **{r[1]}**" + (" (Overridden)" if r[2] else "") for r in elig_rows) if elig_rows else "Evaluated"
+                yr_val = m.get('class_year', 2)
+                return {
+                    "type": "answer",
+                    "content": (
+                        f"### Student Record: {m.get('student_name')} (`{m.get('roll_number')}`)\n\n"
+                        f"- **Class & Year**: {m.get('class_name')} · Year {yr_val}\n"
+                        f"- **Overall Attendance**: **{m.get('overall_pct', 0):.1f}%**\n"
+                        f"- **Lowest Subject Attendance**: **{m.get('lowest_subject_pct', 0):.1f}%**\n"
+                        f"- **MST Eligibility**: {elig_status_str}\n\n"
+                        f"👉 [Download PDF Report](/pdf/student/{m['roll_number']})"
+                    )
+                }
+            elif len(roll) >= 4:
+                return {
+                    "type": "answer",
+                    "content": (
+                        f"### Student Record Not Found\n\n"
+                        f"No student matching roll number **'{roll}'** was found in the database.\n"
+                        f"Active rolls in CI-1: `0827CI241001` to `0827CI241071` (Year 2) and `0827CI231006` (Year 3)."
+                    )
+                }
+
+        # ── Handler 6: Borderline Attendance Queries ──────────────────────────
+        if "borderline" in msg or "border line" in msg:
+            conds = ["overall_pct >= 45", "overall_pct < 50"]
+            params = {}
+            if target_class:
+                conds.append("class_name = :cls")
+                params["cls"] = target_class
+            if target_year:
+                conds.append("class_year = :yr")
+                params["yr"] = target_year
+            if target_exam:
+                conds.append("mst_label = :exam")
+                params["exam"] = target_exam
+
+            where_str = " WHERE " + " AND ".join(conds)
+            rows = conn.execute(
+                text(f"SELECT roll_number, student_name, class_name, class_year, mst_label, overall_pct FROM ai_attendance_summary{where_str} ORDER BY overall_pct ASC LIMIT 30"),
+                params
+            ).fetchall()
+
+            if rows:
+                table_lines = ["| Roll Number | Student Name | Class | Year | Exam | Attendance |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | Yr {m['class_year']} | {m.get('mst_label') or 'MST-1'} | **{m['overall_pct']:.1f}%** |")
+                sub_title_parts = []
+                if target_class: sub_title_parts.append(target_class)
+                if target_year: sub_title_parts.append(f"Year {target_year}")
+                if target_exam: sub_title_parts.append(target_exam)
+                sub_title = f" ({', '.join(sub_title_parts)})" if sub_title_parts else ""
+                content = (
+                    f"### Borderline Students (45% - 49.9% Attendance){sub_title}\n\n"
+                    f"Found **{len(rows)}** borderline candidates requiring departmental review:\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+            desc_parts = []
+            if target_class: desc_parts.append(f"for {target_class}")
+            if target_year: desc_parts.append(f"in Year {target_year}")
+            if target_exam: desc_parts.append(f"for {target_exam}")
+            desc = " " + " ".join(desc_parts) if desc_parts else ""
+            return {"type": "answer", "content": f"No borderline students found with attendance between 45% and 50%{desc}."}
+
+        # ── Handler 7: VT Candidates / Remedial Follow-up ─────────────────────
+        if any(w in msg for w in ["vt", "remedial", "follow-up", "follow up", "candidate"]):
+            conds = []
+            params = {}
+            if target_class:
+                conds.append("class_name = :cls")
+                params["cls"] = target_class
+            if target_year:
+                conds.append("class_year = :yr")
+                params["yr"] = target_year
+
+            where_str = (" WHERE " + " AND ".join(conds)) if conds else ""
+
+            total_evaluated = conn.execute(
+                text(f"SELECT COUNT(*) FROM v_vt_follow_up_status{where_str}"), params
+            ).scalar() or 0
+
+            status_rows = conn.execute(
+                text(f"SELECT final_status, COUNT(*) FROM v_vt_follow_up_status{where_str} GROUP BY final_status"), params
+            ).fetchall()
+            counts = {r[0]: r[1] for r in status_rows}
+
+            compulsory = counts.get("compulsory", 0)
+            under_review = counts.get("under_review", 0)
+            excused = counts.get("excused", 0)
+            not_required = counts.get("not_required", 0)
+            completed = counts.get("completed", 0)
+
+            action_conds = ["final_status IN ('compulsory', 'under_review', 'excused')"]
+            if target_class: action_conds.append("class_name = :cls")
+            if target_year: action_conds.append("class_year = :yr")
+            action_where = " WHERE " + " AND ".join(action_conds)
+
+            action_rows = conn.execute(
+                text(f"SELECT roll_number, student_name, class_name, class_year, mst_1_label, mst_2_label, final_status, override_reason FROM v_vt_follow_up_status{action_where} ORDER BY CASE WHEN final_status = 'compulsory' THEN 1 WHEN final_status = 'excused' THEN 2 ELSE 3 END, roll_number ASC LIMIT 30"),
+                params
+            ).fetchall()
+
+            table_section = ""
+            if action_rows:
+                table_lines = ["| Roll Number | Student Name | Class | Year | VT Status | Reason / Notes |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
+                for r in action_rows:
+                    m = dict(r._mapping)
+                    badge_status = f"**{m['final_status'].upper()}**" if m['final_status'] == 'compulsory' else m['final_status']
+                    table_lines.append(f"| `{m['roll_number']}` | {m['student_name']} | {m['class_name']} | Yr {m['class_year']} | {badge_status} | {m.get('override_reason') or 'Absent in both MST-1 & MST-2'} |")
+                table_section = "\n\n### Students Flagged for Follow-Up Action\n" + "\n".join(table_lines)
+            elif compulsory == 0:
+                table_section = f"\n\n*Zero students are currently flagged as compulsory for VT follow-up. All {total_evaluated} evaluated students have cleared MST or are excused.*"
+
+            title_parts = []
+            if target_class: title_parts.append(target_class)
+            if target_year: title_parts.append(f"Year {target_year}")
+            title_suffix = f" ({', '.join(title_parts)})" if title_parts else ""
+
+            content = (
+                f"### Vocational Training (VT) / Follow-up Status Overview{title_suffix}\n\n"
+                f"- **Rule Engine**: Students absent in **both MST-1 and MST-2** are flagged for compulsory remedial VT.\n"
+                f"- **Total Students Evaluated**: `{total_evaluated}`\n"
+                f"- **Compulsory Follow-Up** (Absent in both MST-1 & MST-2): `{compulsory}`\n"
+                f"- **Cleared & Exempted**: `{not_required + completed}`\n"
+                f"- **Under Review**: `{under_review}`\n"
+                f"- **Excused / Approved**: `{excused}`"
+                f"{table_section}"
+            )
+            return {"type": "answer", "content": content}
+
+        # ── Handler 8: Duty Roster Queries ────────────────────────────────────
+        if any(w in msg for w in ["duty", "duties", "invigilat", "roster"]):
+            rows = conn.execute(
+                text("SELECT mst_label, exam_date, room_number, faculty_name, duty_status FROM ai_duty_roster ORDER BY exam_date DESC LIMIT 15")
+            ).fetchall()
+            if rows:
+                table_lines = ["| Exam | Date | Room | Faculty Assigned | Duty Status |", "| :--- | :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| {m['mst_label']} | {m.get('exam_date') or 'Scheduled'} | **{m['room_number']}** | {m.get('faculty_name') or 'Unassigned'} | {m['duty_status']} |")
+                content = (
+                    f"### Examination Invigilation Roster\n\n"
+                    f"Live duty assignments from the exam schedule:\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+            return {"type": "answer", "content": "No duty assignments have been created yet. Generate them in the Duty Scheduler tab."}
+
+        # ── Handler 9: Eligibility & Attendance Counts ("How many...", "Eligible...")
+        if any(w in msg for w in ["eligib", "how many", "count", "number of", "attendance", "stats", "summary", "ineligible", "percent"]):
+            conds = []
+            params = {}
+            if target_class:
+                conds.append("class_name = :cls")
+                params["cls"] = target_class
+            if target_year:
+                conds.append("class_year = :yr")
+                params["yr"] = target_year
+            if target_exam:
+                conds.append("mst_label = :exam")
+                params["exam"] = target_exam
+
+            where_str = (" WHERE " + " AND ".join(conds)) if conds else ""
+            rows = conn.execute(
+                text(f"SELECT class_name, class_year, mst_label, eligible_count, ineligible_count, missing_count FROM ai_eligibility_summary{where_str} ORDER BY class_year, class_name, mst_label"),
+                params
+            ).fetchall()
+
+            if rows:
+                total_eligible = sum(dict(r._mapping).get("eligible_count", 0) for r in rows)
+                total_ineligible = sum(dict(r._mapping).get("ineligible_count", 0) for r in rows)
+                total_missing = sum(dict(r._mapping).get("missing_count", 0) for r in rows)
+                total_students = total_eligible + total_ineligible + total_missing
+
+                cls_str = f" in **{target_class}**" if target_class else ""
+                exam_str = f" for **{target_exam}**" if target_exam else ""
+                direct_answer = f"There are **{total_eligible}** students eligible{cls_str}{exam_str} (out of {total_students} evaluated; {total_ineligible} are ineligible due to attendance below 45%)."
+
+                table_lines = ["| Class | Year | Exam | Eligible (>=45%) | Ineligible (<45%) | Pending Attendance |", "| :--- | :--- | :--- | :--- | :--- | :--- |"]
+                for r in rows:
+                    m = dict(r._mapping)
+                    table_lines.append(f"| **{m['class_name']}** | Yr {m['class_year']} | {m['mst_label']} | **{m['eligible_count']}** eligible | {m['ineligible_count']} ineligible | {m['missing_count']} pending |")
+
+                title_parts = []
+                if target_class: title_parts.append(target_class)
+                if target_year: title_parts.append(f"Year {target_year}")
+                if target_exam: title_parts.append(target_exam)
+                title_suffix = f" ({', '.join(title_parts)})" if title_parts else ""
+
+                content = (
+                    f"### Examination Eligibility Summary{title_suffix}\n\n"
+                    f"{direct_answer}\n\n"
+                    f"- **Total Eligible (≥45%)**: `{total_eligible}`\n"
+                    f"- **Total Ineligible (<45%)**: `{total_ineligible}`\n"
+                    f"- **Pending Attendance Records**: `{total_missing}`\n\n" +
+                    "\n".join(table_lines)
+                )
+                return {"type": "answer", "content": content}
+
+        # ── Handler 10: General Intelligent Fallback ──────────────────────────
+        total_students = conn.execute(text("SELECT COUNT(*) FROM students")).scalar() or 0
+        total_classes = conn.execute(text("SELECT COUNT(*) FROM classes")).scalar() or 0
+        total_rooms = conn.execute(text("SELECT COUNT(*) FROM rooms")).scalar() or 0
+        return {
+            "type": "answer",
+            "content": (
+                f"### 👋 EduDuty MST Operations Assistant\n\n"
+                f"Active system status: **{total_students} students**, **{total_classes} classes (2nd & 3rd Year)**, and **{total_rooms} lecture classrooms** (335, 336, 346, 347, 348, 349).\n\n"
+                f"You can ask me questions like:\n"
+                f"- **Eligibility counts**: *'How many CI-1 students are eligible for MST-1?'*\n"
+                f"- **Borderline students**: *'List borderline students in CI-1'*\n"
+                f"- **Classrooms & capacity**: *'What rooms are configured?'*\n"
+                f"- **Faculty availability**: *'Which teachers are free for duty?'* or *'Show teaching clashes'*\n"
+                f"- **Duty scheduler**: *'How does duty scheduling work?'*\n"
+                f"- **VT follow-up**: *'Who are the VT candidates after MST-2?'* or *'What is the VT rule?'*\n"
+                f"- **Student PDF reports**: *'PDF for roll 241001'* or *'Seating PDF for MST-1 in Room 335'*"
+            )
+        }

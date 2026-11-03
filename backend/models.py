@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Integer, String, Numeric, ForeignKey, SmallInteger, Date, DateTime, UniqueConstraint, text
+from sqlalchemy import Boolean, Column, Integer, String, Numeric, ForeignKey, SmallInteger, Date, DateTime, text, UniqueConstraint
 from sqlalchemy.orm import relationship
 from database import Base
 import datetime
@@ -29,7 +29,7 @@ class Faculty(Base):
     exempt_from_duty = Column(Boolean, default=False)
     exempt_reason = Column(String(200))
     max_duties_per_day = Column(SmallInteger, default=2)
-    abbreviation = Column(String(10))          # e.g. 'VK', 'MG' — from timetable legend
+    abbreviation = Column(String(10), unique=True)          # e.g. 'VK', 'MG' — from timetable legend
 
 class Subject(Base):
     __tablename__ = "subjects"
@@ -50,7 +50,15 @@ class AttendanceRecord(Base):
     attendance_pct = Column(Numeric(5, 2))
     upload_date = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     source_file = Column(String(255))
+    batch_label = Column(String(100))   # e.g. "CI-1 MST-1", "CI-2 Sem5" — user-assigned label
     approved = Column(Boolean, default=False, nullable=False)
+
+    @property
+    def pct(self) -> float:
+        if not self.classes_conducted:
+            return 0.0
+        attended = self.classes_attended or 0
+        return round(100.0 * attended / self.classes_conducted, 2)
 
 class SystemRule(Base):
     __tablename__ = "system_rules"
@@ -68,9 +76,8 @@ class MstExam(Base):
 
 class MstEligibility(Base):
     __tablename__ = "mst_eligibility"
-    __table_args__ = (
-        UniqueConstraint("student_id", "mst_exam_id", name="uq_mst_eligibility_student_exam"),
-    )
+    __table_args__ = (UniqueConstraint("student_id", "mst_exam_id", name="uq_mst_eligibility_student_exam"),)
+
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
     mst_exam_id = Column(Integer, ForeignKey("mst_exams.id"), nullable=False)
@@ -83,9 +90,8 @@ class MstEligibility(Base):
 
 class MstAttempt(Base):
     __tablename__ = "mst_attempts"
-    __table_args__ = (
-        UniqueConstraint("student_id", "mst_exam_id", name="uq_mst_attempts_student_exam"),
-    )
+    __table_args__ = (UniqueConstraint("student_id", "mst_exam_id", name="uq_mst_attempt_student_exam"),)
+
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
     mst_exam_id = Column(Integer, ForeignKey("mst_exams.id"), nullable=False)

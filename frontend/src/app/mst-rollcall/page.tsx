@@ -14,18 +14,36 @@ import {
 } from "lucide-react"
 import { apiFetch, getApiErrorMessage } from "@/lib/api"
 
-type Exam = { id: number; label: string; exam_date: string | null; time_slot: string | null; class_id: number | null }
+type Exam = {
+  id: number
+  label: string
+  exam_date: string | null
+  time_slot: string | null
+  class_id: number | null
+  class_name?: string | null
+  year?: number | null
+  display_name?: string | null
+}
 type Student = {
   student_id: number; roll_number: string; name: string
   batch_number: number | null; class_name: string; status: string | null
+  is_borderline?: boolean; eligibility_status?: string | null; override?: boolean
 }
 type Mark = "Present" | "Absent" | null
 
 async function fetchRollCall<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await apiFetch(path, init)
   if (!res.ok) {
-    const err = await getApiErrorMessage(res, `HTTP ${res.status}`)
-    throw new Error(err)
+    const err = await res.json().catch(() => ({})) as { detail?: any; message?: string }
+    let msg = `HTTP ${res.status}`
+    if (typeof err.detail === 'string') {
+      msg = err.detail
+    } else if (Array.isArray(err.detail)) {
+      msg = err.detail.map((e: any) => e.msg || JSON.stringify(e)).join(', ')
+    } else if (err.message) {
+      msg = err.message
+    }
+    throw new Error(msg)
   }
   return res.json()
 }
@@ -55,17 +73,23 @@ export default function RollCallPage() {
   const [search,   setSearch]   = useState("")
   const [filter,   setFilter]   = useState<"all" | "present" | "absent" | "unmarked">("all")
   const [loading,  setLoading]  = useState(false)
+  const [submitting, setSubmitting] = useState(false)
   const [saving,   setSaving]   = useState<Record<number, boolean>>({})
+  const [error, setError] = useState<string | null>(null)
   const { toast } = useToast()
 
   // Load exams on mount
   useEffect(() => {
-    fetchRollCall<Exam[]>("/mst/exams").then(setExams).catch(() => {})
+    apiFetch("/mst/exams").then((e: Exam[]) => {
+      setExams(e)
+      if (e.length > 0) setExamId(e[0].id)
+    }).catch(() => {})
   }, [])
 
-  // Load roll-call when exam changes
+  // Load roll-call when exam changes (stable dependency array)
   const loadRollcall = useCallback(async (id: number) => {
     setLoading(true)
+    setError(null)
     try {
       const data = await fetchRollCall<Student[]>(`/mst/attendance/rollcall/${id}`)
       setStudents(data)
@@ -73,13 +97,15 @@ export default function RollCallPage() {
       for (const s of data) m[s.student_id] = (s.status as Mark) ?? null
       setMarks(m)
     } catch (e) {
-      toast({ title: "Failed to load students", description: (e as Error).message, variant: "destructive" })
+      setError((e as Error).message)
     } finally {
       setLoading(false)
     }
-  }, [toast])
+  }, [])
 
-  useEffect(() => { if (examId) loadRollcall(examId) }, [examId, loadRollcall])
+  useEffect(() => {
+    if (examId) loadRollcall(examId)
+  }, [examId, loadRollcall])
 
   // Mark a student
   async function toggle(studentId: number) {
@@ -102,12 +128,67 @@ export default function RollCallPage() {
     }
   }
 
-  // Mark ALL visible students as present
+  // Mark ALL visible students as present in one atomic bulk request
   async function markAllPresent() {
     if (!examId) return
     const toMark = filtered.filter(s => marks[s.student_id] !== "Present")
-    for (const s of toMark) await toggle(s.student_id)
-    toast({ title: `${toMark.length} students marked Present` })
+    if (toMark.length === 0) return
+
+    try {
+      await apiFetch("/mst/attendance/mark-bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mst_exam_id: examId,
+          student_ids: toMark.map(s => s.student_id),
+          status: "Present",
+        }),
+      })
+      setMarks(prev => {
+        const next = { ...prev }
+        for (const s of toMark) next[s.student_id] = "Present"
+        return next
+      })
+      toast({ title: `${toMark.length} students marked Present` })
+    } catch (e) {
+      toast({ title: "Bulk save failed", description: (e as Error).message, variant: "destructive" })
+    }
+  }
+
+  // Submit and finalize attendance to backend + trigger VT recalculation
+  async function submitAttendance() {
+    if (!examId) return
+    setSubmitting(true)
+    try {
+      // Only include marked students ('Present' | 'Absent')
+      const cleanRecords: Record<number, string> = {}
+      for (const [sid, status] of Object.entries(marks)) {
+        if (status === 'Present' || status === 'Absent') {
+          cleanRecords[Number(sid)] = status
+        }
+      }
+      const res = await apiFetch("/mst/attendance/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mst_exam_id: examId,
+          records: cleanRecords,
+        }),
+      })
+      toast({
+        title: "Attendance Submitted Successfully",
+        description: `${res.present_count} Present, ${res.absent_count} Absent. VT compliance & AI assistant synced (${res.vt_recalculated} records updated).`,
+      })
+      await loadRollcall(examId)
+    } catch (e) {
+      toast({
+        title: "Attendance submission failed",
+        description: (e as Error).message,
+        variant: "destructive",
+      })
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   // Counts
@@ -150,14 +231,14 @@ export default function RollCallPage() {
 
       {/* Exam selector */}
       <div className="flex flex-wrap items-center gap-3">
-        <Select onValueChange={v => setExamId(Number(v))}>
-          <SelectTrigger id="rollcall-exam-select" className="w-64">
+        <Select value={examId ? String(examId) : ""} onValueChange={v => setExamId(Number(v))}>
+          <SelectTrigger id="rollcall-exam-select" className="min-w-[320px] max-w-md">
             <SelectValue placeholder="Pick an exam…" />
           </SelectTrigger>
           <SelectContent>
             {exams.map(e => (
               <SelectItem key={e.id} value={String(e.id)}>
-                {e.label} {e.exam_date ? `· ${e.exam_date}` : ""} {e.time_slot ? `· ${e.time_slot}` : ""}
+                {e.display_name || `${e.label} · ${e.class_name || ""} (Yr ${e.year || ""})`} {e.exam_date ? `· ${e.exam_date}` : ""} {e.time_slot ? `· ${e.time_slot}` : ""}
               </SelectItem>
             ))}
           </SelectContent>
@@ -171,16 +252,16 @@ export default function RollCallPage() {
       </div>
 
       {!examId && (
-        <div className="flex flex-col items-center justify-center h-64 gap-2 text-muted-foreground">
-          <AlertCircle className="h-10 w-10" />
-          <p>Select an exam to start marking attendance</p>
+        <div className="flex flex-col items-center justify-center min-h-[300px] gap-3 text-muted-foreground border rounded-2xl bg-card/50">
+          <AlertCircle className="h-10 w-10 text-muted-foreground/50" />
+          <p className="text-sm font-medium">Select an exam above to view student list & mark attendance.</p>
         </div>
       )}
 
       {examId && (
         <>
           {/* Stats bar */}
-          <div className="grid grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             {[
               { label: "Total", value: counts.total,    icon: <Users className="h-4 w-4" />,        color: "" },
               { label: "Present", value: counts.present, icon: <UserCheck className="h-4 w-4" />,   color: "text-emerald-600 dark:text-emerald-400" },
@@ -197,15 +278,15 @@ export default function RollCallPage() {
             ))}
           </div>
 
-          {/* Filter + search + bulk actions */}
-          <div className="flex flex-wrap items-center gap-3">
+          {/* Sticky filter + search + bulk actions + SUBMIT ATTENDANCE */}
+          <div className="sticky top-0 z-20 bg-background/95 backdrop-blur-sm py-2.5 border-y flex flex-wrap items-center gap-3">
             {(["all", "present", "absent", "unmarked"] as const).map(f => (
               <button
                 key={f}
                 onClick={() => setFilter(f)}
                 className={`rounded-full border px-3 py-1 text-xs font-medium capitalize transition-all ${
                   filter === f
-                    ? "bg-foreground text-background border-foreground"
+                    ? "bg-foreground text-background border-foreground shadow-sm"
                     : "border-muted-foreground/30 text-muted-foreground hover:border-foreground/50"
                 }`}
               >
@@ -213,14 +294,14 @@ export default function RollCallPage() {
               </button>
             ))}
 
-            <div className="relative ml-auto">
+            <div className="relative">
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
               <Input
                 id="rollcall-search"
                 placeholder="Roll or name…"
                 value={search}
                 onChange={e => setSearch(e.target.value)}
-                className="pl-8 h-8 w-44 text-sm"
+                className="pl-8 h-8 w-40 md:w-52 text-sm"
               />
             </div>
 
@@ -228,29 +309,79 @@ export default function RollCallPage() {
               <CheckCircle2 className="h-3.5 w-3.5 mr-1.5 text-emerald-500" />
               All Present
             </Button>
+
+            {/* Main Submit Attendance Button */}
+            <Button
+              id="submit-attendance-btn"
+              size="sm"
+              className="h-8 ml-auto bg-emerald-600 hover:bg-emerald-700 text-white font-semibold gap-1.5 shadow-sm px-4"
+              onClick={submitAttendance}
+              disabled={submitting || students.length === 0}
+            >
+              {submitting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+              {submitting ? "Submitting..." : `Submit Attendance (${counts.present + counts.absent}/${counts.total})`}
+            </Button>
           </div>
 
-          {/* Loading */}
-          {loading ? (
+          {/* Error, Loading, Empty, or List */}
+          {error ? (
+            <div className="flex flex-col items-center justify-center min-h-[300px] gap-3 text-center p-6 border rounded-2xl bg-destructive/5 border-destructive/20">
+              <AlertCircle className="h-10 w-10 text-destructive/80" />
+              <div className="max-w-md">
+                <p className="font-semibold text-base text-foreground">Could not load students for this exam</p>
+                <p className="text-sm text-muted-foreground mt-1">{error}</p>
+              </div>
+              <div className="flex gap-3 mt-2">
+                <Button variant="outline" size="sm" onClick={() => examId && loadRollcall(examId)}>
+                  Try Again
+                </Button>
+                <a
+                  href="/attendance/upload"
+                  className="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-9 px-3 text-xs font-medium shadow-sm transition-colors"
+                >
+                  Upload Attendance & Compute
+                </a>
+              </div>
+            </div>
+          ) : loading ? (
             <div className="flex flex-col items-center justify-center min-h-[400px] border rounded-xl bg-muted/5">
               <RefreshCw className="h-6 w-6 animate-spin text-muted-foreground mb-4" />
               <span className="text-muted-foreground text-sm font-medium">Loading students…</span>
             </div>
+          ) : students.length === 0 ? (
+            <div className="flex flex-col items-center justify-center min-h-[360px] gap-3 text-center p-6 border rounded-2xl bg-card/40">
+              <Users className="h-10 w-10 text-muted-foreground/60" />
+              <div className="max-w-md">
+                <p className="font-semibold text-base text-foreground">No students enrolled yet for this exam</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Upload student attendance data from your excel sheets to populate the roll call roster.
+                </p>
+              </div>
+              <a
+                href="/attendance/upload"
+                className="mt-2 inline-flex items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 h-8 px-4 text-xs font-semibold shadow-sm transition-colors"
+              >
+                Upload Attendance Data
+              </a>
+            </div>
           ) : filtered.length === 0 ? (
-            <div className="flex flex-col items-center justify-center min-h-[400px] gap-3 text-muted-foreground border rounded-xl bg-muted/5">
-              <AlertCircle className="h-10 w-10 opacity-50" />
-              <p className="text-sm font-medium">No students match — try a different filter or search.</p>
+            <div className="flex flex-col items-center justify-center min-h-[300px] gap-2 text-muted-foreground border rounded-2xl bg-card/40">
+              <AlertCircle className="h-8 w-8 text-muted-foreground/60" />
+              <p className="text-sm font-medium">No students match filter &ldquo;{filter}&rdquo; or search &ldquo;{search}&rdquo;</p>
+              <Button variant="ghost" size="sm" onClick={() => { setSearch(""); setFilter("all"); }}>
+                Reset Filters
+              </Button>
             </div>
           ) : (
-            /* Roll call list */
-            <div className="rounded-xl border overflow-hidden">
-              <div className="grid grid-cols-[auto_1fr_auto_auto] text-xs font-semibold text-muted-foreground uppercase tracking-wide bg-muted/40 border-b px-4 py-2 gap-4">
+            /* Roll call list with smooth scrolling and sticky header */
+            <div className="rounded-xl border bg-card/50 overflow-hidden shadow-sm">
+              <div className="grid grid-cols-[auto_1fr_auto_auto] text-xs font-semibold text-muted-foreground uppercase tracking-wide bg-muted/70 border-b px-4 py-3 gap-4">
                 <span>#</span>
                 <span>Student</span>
                 <span>Batch</span>
                 <span className="text-right pr-2">Status</span>
               </div>
-              <div className="divide-y max-h-[calc(100vh-28rem)] overflow-y-auto">
+              <div className="divide-y max-h-[600px] overflow-y-auto overscroll-contain">
                 {filtered.map((s, i) => {
                   const mark = marks[s.student_id] ?? null
                   const isSaving = saving[s.student_id]
@@ -260,7 +391,7 @@ export default function RollCallPage() {
                       id={`rollcall-row-${s.roll_number}`}
                       onClick={() => toggle(s.student_id)}
                       disabled={isSaving}
-                      className={`w-full grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-3 text-left transition-all active:scale-[0.99] ${markStyle(mark)} ${isSaving ? "opacity-60" : ""}`}
+                      className={`w-full grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 px-4 py-3 text-left transition-colors ${markStyle(mark)} ${isSaving ? "opacity-60" : ""}`}
                     >
                       {/* Row number + status icon */}
                       <div className="flex items-center gap-2 min-w-[2.5rem]">
@@ -270,7 +401,14 @@ export default function RollCallPage() {
 
                       {/* Name + roll */}
                       <div className="min-w-0">
-                        <div className="font-medium text-sm truncate">{s.name}</div>
+                        <div className="font-medium text-sm truncate flex items-center gap-2">
+                          <span>{s.name}</span>
+                          {s.is_borderline && (
+                            <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30 text-[10px] px-1.5 py-0 font-normal">
+                              Borderline
+                            </Badge>
+                          )}
+                        </div>
                         <div className="font-mono text-xs text-muted-foreground">{s.roll_number}</div>
                       </div>
 
@@ -283,13 +421,29 @@ export default function RollCallPage() {
 
                       {/* Status badge */}
                       <div className="pr-2">
-                        {mark === "Present" && <Badge className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20">Present</Badge>}
-                        {mark === "Absent"  && <Badge className="bg-red-500/20 text-red-700 dark:text-red-400 border-red-500/30 hover:bg-red-500/20">Absent</Badge>}
+                        {mark === "Present" && <Badge className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20 font-medium">Present</Badge>}
+                        {mark === "Absent"  && <Badge className="bg-red-500/20 text-red-700 dark:text-red-400 border-red-500/30 hover:bg-red-500/20 font-medium">Absent</Badge>}
                         {!mark && <span className="text-xs text-muted-foreground italic">Tap to mark</span>}
                       </div>
                     </button>
                   )
                 })}
+              </div>
+
+              {/* Bottom submission footer */}
+              <div className="p-3 bg-muted/30 border-t flex flex-wrap items-center justify-between gap-3">
+                <span className="text-xs text-muted-foreground font-medium">
+                  {counts.present} Present · {counts.absent} Absent · {counts.unmarked} Unmarked
+                </span>
+                <Button
+                  size="sm"
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold gap-1.5 shadow-sm"
+                  onClick={submitAttendance}
+                  disabled={submitting || students.length === 0}
+                >
+                  {submitting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                  Submit & Sync VT Compliance
+                </Button>
               </div>
             </div>
           )}

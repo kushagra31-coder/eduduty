@@ -7,8 +7,19 @@ import { cn } from '@/lib/utils';
 import { useTheme } from 'next-themes';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { useAuth } from '@/lib/auth/context';
-import { getFilteredNavLinks } from '@/lib/nav';
+
+const NAV_LINKS = [
+  { href: "/dashboard",          label: "Dashboard",          icon: Home },
+  { href: "/attendance/upload",  label: "Upload Attendance",  icon: Upload },
+  { href: "/attendance/tracker", label: "Seating Arrangement", icon: Armchair },
+  { href: "/mst-rollcall",       label: "MST Roll Call",      icon: ClipboardCheck },
+  { href: "/eligibility",        label: "Eligibility",        icon: CheckSquare },
+  { href: "/follow-up",          label: "VT / Follow-up",     icon: ClipboardList },
+  { href: "/duties",             label: "Duty Scheduler",     icon: Users },
+  { href: "/timetable",          label: "Timetable",          icon: CalendarDays },
+  { href: "/ai",                 label: "AI Assistant",       icon: Bot },
+  { href: "/settings",           label: "Settings",           icon: Settings },
+];
 
 
 export function Sidebar({ className }: { className?: string }) {

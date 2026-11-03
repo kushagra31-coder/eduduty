@@ -14,7 +14,6 @@ import {
   Settings, Database, Server, RefreshCw, CheckCircle, XCircle,
   Users, ShieldOff, Pencil, Plus,
 } from 'lucide-react'
-import { apiFetch as baseApiFetch, getApiErrorMessage } from '@/lib/api'
 
 type AIProvider = { name: string; configured: boolean; hint?: string }
 type HealthData = { ready: boolean; providers: AIProvider[] }
@@ -32,15 +31,16 @@ type FacultyRow = {
 
 type ClassRow = { id: number; name: string; branch: string; year: number; section: string | null }
 
+const API = '/api'
+
 async function apiFetch(path: string, init?: RequestInit) {
-  const res = await baseApiFetch(path, init)
+  const res = await fetch(`${API}${path}`, init)
   if (!res.ok) {
-    const e = await getApiErrorMessage(res, `HTTP ${res.status}`)
-    throw new Error(e)
+    const e = await res.json().catch(() => ({})) as { detail?: string }
+    throw new Error(e.detail ?? `HTTP ${res.status}`)
   }
   return res.json()
 }
-
 
 // Faculty management tab
 function FacultyTab() {
@@ -374,13 +374,12 @@ function SystemTab() {
     setRefreshing(true)
     try {
       const [healthRes, classesRes, facultyRes, roomsRes, examsRes] = await Promise.all([
-        baseApiFetch('/ai/health').then(r => r.ok ? r.json() : null),
-        baseApiFetch('/classes').then(r => r.ok ? r.json() : []),
-        baseApiFetch('/faculty').then(r => r.ok ? r.json() : []),
-        baseApiFetch('/rooms').then(r => r.ok ? r.json() : []),
-        baseApiFetch('/mst/exams').then(r => r.ok ? r.json() : []),
+        fetch('/api/ai/health').then(r => r.ok ? r.json() : null),
+        fetch('/api/classes').then(r => r.ok ? r.json() : []),
+        fetch('/api/faculty').then(r => r.ok ? r.json() : []),
+        fetch('/api/rooms').then(r => r.ok ? r.json() : []),
+        fetch('/api/mst/exams').then(r => r.ok ? r.json() : []),
       ])
-
       setHealth(healthRes)
       setInfo({ classes: classesRes.length, faculty: facultyRes.length, rooms: roomsRes.length, exams: examsRes.length })
     } catch { /* ignore */ } finally {
@@ -501,7 +500,7 @@ function SystemTab() {
           <ol className="space-y-2 text-sm text-muted-foreground list-decimal pl-5">
             <li><strong className="text-foreground">Upload Attendance</strong> — import Excel sheets (.xlsx). Each subject sheet data is stored per student.</li>
             <li><strong className="text-foreground">Eligibility</strong> — automatically computed from the latest records. View and HOD-override here.</li>
-            <li><strong className="text-foreground">MST Seat Map</strong> — create exams + rooms, generate seating (B1/B2 interleaved), mark attendance during exam.</li>
+            <li><strong className="text-foreground">Seating Arrangement</strong> — create exams + rooms, generate seating (B1/B2 interleaved), mark attendance during exam.</li>
             <li><strong className="text-foreground">MST Roll Call</strong> — alternative list-based roll-call view, syncs the same attendance records.</li>
             <li><strong className="text-foreground">VT / Follow-up</strong> — auto-calculated after marking. Export as Excel or PDF.</li>
             <li><strong className="text-foreground">Duty Scheduler</strong> — auto-assigns free faculty to rooms based on timetable data.</li>

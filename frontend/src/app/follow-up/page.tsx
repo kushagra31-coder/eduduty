@@ -23,7 +23,11 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { useToast } from "@/components/ui/use-toast"
-import { apiFetch, getApiErrorMessage } from "@/lib/api"
+import {
+  Users, AlertTriangle, CheckCircle2, Clock, Sparkles,
+  RefreshCw, FileSpreadsheet, FileText, ChevronRight,
+  Filter, AlertCircle
+} from "lucide-react"
 
 type FollowUpRecord = {
   id: number
@@ -58,18 +62,54 @@ function pretty(s: string) {
 }
 
 function appearanceBadge(v: boolean | null) {
-  if (v === true) return <Badge className="bg-foreground text-background hover:bg-foreground/85">Present</Badge>
-  if (v === false) return <Badge className="border border-foreground/30 bg-foreground/10 text-foreground hover:bg-foreground/15">Absent</Badge>
-  return <Badge variant="secondary">Missing</Badge>
+  if (v === true) return (
+    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 rounded-md">
+      Present
+    </span>
+  )
+  if (v === false) return (
+    <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-rose-700 dark:text-rose-300 bg-rose-500/15 border border-rose-500/30 px-2 py-0.5 rounded-md">
+      Absent
+    </span>
+  )
+  return (
+    <span className="inline-flex items-center text-[10px] font-medium text-muted-foreground bg-muted/60 border border-border/70 px-1.5 py-0.5 rounded-md">
+      Missing
+    </span>
+  )
 }
 
 function statusBadge(status: string, override: boolean) {
-  if (override) return <Badge className="border-2 border-foreground bg-transparent text-foreground hover:bg-muted">Overridden</Badge>
-  if (status === "compulsory") return <Badge className="bg-foreground text-background hover:bg-foreground/85">Compulsory</Badge>
-  if (status === "under_review") return <Badge className="border border-dashed border-foreground/60 bg-transparent text-foreground hover:bg-muted">Under Review</Badge>
-  if (status === "excused") return <Badge className="border border-foreground/30 bg-foreground/10 text-foreground hover:bg-foreground/15">Excused</Badge>
-  if (status === "completed") return <Badge variant="secondary">Completed</Badge>
-  return <Badge variant="outline">Not Required</Badge>
+  if (override) return (
+    <Badge className="bg-purple-500/20 text-purple-700 dark:text-purple-300 border-purple-500/40 text-[10px] font-bold">
+      Overridden
+    </Badge>
+  )
+  if (status === "compulsory") return (
+    <Badge className="bg-rose-500/20 text-rose-700 dark:text-rose-300 border-rose-500/40 text-[10px] font-bold">
+      Compulsory
+    </Badge>
+  )
+  if (status === "under_review") return (
+    <Badge className="bg-amber-500/20 text-amber-700 dark:text-amber-300 border-amber-500/40 text-[10px] font-semibold">
+      Under Review
+    </Badge>
+  )
+  if (status === "excused") return (
+    <Badge className="bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 border-indigo-500/40 text-[10px] font-semibold">
+      Excused
+    </Badge>
+  )
+  if (status === "completed") return (
+    <Badge className="bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border-emerald-500/40 text-[10px] font-semibold">
+      Completed
+    </Badge>
+  )
+  return (
+    <Badge variant="outline" className="text-muted-foreground text-[10px] font-medium">
+      Not Required
+    </Badge>
+  )
 }
 
 export default function FollowUpPage() {
@@ -130,7 +170,17 @@ export default function FollowUpPage() {
         throw new Error(msg)
       }
       const data = await res.json()
-      toast({ title: `Recalculated ${data.evaluated} students (${data.changed} changed)` })
+      if (data.changed > 0) {
+        toast({
+          title: "Recalculation Complete",
+          description: `Evaluated ${data.evaluated} students. Status updated for ${data.changed} students based on MST-1 and MST-2 roll call.`,
+        })
+      } else {
+        toast({
+          title: "Recalculation Complete",
+          description: `Evaluated ${data.evaluated} students. All students remain 'Under Review' because MST roll-call attendance has not been marked yet. Once roll-call attendance is marked, students absent in both MSTs will move to Compulsory Follow-up.`,
+        })
+      }
       fetchData()
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Recalculation failed"
@@ -202,119 +252,245 @@ export default function FollowUpPage() {
   }
 
   const byFinal = stats?.by_final_status ?? {}
-  const card = (label: string, value: number | undefined, hint?: string) => (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardDescription>{label}</CardDescription>
-        <CardTitle className="text-3xl font-mono tabular-nums">{value ?? "—"}</CardTitle>
-      </CardHeader>
-      {hint && <CardContent className="pt-0 text-xs text-muted-foreground">{hint}</CardContent>}
-    </Card>
-  )
+
+  const statusFilters = [
+    { key: "all", label: "All Records", count: stats?.total_evaluated ?? 0 },
+    { key: "compulsory", label: "Compulsory", count: byFinal["compulsory"] ?? 0 },
+    { key: "under_review", label: "Under Review", count: byFinal["under_review"] ?? 0 },
+    { key: "not_required", label: "Not Required", count: byFinal["not_required"] ?? 0 },
+    { key: "excused", label: "Excused", count: byFinal["excused"] ?? 0 },
+    { key: "completed", label: "Completed", count: byFinal["completed"] ?? 0 },
+  ]
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      <div className="flex justify-between items-end flex-wrap gap-3">
+      <div className="flex justify-between items-start md:items-end flex-wrap gap-4">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">VT / Follow-up</h1>
-          <p className="text-muted-foreground mt-2">
-            Absent in both MST-1 and MST-2 → compulsory follow-up. Rule: absent-both-mst-v1.
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-3xl font-bold tracking-tight">VT / Follow-up</h1>
+            <Badge variant="outline" className="font-mono text-[11px] font-semibold text-muted-foreground border-border/80">
+              Rule: absent-both-mst-v1
+            </Badge>
+          </div>
+          <p className="text-muted-foreground mt-1.5 text-sm">
+            Automated compliance engine. Students absent in both MST-1 and MST-2 are flagged for compulsory remedial follow-up.
           </p>
         </div>
-        <div className="flex gap-2 flex-wrap">
-          <Button variant="outline" onClick={recalculate} disabled={recalcBusy}>
+        <div className="flex gap-2 flex-wrap items-center">
+          <Button variant="outline" size="sm" onClick={recalculate} disabled={recalcBusy} className="gap-1.5">
+            <RefreshCw className={`w-3.5 h-3.5 ${recalcBusy ? "animate-spin" : ""}`} />
             {recalcBusy ? "Recalculating…" : "Recalculate"}
           </Button>
-          <Button variant="outline" onClick={() => window.open(exportUrl(false), "_blank")}>Export Excel</Button>
-          <Button variant="outline" onClick={() => window.open(exportUrl(true), "_blank")}>Export PDF</Button>
+          <Button variant="outline" size="sm" onClick={() => window.open(exportUrl(false), "_blank")} className="gap-1.5">
+            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+            Export Excel
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => window.open(exportUrl(true), "_blank")} className="gap-1.5">
+            <FileText className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
+            Export PDF
+          </Button>
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-7">
-        {card("Evaluated", stats?.total_evaluated)}
-        {card("Compulsory", byFinal["compulsory"], "absent in both MSTs")}
-        {card("Not Required", byFinal["not_required"])}
-        {card("Under Review", byFinal["under_review"], "missing appearance data")}
-        {card("Excused", byFinal["excused"])}
-        {card("Completed", byFinal["completed"])}
-        {card("Missing Records", stats?.missing_records, "students not yet evaluated")}
+      {/* Modern KPI Header Cards - Open & Responsive Layout */}
+      <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
+        {/* Total Evaluated */}
+        <div className="rounded-2xl border border-border/80 bg-card/80 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-border">
+          <div className="flex items-center justify-between text-muted-foreground mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Total Evaluated</span>
+            <div className="p-2 rounded-xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">
+              <Users className="w-4 h-4" />
+            </div>
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-foreground">
+            {stats?.total_evaluated ?? 0}
+          </div>
+          <p className="text-xs text-muted-foreground mt-1.5">
+            Out of <span className="font-semibold text-foreground">{stats?.total_students ?? 0}</span> enrolled students
+          </p>
+        </div>
+
+        {/* Compulsory Follow-up */}
+        <div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-rose-500/50">
+          <div className="flex items-center justify-between text-rose-600 dark:text-rose-400 mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Compulsory Follow-up</span>
+            <div className="p-2 rounded-xl bg-rose-500/20 text-rose-600 dark:text-rose-400">
+              <AlertTriangle className="w-4 h-4" />
+            </div>
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-rose-600 dark:text-rose-400">
+            {byFinal["compulsory"] ?? 0}
+          </div>
+          <p className="text-xs text-rose-700/80 dark:text-rose-300/80 mt-1.5">
+            Absent in both MST-1 & MST-2
+          </p>
+        </div>
+
+        {/* Under Review & Excused */}
+        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-amber-500/50">
+          <div className="flex items-center justify-between text-amber-600 dark:text-amber-400 mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Under Review & Excused</span>
+            <div className="p-2 rounded-xl bg-amber-500/20 text-amber-600 dark:text-amber-400">
+              <Clock className="w-4 h-4" />
+            </div>
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-amber-600 dark:text-amber-400">
+            {(byFinal["under_review"] ?? 0) + (byFinal["excused"] ?? 0)}
+          </div>
+          <p className="text-xs text-amber-700/80 dark:text-amber-300/80 mt-1.5">
+            {byFinal["under_review"] ?? 0} pending data · {byFinal["excused"] ?? 0} excused
+          </p>
+        </div>
+
+        {/* Completed & Exempted */}
+        <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 backdrop-blur-sm p-5 shadow-sm transition-all hover:shadow-md hover:border-emerald-500/50">
+          <div className="flex items-center justify-between text-emerald-600 dark:text-emerald-400 mb-2">
+            <span className="text-[11px] font-bold tracking-wider uppercase">Completed & Exempted</span>
+            <div className="p-2 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
+              <CheckCircle2 className="w-4 h-4" />
+            </div>
+          </div>
+          <div className="text-3xl font-mono font-bold tracking-tight text-emerald-600 dark:text-emerald-400">
+            {(byFinal["completed"] ?? 0) + (byFinal["not_required"] ?? 0)}
+          </div>
+          <p className="text-xs text-emerald-700/80 dark:text-emerald-300/80 mt-1.5">
+            {byFinal["completed"] ?? 0} completed · {byFinal["not_required"] ?? 0} exempted
+          </p>
+        </div>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Follow-up Roster</CardTitle>
-          <CardDescription>Calculated by the rule engine; final status needs an authorized override with a typed reason.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex gap-3 flex-wrap">
-            <Select value={classFilter} onValueChange={(v: string | null) => { if (v) setClassFilter(v) }}>
-              <SelectTrigger className="w-44"><SelectValue placeholder="Class" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All classes</SelectItem>
-                {classes.map((c) => <SelectItem key={c.id} value={String(c.id)}>{c.name}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            <Select value={finalFilter} onValueChange={(v: string | null) => { if (v) setFinalFilter(v) }}>
-              <SelectTrigger className="w-44"><SelectValue placeholder="Final status" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All statuses</SelectItem>
-                <SelectItem value="compulsory">Compulsory</SelectItem>
-                <SelectItem value="not_required">Not required</SelectItem>
-                <SelectItem value="under_review">Under review</SelectItem>
-                <SelectItem value="excused">Excused</SelectItem>
-                <SelectItem value="completed">Completed</SelectItem>
-              </SelectContent>
-            </Select>
-            <Input
-              className="w-64"
-              placeholder="Search roll no. or name…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
+      {/* Advisory Status Banner */}
+      {(stats?.missing_records ?? 0) > 0 && (
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-900 dark:text-amber-200">
+          <div className="flex items-center gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0" />
+            <span className="leading-relaxed">
+              <strong>{stats?.missing_records} students</strong> have missing or pending MST attendance data. Rule <code>absent-both-mst-v1</code> keeps them <strong>Under Review</strong> until both MST roll calls are recorded. Mark attendance in <strong>MST Roll Call</strong> to automatically flag double-absentees for compulsory remedial follow-up.
+            </span>
           </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={recalculate}
+            disabled={recalcBusy}
+            className="h-8 text-xs font-semibold border-amber-400/60 hover:bg-amber-500/20 text-amber-950 dark:text-amber-100 shrink-0 self-end sm:self-auto"
+          >
+            {recalcBusy ? "Recalculating…" : "Recalculate Now"}
+          </Button>
+        </div>
+      )}
 
-          <div className="rounded-md border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Roll No.</TableHead>
-                  <TableHead>Name</TableHead>
-                  <TableHead>Class</TableHead>
-                  <TableHead>MST-1</TableHead>
-                  <TableHead>MST-2</TableHead>
-                  <TableHead>Calculated</TableHead>
-                  <TableHead>Final</TableHead>
-                  <TableHead className="text-right">Action</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {isLoading ? (
-                  <TableRow><TableCell colSpan={8} className="h-24 text-center">Loading…</TableCell></TableRow>
-                ) : records.length === 0 ? (
-                  <TableRow><TableCell colSpan={8} className="h-24 text-center">No records. Mark MST attendance or hit Recalculate.</TableCell></TableRow>
-                ) : (
-                  records.map((r) => (
-                    <TableRow key={r.id} className={r.override ? "bg-muted/60" : ""}>
-                      <TableCell className="font-medium font-mono">{r.roll_number}</TableCell>
-                      <TableCell>{r.name}</TableCell>
-                      <TableCell>{r.class_name}</TableCell>
-                      <TableCell>{appearanceBadge(r.mst_1_appeared)}</TableCell>
-                      <TableCell>{appearanceBadge(r.mst_2_appeared)}</TableCell>
-                      <TableCell>{statusBadge(r.calculated_status, false)}</TableCell>
-                      <TableCell>{statusBadge(r.final_status, r.override)}</TableCell>
-                      <TableCell className="text-right">
-                        <Button variant="ghost" size="sm" onClick={() => openDialog(r)}>
-                          {r.override ? "Review Override" : "Review"}
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </div>
-        </CardContent>
-      </Card>
+      {/* Follow-up Roster Section */}
+      <div className="rounded-2xl border border-border/80 bg-card/60 backdrop-blur-sm shadow-sm overflow-hidden p-5 space-y-4">
+        <div className="space-y-1">
+          <h2 className="text-xl font-bold tracking-tight">Follow-up Roster</h2>
+          <p className="text-xs text-muted-foreground">
+            Calculated by the automated compliance engine; final status changes require an authorized coordinator decision with a mandatory typed reason.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 pb-2 border-b border-border/40">
+          <span className="text-xs font-semibold text-muted-foreground mr-1 flex items-center gap-1.5">
+            <Filter className="w-3.5 h-3.5" /> Filter by:
+          </span>
+          {statusFilters.map((f) => {
+            const active = finalFilter === f.key
+            return (
+              <button
+                key={f.key}
+                type="button"
+                onClick={() => setFinalFilter(f.key)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all cursor-pointer ${
+                  active
+                    ? "bg-primary text-primary-foreground shadow-sm"
+                    : "bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                <span>{f.label}</span>
+                <span
+                  className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+                    active ? "bg-primary-foreground/20 text-primary-foreground" : "bg-background/90 text-foreground"
+                  }`}
+                >
+                  {f.count}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+
+        <div className="flex gap-3 flex-wrap items-center">
+          <Select value={classFilter} onValueChange={(v: string | null) => { if (v) setClassFilter(v) }}>
+            <SelectTrigger className="w-44"><SelectValue placeholder="Class" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All classes</SelectItem>
+              {classes.map((c) => <SelectItem key={c.id} value={String(c.id)}>{c.name}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Input
+            className="w-72"
+            placeholder="Search roll number or name…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          {(finalFilter !== "all" || classFilter !== "all" || search.trim() !== "") && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setFinalFilter("all")
+                setClassFilter("all")
+                setSearch("")
+              }}
+              className="text-xs text-muted-foreground hover:text-foreground h-9"
+            >
+              Reset filters
+            </Button>
+          )}
+        </div>
+
+        {/* Clean, Full-Width Table with horizontal scroll if needed to avoid column squishing */}
+        <div className="rounded-xl border border-border/80 bg-background overflow-x-auto shadow-sm">
+          <table className="w-full text-xs text-left border-collapse min-w-[880px]">
+            <thead>
+              <tr className="border-b bg-muted/40 text-muted-foreground font-semibold">
+                <th className="px-4 py-3 min-w-[130px]">Roll No.</th>
+                <th className="px-4 py-3 min-w-[160px]">Student Name</th>
+                <th className="px-3 py-3 w-24">Class</th>
+                <th className="px-3 py-3 w-28 text-center">MST-1</th>
+                <th className="px-3 py-3 w-28 text-center">MST-2</th>
+                <th className="px-3 py-3 min-w-[125px] text-center">Calculated</th>
+                <th className="px-3 py-3 min-w-[125px] text-center">Final</th>
+                <th className="px-4 py-3 min-w-[100px] text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/60">
+              {isLoading ? (
+                <tr><td colSpan={8} className="h-24 text-center text-muted-foreground">Loading roster records…</td></tr>
+              ) : records.length === 0 ? (
+                <tr><td colSpan={8} className="h-24 text-center text-muted-foreground">No records found. Mark MST attendance or hit Recalculate.</td></tr>
+              ) : (
+                records.map((r) => (
+                  <tr key={r.id} className={`hover:bg-muted/30 transition-colors ${r.override ? "bg-muted/40" : ""}`}>
+                    <td className="px-4 py-3 font-medium font-mono whitespace-nowrap">{r.roll_number}</td>
+                    <td className="px-4 py-3 font-medium whitespace-nowrap">{r.name}</td>
+                    <td className="px-3 py-3 whitespace-nowrap font-semibold text-muted-foreground">{r.class_name}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{appearanceBadge(r.mst_1_appeared)}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{appearanceBadge(r.mst_2_appeared)}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{statusBadge(r.calculated_status, false)}</td>
+                    <td className="px-3 py-3 text-center whitespace-nowrap">{statusBadge(r.final_status, r.override)}</td>
+                    <td className="px-4 py-3 text-right whitespace-nowrap">
+                      <Button variant="ghost" size="sm" onClick={() => openDialog(r)} className="h-7 text-xs font-medium px-2.5">
+                        {r.override ? "Review Override" : "Review"}
+                      </Button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent>

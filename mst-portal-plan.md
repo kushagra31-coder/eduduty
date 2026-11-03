@@ -1,5 +1,9 @@
 # MST Operations Portal — Full Plan
 
+> **Last updated:** 2026-11-02 · Status snapshot: **Phase 1–3 functional, 33/35 tests passing**
+
+---
+
 ## 1. Problem
 
 Department currently runs MST (midterm) attendance eligibility, seating, and
@@ -201,28 +205,83 @@ correction is made (with audit trail).
 
 ---
 
-## 9. Build phases
+## 9. Build phases & current status
 
-**Phase 1 — Core**
-Login/roles · student & faculty import · class/batch setup · attendance
-Excel upload · eligibility dashboard · MST-1/MST-2 records · present/absent
-marking.
+### Phase 1 — Core ✅ COMPLETE
+- ✅ Login / JWT auth · role-based access (`Admin`, `Exam Coordinator`, `Faculty`, `Invigilator`, `AI`)
+- ✅ Class & student import · faculty CRUD (`/classes`, `/faculty`)
+- ✅ Attendance Excel upload + validation (`/upload-attendance`)
+- ✅ Import-batch management & rollback (`/import-batches`)
+- ✅ Eligibility dashboard with override + audit (`/eligibility/{mst_exam_id}`)
+- ✅ MST-1 / MST-2 exam record creation (`/mst/exams`)
+- ✅ Exam-day roll-call marking — individual & bulk (`/mst/attendance/mark`, `/mst/attendance/mark-bulk`)
+- ✅ MST roll-call submission with gate (`/mst/attendance/submit`)
+- ✅ Dashboard stats endpoint (`/dashboard/stats`)
+- ✅ VT / follow-up engine with override & restore (`/follow-up/*`)
+- ✅ Follow-up CSV + PDF export
 
-**Phase 2 — Exam operations**
-Room/seat creation · batch pairing · printable seating chart & signature
-sheet · absentee/compulsory lists · VT rule engine.
+**Frontend pages:** `dashboard` (545 ln) · `eligibility` (262 ln) · `attendance/upload` · `attendance/tracker` · `mst-rollcall` (454 ln) · `follow-up` (535 ln) · `login`
 
-**Phase 3 — Faculty scheduling**
-Full all-year timetable import · exemption config · clash detection ·
-auto duty assignment (OR-Tools) · manual edit/replace workflow · audit
-history.
+---
 
-**Phase 4 — Local AI**
-Natural-language reporting over approved views · charts/exports ·
-(optional, later) voice input.
+### Phase 2 — Exam operations ✅ COMPLETE
+- ✅ Room creation + capacity management (`/rooms`)
+- ✅ Seating generation — batch-paired, 2-per-bench, roll-number order (`/mst/seating/generate`)
+- ✅ Seating view per exam (`/mst/seating/{mst_exam_id}`)
+- ✅ Printable seating chart PDF (`/pdf/seating/{mst_exam_id}/{room_id}`)
+- ✅ Student record PDF with eligibility + appearance (`/pdf/student/{roll_number}`)
+- ✅ VT rule engine: compulsory only if absent **both** MSTs; stored in `system_rules`
 
-Do not build Phase 4 before Phases 1–3 are correct — the AI is only as
-trustworthy as the data underneath it.
+---
+
+### Phase 3 — Faculty scheduling ✅ COMPLETE
+- ✅ Full timetable import (OCR image path + manual entry) — `PUT /timetable/class/{class_id}/{semester}`
+- ✅ Faculty availability / clash checker across **all years** (`/timetable/availability`)
+- ✅ Duty assignment (manual + auto-schedule suggestion) (`/mst/duties/assign`, `/mst/duties/auto-schedule`)
+- ✅ Duty unassign & replacement workflow
+- ✅ Faculty exemption flag + reason on model (`exempt_from_duty`)
+- ✅ Duty exemption seed (`seed_duty_exemptions.py`)
+- ✅ Faculty exam-status grid (`/mst/faculty-status`, `/mst/faculty-grid`)
+- ✅ `duty_replacements` append-only log in schema · `audit_logs` across all editable fields
+
+**Frontend pages:** `duties` (911 ln) · `timetable` (949 ln) · `settings` (554 ln)
+
+---
+
+### Phase 4 — Local AI ⚠️ IN PROGRESS
+- ✅ AI query endpoint with read-only guard (`/ai/query`, `/ai/confirm-write`)
+- ✅ Ollama + OpenAI-compat routing (`_ollama_chat`, `_openai_compat_chat`)
+- ✅ SQL validation — blocks writes, table-dump limits
+- ✅ Heuristic fallback + cloud aggregation helper
+- ✅ AI health check (`/ai/health`)
+- ✅ AI page frontend (`ai/page.tsx` — 74 ln, chat UI skeleton)
+- ⚠️ Natural-language → SQL query generation: basic; needs deeper prompt tuning
+- 🔲 Per-role row filtering on AI responses
+- 🔲 Charts / export from AI results
+- 🔲 Voice input (optional / future)
+
+---
+
+### Known test failures (2 / 35)
+
+| Test | Issue |
+|---|---|
+| `test_dashboard_stats_dynamic_exam_resolution` | Dashboard stats endpoint does not dynamically resolve the current MST exam from context |
+| `test_flat_upload_requires_class_id_and_returns_422` | Upload endpoint accepts flat payload without `class_id` instead of returning 422 |
+
+**Deprecation warnings (non-blocking):** `datetime.utcnow()` → use `datetime.now(UTC)` · Pydantic `.dict()` → `.model_dump()` in `crud.py` and `main.py` — both are Pydantic v2 migration leftovers, no functional impact yet.
+
+---
+
+### Data still needed before real data replaces mock prototype
+- MST-1 / MST-2 dates, time slots, rooms, and which classes sit each
+- Full timetable for second, third, and final year (not just second year)
+- A sample attendance Excel sheet exactly as faculty currently produce it
+- Final exemption list (currently: HOD Vandana ma'am + one more faculty — confirm full list and reasons)
+- Confirmation: attendance threshold is overall, subject-wise, or both
+- Room capacities and per-room invigilator counts required
+
+Do not build Phase 4 further before fixing the 2 failing tests — the AI is only as trustworthy as the data underneath it.
 
 ---
 
@@ -248,14 +307,5 @@ trustworthy as the data underneath it.
 - Override approvals must require a reason every time — no silent
   overrides, even by Admin/HOD.
 
----
 
-## 11. Data still needed before real data replaces the mock prototype
 
-- MST-1 / MST-2 dates, time slots, rooms, and which classes sit each
-- Full timetable for second, third, and final year (not just second year)
-- A sample attendance Excel sheet exactly as faculty currently produce it
-- Final exemption list (currently: HOD Vandana ma'am + one more faculty —
-  confirm full list and reasons)
-- Confirmation attendance threshold is overall, subject-wise, or both
-- Room capacities and per-room invigilator counts required

@@ -1,3 +1,4 @@
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 import models, schemas
 import datetime
@@ -51,22 +52,25 @@ def get_mst_eligibility(db: Session, mst_exam_id: int):
 def update_eligibility_override(db: Session, eligibility_id: int, override: bool, reason: str, user_id: int = None):
     db_record = db.query(models.MstEligibility).filter(models.MstEligibility.id == eligibility_id).first()
     if db_record:
+        old_val = str(db_record.override)
+        new_val = str(override)
+
         db_record.override = override
-        db_record.override_reason = reason
-        db_record.override_by = user_id
-        
-        # Log to audit (simplified)
+        db_record.override_reason = reason if override else None
+        db_record.override_by = user_id if override else None
+
+        # Log to audit with true old and new values
         log = models.AuditLog(
             table_name="mst_eligibility",
             record_id=eligibility_id,
             field_changed="override",
-            old_value=str(not override),
-            new_value=str(override),
+            old_value=old_val,
+            new_value=new_val,
             changed_by=user_id,
             reason=reason
         )
         db.add(log)
-        
+
         db.commit()
         db.refresh(db_record)
     return db_record
@@ -116,6 +120,8 @@ def compute_eligibility_for_student(db: Session, student_id: int, mst_exam_id: i
         db.add(el_record)
         
     db.commit()
+    db.refresh(el_record)
+    return el_record
 
 
 # ── Timetable ──────────────────────────────────────────────────────────────────
@@ -137,6 +143,26 @@ def create_timetable_version(db: Session, v: schemas.TimetableVersionCreate):
     db.refresh(obj)
     return obj
 
+def active_timetable_query(db: Session):
+    """
+    Query FacultyTimetable joined to TimetableVersion such that only active
+    versions are returned, but preserving legacy/unversioned rows where
+    timetable_version_id is NULL.
+    """
+    return (
+        db.query(models.FacultyTimetable)
+        .outerjoin(
+            models.TimetableVersion,
+            models.FacultyTimetable.timetable_version_id == models.TimetableVersion.id,
+        )
+        .filter(
+            or_(
+                models.FacultyTimetable.timetable_version_id.is_(None),
+                models.TimetableVersion.active.is_(True),
+            )
+        )
+    )
+
 def create_timetable_entry(db: Session, e: schemas.TimetableEntryCreate):
     obj = models.FacultyTimetable(**e.dict())
     db.add(obj)
@@ -153,7 +179,8 @@ def bulk_create_timetable_entries(db: Session, entries: list):
 
 def get_timetable_for_class(db: Session, class_id: int, semester: str = None):
     q = (
-        db.query(models.FacultyTimetable, models.Faculty.name.label("fac_name"))
+        active_timetable_query(db)
+        .add_columns(models.Faculty.name.label("fac_name"))
         .join(models.Faculty, models.FacultyTimetable.faculty_id == models.Faculty.id)
         .filter(models.FacultyTimetable.class_id == class_id)
     )
@@ -188,7 +215,7 @@ def check_faculty_availability(db: Session, day_of_week: str, period_start: str,
             ))
             continue
 
-        clash = db.query(models.FacultyTimetable).filter(
+        clash = active_timetable_query(db).filter(
             models.FacultyTimetable.faculty_id == f.id,
             models.FacultyTimetable.day_of_week == day_of_week,
             # standard interval-overlap test
@@ -533,7 +560,7 @@ def propose_invigilation_duties(db: Session, mst_exam_ids: list):
                 if f.exempt_from_duty:
                     blockers.append(f"{f.name}: exempt ({f.exempt_reason or 'by admin'})")
                     continue
-                clash = db.query(models.FacultyTimetable).filter(
+                clash = active_timetable_query(db).filter(
                     models.FacultyTimetable.faculty_id == f.id,
                     models.FacultyTimetable.day_of_week == day,
                     models.FacultyTimetable.period_start < end,

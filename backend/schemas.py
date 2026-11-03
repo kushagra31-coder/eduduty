@@ -1,4 +1,5 @@
-from pydantic import BaseModel
+import re
+from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from decimal import Decimal
 from datetime import datetime, date
@@ -98,6 +99,8 @@ class TimetableVersionOut(TimetableVersionCreate):
     class Config:
         from_attributes = True
 
+TIME_REGEX = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
 class TimetableEntryBase(BaseModel):
     faculty_id: int
     day_of_week: str           # 'MON','TUE','WED','THUR','FRI'
@@ -111,8 +114,20 @@ class TimetableEntryBase(BaseModel):
     year: int                  # taught class's actual year
     semester: Optional[str] = None
 
+    @field_validator("period_start", "period_end")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        if not TIME_REGEX.match(v):
+            raise ValueError(f"Time '{v}' must be in HH:MM format (00:00 to 23:59)")
+        return v
+
 class TimetableEntryCreate(TimetableEntryBase):
-    timetable_version_id: int
+    timetable_version_id: Optional[int] = None
+
+class TimetableSaveRequest(BaseModel):
+    session: Optional[str] = "Jul-Dec 2026"
+    doc_no: Optional[str] = None
+    entries: List[TimetableEntryCreate]
 
 class TimetableEntryOut(TimetableEntryBase):
     id: int
@@ -124,6 +139,13 @@ class FacultyAvailabilityCheck(BaseModel):
     day_of_week: str
     period_start: str
     period_end: str
+
+    @field_validator("period_start", "period_end")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        if not TIME_REGEX.match(v):
+            raise ValueError(f"Time '{v}' must be in HH:MM format (00:00 to 23:59)")
+        return v
 
 class FacultyAvailabilityResult(BaseModel):
     faculty_id: int
@@ -145,6 +167,9 @@ class MstExamOut(BaseModel):
     exam_date: Optional[date] = None
     time_slot: Optional[str] = None
     class_id: Optional[int] = None
+    class_name: Optional[str] = None
+    year: Optional[int] = None
+    display_name: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -194,6 +219,34 @@ class AttendanceMarkOut(BaseModel):
     student_id: int
     status: str
     marked_at: Optional[datetime] = None
+
+class MarkAttendanceBulkIn(BaseModel):
+    mst_exam_id: int
+    student_ids: list[int]
+    status: str = "Present"  # 'Present' | 'Absent'
+
+class AttendanceMarkBulkOut(BaseModel):
+    marked_count: int
+    mst_exam_id: int
+    status: str
+    student_ids: list[int]
+    skipped: list[dict] = []
+
+class AttendanceSubmitIn(BaseModel):
+    mst_exam_id: int
+    # Optional dictionary mapping student_id -> "Present" | "Absent"
+    records: Optional[dict[int, Optional[str]]] = None
+
+class AttendanceSubmitOut(BaseModel):
+    success: bool
+    mst_exam_id: int
+    total_enrolled: int
+    marked_count: int
+    present_count: int
+    absent_count: int
+    unmarked_count: int
+    vt_recalculated: int
+    message: str
 
 class DutyAssignIn(BaseModel):
     mst_exam_id: int

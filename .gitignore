@@ -1,9 +1,19 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
-.env
-*.env
-venv/
+*.py[cod]
+*$py.class
 
-# Local environment and database files
-backend/.env
-backend/eduduty.db
-backend/eduduty_demo.db
+# Virtual environments
+venv/
+.venv/
+vens/
+
+# Environment files
+.env
+.env.*
+!.env.example
+*.env
+
+# SQLite WAL and lock files
+*.db-wal
+*.db-shm
