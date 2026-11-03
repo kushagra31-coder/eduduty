@@ -18,7 +18,7 @@ AUTH_DISABLED = os.getenv("AUTH_DISABLED", "false").strip().lower() in ("true", 
 def validate_auth_startup():
     """Verify that AUTH_DISABLED is only ever used in ENV=local."""
     curr_env = os.getenv("ENV", "local").strip().lower()
-    auth_off = os.getenv("AUTH_DISABLED", "false").strip().lower() in ("true", "1", "yes")
+    auth_off = os.getenv("AUTH_DISABLED", "true" if curr_env == "local" else "false").strip().lower() in ("true", "1", "yes")
     if auth_off and curr_env != "local":
         raise RuntimeError(
             f"Security violation: AUTH_DISABLED=true is only allowed when ENV=local (current ENV='{curr_env}')."
@@ -110,7 +110,7 @@ def get_current_user(
     Otherwise, raises 401 if missing/invalid.
     """
     curr_env = os.getenv("ENV", "local").strip().lower()
-    auth_off = os.getenv("AUTH_DISABLED", "false").strip().lower() in ("true", "1", "yes")
+    auth_off = os.getenv("AUTH_DISABLED", "true" if curr_env == "local" else "false").strip().lower() in ("true", "1", "yes")
 
     if not credentials or not credentials.credentials:
         if auth_off and curr_env == "local":
